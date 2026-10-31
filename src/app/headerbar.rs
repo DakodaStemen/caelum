@@ -239,53 +239,50 @@ impl App {
             .gap(4.)
             .show(|ui| {
                 // Scrolls when the window is too short for it (small window, big zoom).
-                let max_height = ui.ctx().content_rect().height() - 16.;
-                egui::ScrollArea::vertical()
-                    .max_height(max_height)
-                    .show(ui, |ui| {
-                        ui.set_width(260.);
+                fit_height(ui, |ui| {
+                    ui.set_width(260.);
+                    menu_spacing(ui);
+                    zoom_row(ui, theme);
+                    ui.separator();
+                    let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
+                        let shortcut = self.keymap.get(key).map(binding_label);
+                        menu_item(ui, label, shortcut).clicked().then_some(action)
+                    };
+                    let mut picks = vec![
+                        item(ui, "New Tab", "new_tab", Action::NewTab),
+                        item(ui, "New Workspace", "", Action::NewWorkspace),
+                        item(ui, "Open File…", "open_file", Action::Open),
+                    ];
+                    submenu(ui, "New Pane", |ui| {
+                        ui.set_width(200.);
                         menu_spacing(ui);
-                        zoom_row(ui, theme);
-                        ui.separator();
-                        let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
-                            let shortcut = self.keymap.get(key).map(binding_label);
-                            menu_item(ui, label, shortcut).clicked().then_some(action)
-                        };
-                        let mut picks = vec![
-                            item(ui, "New Tab", "new_tab", Action::NewTab),
-                            item(ui, "New Workspace", "", Action::NewWorkspace),
-                            item(ui, "Open File…", "open_file", Action::Open),
-                        ];
-                        submenu(ui, "New Pane", |ui| {
-                            ui.set_width(200.);
-                            menu_spacing(ui);
-                            for (label, action) in [
-                                ("Terminal", Action::Split(Direction::Right)),
-                                ("Files", Action::Files),
-                                ("System Monitor", Action::System),
-                                ("Processes", Action::Processes),
-                                ("SSH Connection…", Action::Connect),
-                                ("Codex", Action::Assistant("codex".into())),
-                                ("Claude", Action::Assistant("claude".into())),
-                            ] {
-                                picks.push(item(ui, label, "", action));
-                            }
-                        });
-                        ui.separator();
-                        picks.push(item(ui, "Find…", "search", Action::Search));
-                        picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
-                        picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
-                        picks.push(item(
-                            ui,
-                            "Command Palette",
-                            "command_palette",
-                            Action::Palette,
-                        ));
-                        ui.separator();
-                        picks.push(item(ui, "Preferences", "", Action::Settings));
-                        picks.push(item(ui, "About Caelum", "", Action::About));
-                        chosen = picks.into_iter().flatten().next();
+                        for (label, action) in [
+                            ("Terminal", Action::Split(Direction::Right)),
+                            ("Files", Action::Files),
+                            ("System Monitor", Action::System),
+                            ("Processes", Action::Processes),
+                            ("SSH Connection…", Action::Connect),
+                            ("Codex", Action::Assistant("codex".into())),
+                            ("Claude", Action::Assistant("claude".into())),
+                        ] {
+                            picks.push(item(ui, label, "", action));
+                        }
                     });
+                    ui.separator();
+                    picks.push(item(ui, "Find…", "search", Action::Search));
+                    picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
+                    picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
+                    picks.push(item(
+                        ui,
+                        "Command Palette",
+                        "command_palette",
+                        Action::Palette,
+                    ));
+                    ui.separator();
+                    picks.push(item(ui, "Preferences", "", Action::Settings));
+                    picks.push(item(ui, "About Caelum", "", Action::About));
+                    chosen = picks.into_iter().flatten().next();
+                });
             });
         if chosen.is_some() {
             self.pending_action = chosen;
@@ -785,11 +782,31 @@ pub(super) fn submenu(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut 
         .min_size(Vec2::new(ui.available_width(), 32.))
         .right_text(icons::image(Icon::PanEnd, 16., color));
     egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
-        let max_height = ui.ctx().content_rect().height() - 16.;
-        egui::ScrollArea::vertical()
-            .max_height(max_height)
-            .show(ui, content);
+        fit_height(ui, content);
     });
+}
+
+/// Shows `content` as is, or in a scroll area once it was taller than the window
+/// (so a popover in a short window can still reach every row, without a scroll
+/// bar the rest of the time).
+pub(super) fn fit_height<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let id = ui.id().with("fit-height");
+    let max = ui.ctx().content_rect().height() - 16.;
+    let last: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.);
+    if last > max {
+        let out = egui::ScrollArea::vertical()
+            .max_height(max)
+            .show(ui, content);
+        let height = out.content_size.y;
+        ui.ctx().data_mut(|d| d.insert_temp(id, height));
+        out.inner
+    } else {
+        let top = ui.cursor().top();
+        let inner = content(ui);
+        let height = ui.min_rect().bottom() - top;
+        ui.ctx().data_mut(|d| d.insert_temp(id, height));
+        inner
+    }
 }
 
 /// The zoom row at the top of the main menu: out, the current level (resets), in.
