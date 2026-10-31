@@ -131,7 +131,7 @@ impl App {
                 focus_requested |= self.editor_pane(ui, theme, &id, path);
             }
             Pane::System { .. } => self.system_pane(ui, theme),
-            Pane::Processes { .. } => self.processes_pane(ui, &id),
+            Pane::Processes { .. } => self.processes_pane(ui, &id, theme),
             Pane::Browser { url, .. } => Self::browser_pane(ui, ctx, url),
             _ => {}
         }
@@ -194,12 +194,17 @@ impl App {
         let ui = &mut bar_ui;
         ui.spacing_mut().item_spacing.x = 2.;
         let button = Vec2::splat(24.);
-        if icons::flat(ui, Icon::Close, button, 16., pal, "Close Pane", false).clicked() {
+        // Buttons show on the focused pane and the one under the pointer, keeping the
+        // other headers to just their titles.
+        let show_buttons = selected || ui.rect_contains_pointer(bar);
+        if show_buttons
+            && icons::flat(ui, Icon::Close, button, 16., pal, "Close Pane", false).clicked()
+        {
             self.focused = id.to_string();
             self.pending = Some(PendingClose::Pane);
         }
         let zoomed = self.zoom.is_some();
-        let roomy = bar.width() > 150.;
+        let roomy = show_buttons && bar.width() > 150.;
         if roomy {
             let (icon, tip) = if zoomed {
                 (Icon::Restore, "Restore Pane")
@@ -410,60 +415,85 @@ impl App {
     }
     pub(super) fn system_pane(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         self.system.refresh(ui.ctx());
+        let cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let rows = [
+            ("Load Average", self.system.load.clone()),
+            ("Memory", self.system.memory.clone()),
+            ("Uptime", self.system.uptime.clone()),
+            ("Processors", format!("{cpus}")),
+            ("System", std::env::consts::OS.to_string()),
+        ];
         egui::ScrollArea::vertical()
             .scroll_source(
                 egui::scroll_area::ScrollSource::MOUSE_WHEEL
                     | egui::scroll_area::ScrollSource::SCROLL_BAR,
             )
             .show(ui, |ui| {
-                ui.add_space(16.);
-                for (name, value) in [
-                    ("LOAD AVERAGE", &self.system.load),
-                    ("MEMORY", &self.system.memory),
-                    ("UPTIME", &self.system.uptime),
-                ] {
+                ui.add_space(6.);
+                for (name, value) in rows {
                     ui.label(RichText::new(name).small().color(theme.ui("muted")));
-                    ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));
-                    ui.add_space(20.);
+                    ui.label(RichText::new(value).size(20.).color(theme.ui("text")));
+                    ui.add_space(14.);
                 }
-                let cpus = std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1);
-                ui.label(format!("{cpus} logical CPUs"));
-                ui.label(std::env::consts::OS);
             });
     }
-    pub(super) fn processes_pane(&mut self, ui: &mut egui::Ui, id: &str) {
+    pub(super) fn processes_pane(&mut self, ui: &mut egui::Ui, id: &str, theme: &Theme) {
         self.system.refresh(ui.ctx());
         ui.add(
-            egui::TextEdit::singleline(&mut self.process_filter).hint_text(
-                RichText::new("Filter name or PID…").color(ui.visuals().weak_text_color()),
-            ),
+            egui::TextEdit::singleline(&mut self.process_filter)
+                .hint_text(RichText::new("Filter by name or PID").color(theme.ui("muted")))
+                .margin(Vec2::new(8., 5.))
+                .desired_width(ui.available_width()),
         );
+        ui.add_space(4.);
         let filter = self.process_filter.to_lowercase();
-        egui::ScrollArea::both()
+        let muted = theme.ui("muted");
+        let text = theme.ui("text");
+        let base = theme.term("background");
+        // A plain list: PID, name (cut to fit), resident memory on the right.
+        let row = |ui: &mut egui::Ui, pid: &str, name: &str, rss: &str, color: Color32| {
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.), Sense::hover());
+            if response.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 6, theme::mix(base, text, 0.05));
+            }
+            let y = rect.center().y;
+            let pid_g = truncated(ui, pid, egui::TextStyle::Body, muted, 64.);
+            let rss_g = truncated(ui, rss, egui::TextStyle::Body, color, 90.);
+            let name_w = (rect.width() - 72. - rss_g.size().x - 24.).max(20.);
+            let name_g = truncated(ui, name, egui::TextStyle::Body, color, name_w);
+            let p = ui.painter();
+            p.galley(
+                Pos2::new(rect.left() + 6., y - pid_g.size().y / 2.),
+                pid_g,
+                muted,
+            );
+            p.galley(
+                Pos2::new(rect.left() + 72., y - name_g.size().y / 2.),
+                name_g,
+                color,
+            );
+            let rx = rect.right() - 6. - rss_g.size().x;
+            p.galley(Pos2::new(rx, y - rss_g.size().y / 2.), rss_g, color);
+        };
+        row(ui, "PID", "Process", "Memory", muted);
+        egui::ScrollArea::vertical()
+            .id_salt(("processes", id))
             .scroll_source(
                 egui::scroll_area::ScrollSource::MOUSE_WHEEL
                     | egui::scroll_area::ScrollSource::SCROLL_BAR,
             )
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new(("processes", id))
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("PID");
-                        ui.strong("Process");
-                        ui.strong("RSS");
-                        ui.end_row();
-                        for (pid, name, rss) in &self.system.processes {
-                            if name.to_lowercase().contains(&filter) || pid.contains(&filter) {
-                                ui.monospace(pid);
-                                ui.label(name);
-                                ui.label(rss);
-                                ui.end_row();
-                            }
-                        }
-                    });
+                ui.spacing_mut().item_spacing.y = 0.;
+                for (pid, name, rss) in &self.system.processes {
+                    if name.to_lowercase().contains(&filter) || pid.contains(&filter) {
+                        row(ui, pid, name, rss, text);
+                    }
+                }
             });
     }
     pub(super) fn browser_pane(ui: &mut egui::Ui, ctx: &egui::Context, url: &mut String) {

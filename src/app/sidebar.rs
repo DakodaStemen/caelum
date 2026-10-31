@@ -36,15 +36,17 @@ impl App {
                         self.ensure_focus();
                     }
                     row.context_menu(|ui| {
-                        if ui.button("Rename…").clicked() {
+                        super::headerbar::menu_spacing(ui);
+                        ui.set_width(180.);
+                        if super::headerbar::menu_item(ui, "Rename…", None).clicked() {
                             self.state.active_workspace = id.clone();
                             self.action(Action::RenameWorkspace, ctx);
                         }
                         if ui
-                            .add_enabled(
-                                self.state.workspaces.len() > 1,
-                                egui::Button::new("Close"),
-                            )
+                            .add_enabled_ui(self.state.workspaces.len() > 1, |ui| {
+                                super::headerbar::menu_item(ui, "Close", None)
+                            })
+                            .inner
                             .clicked()
                         {
                             self.state.active_workspace = id.clone();

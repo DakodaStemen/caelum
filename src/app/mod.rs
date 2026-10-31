@@ -1320,8 +1320,9 @@ impl App {
         }
         self.window_edges(ctx);
         self.headerbar(ctx, &theme);
-        self.search_bar(ctx, &theme);
         self.sidebar(ctx, &theme);
+        // After the sidebar, so the bar spans only the content beside it.
+        self.search_bar(ctx, &theme);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme.ui("background")))
             .show(ctx, |ui| {

@@ -37,16 +37,12 @@ impl App {
             );
             return false;
         };
+        // A slim status line, like GNOME Text Editor's: the language and length, and
+        // Save only while there is something to save (Ctrl+S always works).
         ui.horizontal(|ui| {
+            ui.set_min_height(28.);
             if self.docio.saving(id) {
                 ui.spinner();
-            }
-            if ui
-                .add_enabled(!doc.read_only && doc.dirty(), egui::Button::new("Save"))
-                .on_hover_text("Ctrl+S")
-                .clicked()
-            {
-                self.pending_save = Some(id.to_string());
             }
             if doc.read_only {
                 ui.colored_label(theme.ui("danger"), "Unknown encoding · read only");
@@ -56,12 +52,15 @@ impl App {
                 RichText::new(format!("{language} · {lines} lines"))
                     .small()
                     .color(theme.ui("muted")),
-            );
-            ui.label(
-                RichText::new(doc.path.display().to_string())
-                    .small()
-                    .color(theme.ui("muted")),
-            );
+            )
+            .on_hover_text(doc.path.display().to_string());
+            if !doc.read_only && doc.dirty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+                        self.pending_save = Some(id.to_string());
+                    }
+                });
+            }
         });
         let font = FontId::monospace(self.state.preferences.font_size);
         let doc_path = doc.path.clone();
@@ -74,6 +73,7 @@ impl App {
             .font(egui::TextStyle::Monospace)
             .desired_width(f32::INFINITY)
             .interactive(!doc.read_only)
+            .frame(false)
             .code_editor()
             .layouter(&mut layouter);
         egui::ScrollArea::both()

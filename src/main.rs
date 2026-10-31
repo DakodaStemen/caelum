@@ -93,7 +93,7 @@ fn main() -> Result<()> {
             .with_title("Caelum Rust")
             .with_app_id("io.github.DakodaStemen.CaelumRust")
             .with_inner_size([1360., 880.])
-            .with_min_inner_size([760., 480.])
+            .with_min_inner_size([640., 400.])
             .with_icon(icon)
             // GNOME on Wayland draws no title bar for us: the headerbar is the title bar.
             .with_decorations(!csd),

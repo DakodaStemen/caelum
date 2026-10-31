@@ -376,12 +376,13 @@ impl App {
                 self.action(Action::RenameTab, ui.ctx());
             }
             response.context_menu(|ui| {
-                ui.set_min_width(180.);
-                if ui.button("Rename…").clicked() {
+                menu_spacing(ui);
+                ui.set_width(180.);
+                if menu_item(ui, "Rename…", None).clicked() {
                     self.workspace_mut().active_tab = id.clone();
                     self.action(Action::RenameTab, ui.ctx());
                 }
-                if ui.button("Close").clicked() {
+                if menu_item(ui, "Close", None).clicked() {
                     self.workspace_mut().active_tab = id.clone();
                     self.pending = Some(PendingClose::Tab);
                 }
@@ -424,7 +425,7 @@ impl App {
                         top: 7,
                         bottom: 7,
                     })
-                    .desired_width(width - 6.)
+                    .desired_width(width - 46.)
                     .text_color(if miss { c.danger } else { c.text });
                 let response = ui.add(edit);
                 let icon = Rect::from_center_size(
