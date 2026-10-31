@@ -1414,17 +1414,23 @@ fn paint_grid(
             found,
         );
     }
-    let show_cursor = focused
-        && term.mode().contains(TermMode::SHOW_CURSOR)
+    // The focused pane of a focused window shows a solid (blinking) cursor; any
+    // other terminal a hollow block, like VTE.
+    let window_focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
+    let active = focused && window_focused;
+    let show_cursor = term.mode().contains(TermMode::SHOW_CURSOR)
         && offset == 0
-        && (!prefs.cursor_blink || ui.input(|i| ((i.time * 2.) as u64).is_multiple_of(2)));
+        && (!active
+            || !prefs.cursor_blink
+            || ui.input(|i| ((i.time * 2.) as u64).is_multiple_of(2)));
+    let under = term.grid()[cursor.point].c;
     drop(term);
     if show_cursor {
         let r = Rect::from_min_size(
             m.cell_pos(cursor.point.column.0, cursor.point.line.0),
             Vec2::new(m.cw, m.ch),
         );
-        paint_cursor(theme, prefs, painter, r);
+        paint_cursor(theme, prefs, painter, r, active, under, &faces.regular);
     }
 }
 
@@ -1513,8 +1519,20 @@ fn paint_cell(
     }
 }
 
-fn paint_cursor(theme: &Theme, prefs: &Preferences, painter: &egui::Painter, r: Rect) {
+fn paint_cursor(
+    theme: &Theme,
+    prefs: &Preferences,
+    painter: &egui::Painter,
+    r: Rect,
+    active: bool,
+    under: char,
+    font: &FontId,
+) {
     let color = theme.term("cursor");
+    if !active {
+        painter.rect_stroke(r, 0., Stroke::new(1_f32, color), egui::StrokeKind::Inside);
+        return;
+    }
     match prefs.cursor_style.as_str() {
         "bar" => {
             painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(2_f32, color));
@@ -1526,7 +1544,17 @@ fn paint_cursor(theme: &Theme, prefs: &Preferences, painter: &egui::Painter, r: 
             );
         }
         _ => {
-            painter.rect_stroke(r, 0., Stroke::new(1.5_f32, color), egui::StrokeKind::Inside);
+            // A solid block with the character under it in the background color.
+            painter.rect_filled(r, 0., color);
+            if !under.is_whitespace() {
+                painter.text(
+                    r.min,
+                    egui::Align2::LEFT_TOP,
+                    under,
+                    font.clone(),
+                    theme.term("background"),
+                );
+            }
         }
     }
 }
