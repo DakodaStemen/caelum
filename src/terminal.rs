@@ -993,6 +993,47 @@ impl PointerMode {
     }
 }
 
+/// Font families for the terminal font's bold, italic and bold italic faces,
+/// registered by the app only when the font has them.
+pub const STYLED_FAMILIES: [&str; 3] = ["mono-bold", "mono-italic", "mono-bold-italic"];
+
+/// The fonts cells are drawn with: regular, then the bold, italic and bold italic
+/// faces where the font has them.
+struct Faces {
+    regular: FontId,
+    styled: [Option<FontId>; 3],
+}
+impl Faces {
+    fn new(ui: &egui::Ui, size: f32) -> Self {
+        let families = ui.fonts(|f| f.families());
+        let styled = STYLED_FAMILIES.map(|name| {
+            let family = egui::FontFamily::Name(name.into());
+            families
+                .contains(&family)
+                .then(|| FontId::new(size, family))
+        });
+        Self {
+            regular: FontId::monospace(size),
+            styled,
+        }
+    }
+    /// The font for a cell, and whether bold must be faked (no bold face).
+    fn pick(&self, bold: bool, italic: bool) -> (&FontId, bool) {
+        let [b, i, bi] = &self.styled;
+        match (bold, italic) {
+            (true, true) => match (bi, i, b) {
+                (Some(f), _, _) => (f, false),
+                (None, Some(f), _) => (f, true),
+                (None, None, Some(f)) => (f, false),
+                (None, None, None) => (&self.regular, true),
+            },
+            (true, false) => b.as_ref().map_or((&self.regular, true), |f| (f, false)),
+            (false, true) => (i.as_ref().unwrap_or(&self.regular), false),
+            (false, false) => (&self.regular, false),
+        }
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     s: &mut Session,
@@ -1013,7 +1054,8 @@ pub fn show(
         handle_events(ui, s, prefs, &response, &m, pointer);
     }
     let painter = ui.painter_at(m.rect);
-    paint_grid(ui, s, theme, prefs, &painter, &m, &font, focused, search);
+    let faces = Faces::new(ui, prefs.font_size);
+    paint_grid(ui, s, theme, prefs, &painter, &m, &faces, focused, search);
     paint_exit_badge(s, theme, prefs, &painter, m.rect);
     context_menu(s, &response, &mut clicked);
     clicked
@@ -1332,7 +1374,7 @@ fn paint_grid(
     prefs: &Preferences,
     painter: &egui::Painter,
     m: &Metrics,
-    font: &FontId,
+    faces: &Faces,
     focused: bool,
     search: &str,
 ) {
@@ -1355,7 +1397,7 @@ fn paint_grid(
             theme,
             painter,
             m,
-            font,
+            faces,
             colors,
             &cell,
             m.cell_pos(point.column.0, row),
@@ -1383,7 +1425,7 @@ fn paint_cell(
     theme: &Theme,
     painter: &egui::Painter,
     m: &Metrics,
-    font: &FontId,
+    faces: &Faces,
     colors: &alacritty_terminal::term::color::Colors,
     cell: &alacritty_terminal::grid::Indexed<&alacritty_terminal::term::cell::Cell>,
     pos: Pos2,
@@ -1431,16 +1473,34 @@ fn paint_cell(
         if let Some(extra) = cell.zerowidth() {
             text.extend(extra);
         }
-        painter.text(pos, egui::Align2::LEFT_TOP, text, font.clone(), fg);
+        let (font, fake_bold) = faces.pick(
+            cell.flags.contains(Flags::BOLD),
+            cell.flags.contains(Flags::ITALIC),
+        );
+        let galley = painter.layout_no_wrap(text, font.clone(), fg);
+        if fake_bold {
+            // No bold face: overstrike one pixel to the right, like VTE.
+            let px = 1. / painter.pixels_per_point();
+            painter.galley(pos + Vec2::new(px, 0.), galley.clone(), fg);
+        }
+        painter.galley(pos, galley, fg);
     }
-    if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+    let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+        2. * cw
+    } else {
+        cw
+    };
+    let line = |y: f32| {
         painter.line_segment(
-            [
-                Pos2::new(pos.x, pos.y + ch - 2.),
-                Pos2::new(pos.x + cw, pos.y + ch - 2.),
-            ],
+            [Pos2::new(pos.x, y), Pos2::new(pos.x + width, y)],
             Stroke::new(1_f32, fg),
         );
+    };
+    if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+        line(pos.y + ch - 2.);
+    }
+    if cell.flags.contains(Flags::STRIKEOUT) {
+        line(pos.y + ch / 2.);
     }
 }
 

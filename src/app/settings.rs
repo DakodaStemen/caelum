@@ -50,9 +50,10 @@ impl App {
                     fonts.families.entry(family).or_default().push(name.clone());
                 }
             }
+            let [mono, styled @ ..] = &self.mono_font;
             for (name, bytes, family) in [
                 ("system-ui", &self.ui_font, egui::FontFamily::Proportional),
-                ("system-mono", &self.mono_font, egui::FontFamily::Monospace),
+                ("system-mono", mono, egui::FontFamily::Monospace),
             ] {
                 if let Some(bytes) = bytes {
                     fonts.font_data.insert(
@@ -66,6 +67,22 @@ impl App {
                         .insert(0, name.into());
                 }
             }
+            // The terminal's bold and italic faces, each falling back like the
+            // regular one; only registered when the font has them.
+            let mono_list = fonts.families[&egui::FontFamily::Monospace].clone();
+            for (family, bytes) in caelum_rs::terminal::STYLED_FAMILIES.iter().zip(styled) {
+                if let Some(bytes) = bytes {
+                    fonts.font_data.insert(
+                        (*family).into(),
+                        egui::FontData::from_owned(bytes.clone()).into(),
+                    );
+                    let mut list = vec![(*family).to_string()];
+                    list.extend(mono_list.iter().cloned());
+                    fonts
+                        .families
+                        .insert(egui::FontFamily::Name((*family).into()), list);
+                }
+            }
             ctx.set_fonts(fonts);
         }
         let name = self.state.preferences.terminal_font.clone();
@@ -77,7 +94,7 @@ impl App {
         self.font_rx = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(resolve_font(&name));
+            let _ = tx.send(resolve_mono(&name));
             ctx.request_repaint();
         });
     }
@@ -456,10 +473,31 @@ fn theme_editor(
     });
 }
 
-/// Resolves a font family (fontconfig first, then standard font directories) and
-/// returns its bytes if egui can parse them.
-fn resolve_font(name: &str) -> Option<Vec<u8>> {
-    resolve_family(name, true)
+/// The terminal font's regular, bold, italic and bold italic faces.
+pub(super) type MonoFaces = [Option<Vec<u8>>; 4];
+
+/// Resolves the terminal font family (fontconfig first, then standard font
+/// directories) and, through fontconfig, its bold and italic faces. A style the
+/// family lacks (fontconfig answers with the regular file) is left out.
+fn resolve_mono(name: &str) -> MonoFaces {
+    let regular = resolve_family(name, true);
+    let styled = |style: &str| -> Option<Vec<u8>> {
+        let regular = regular.as_ref()?;
+        let family = if name.is_empty() { "monospace" } else { name };
+        let output = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "--", &format!("{family}:{style}")])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        fs::read(String::from_utf8_lossy(&output.stdout).trim())
+            .ok()
+            .filter(|b| b != regular && ab_glyph::FontRef::try_from_slice(b).is_ok())
+    };
+    let bold = styled("weight=bold");
+    let italic = styled("slant=italic");
+    let bold_italic = styled("weight=bold:slant=italic")
+        .filter(|b| Some(b) != bold.as_ref() && Some(b) != italic.as_ref());
+    [regular, bold, italic, bold_italic]
 }
 /// `mono`: an empty name means the system monospace font, and the platform
 /// fallbacks are monospace families.
