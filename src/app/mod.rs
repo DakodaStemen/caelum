@@ -1,6 +1,8 @@
 mod editor;
 mod panes;
 mod persist;
+#[cfg(test)]
+mod screens;
 mod settings;
 mod sidebar;
 mod terminal_pane;
@@ -228,6 +230,8 @@ pub struct App {
     keymap: Keymap,
     config_watch: Option<config::Watcher>,
     writer: model::BackgroundWriter,
+    /// Terminals launch the hermetic test shell (offscreen screenshot tests).
+    test_shell: bool,
     docio: files::DocumentIo,
 }
 struct Smoke {
@@ -243,7 +247,7 @@ struct Smoke {
 }
 impl App {
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &egui::Context,
         profile: PathBuf,
         mut state: State,
         message: String,
@@ -255,12 +259,12 @@ impl App {
             .map(|i| i.to_rgba8())
             .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
         let size = [image.width() as usize, image.height() as usize];
-        let logo = cc.egui_ctx.load_texture(
+        let logo = ctx.load_texture(
             "Caelum",
             egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
             Default::default(),
         );
-        let mut style = (*cc.egui_ctx.style()).clone();
+        let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = Vec2::new(8., 8.);
         style.spacing.button_padding = Vec2::new(12., 7.);
         style
@@ -269,7 +273,7 @@ impl App {
         style
             .text_styles
             .insert(egui::TextStyle::Button, FontId::proportional(14.));
-        cc.egui_ctx.set_style(style);
+        ctx.set_style(style);
         if smoke.is_some() {
             let demo = profile.join("demo");
             let _ = fs::create_dir_all(demo.join("src"));
@@ -342,15 +346,16 @@ impl App {
             keymap: Keymap::default(),
             config_watch: None,
             writer: model::BackgroundWriter::new(),
+            test_shell: false,
             docio: {
-                let ctx = cc.egui_ctx.clone();
+                let ctx = ctx.clone();
                 files::DocumentIo::new(move || ctx.request_repaint())
             },
         };
         if app.smoke.is_none() {
             // Smoke runs use an isolated profile and must not read the user's config.
-            app.reload_config(&cc.egui_ctx, false);
-            match config::Watcher::new(&app.config_path, cc.egui_ctx.clone()) {
+            app.reload_config(ctx, false);
+            match config::Watcher::new(&app.config_path, ctx.clone()) {
                 Ok(w) => app.config_watch = Some(w),
                 Err(e) => app.message = format!("Config watcher unavailable: {e}"),
             }
@@ -1092,6 +1097,16 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_now();
+        self.terminals.clear();
+    }
+}
+impl App {
+    /// One UI frame; split from `eframe::App::update` so offscreen tests can drive it.
+    fn frame(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
@@ -1157,10 +1172,6 @@ impl eframe::App for App {
                 500
             },
         ));
-    }
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist_now();
-        self.terminals.clear();
     }
 }
 /// Config action name -> app action for every rebindable shortcut in [`config::ACTIONS`].

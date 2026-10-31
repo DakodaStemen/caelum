@@ -43,6 +43,9 @@ x11rb = { version = "0.14", features = ["xtest"] }
 lto = "thin"
 strip = true
 
+[dev-dependencies]
+egui_kittest = { version = "0.33", features = ["wgpu"] }
+
 # Packaging via cargo-packager (https://github.com/crabnebula-dev/cargo-packager).
 # Release artifacts are built by .github/workflows/release.yml. RPMs use the
 # [package.metadata.generate-rpm] table below since cargo-packager has no rpm target.

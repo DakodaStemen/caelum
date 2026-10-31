@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         options,
         Box::new(move |cc| {
             Ok(Box::new(app::App::new(
-                cc,
+                &cc.egui_ctx,
                 profile,
                 state,
                 message,

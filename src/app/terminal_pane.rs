@@ -31,7 +31,7 @@ impl App {
                 return false;
             }
             let test_command = caelum_rs::platform::test_shell_command();
-            let chosen = if self.smoke.is_some() {
+            let chosen = if self.smoke.is_some() || self.test_shell {
                 Some(test_command.as_slice())
             } else {
                 command.as_deref()
