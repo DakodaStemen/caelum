@@ -29,9 +29,27 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ui_font_rx = None,
             }
         }
+        if let Some(rx) = &self.fallback_rx
+            && let Ok(list) = rx.try_recv()
+        {
+            self.fallback_rx = None;
+            self.fallback_fonts = list;
+            changed = true;
+        }
         if changed {
-            // egui's bundled fonts stay as fallbacks for missing glyphs.
+            // egui's bundled fonts stay as fallbacks for missing glyphs, then the
+            // system's fonts for other scripts.
             let mut fonts = egui::FontDefinitions::default();
+            for (i, bytes) in self.fallback_fonts.iter().enumerate() {
+                let name = format!("system-fallback-{i}");
+                fonts.font_data.insert(
+                    name.clone(),
+                    egui::FontData::from_owned(bytes.clone()).into(),
+                );
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    fonts.families.entry(family).or_default().push(name.clone());
+                }
+            }
             for (name, bytes, family) in [
                 ("system-ui", &self.ui_font, egui::FontFamily::Proportional),
                 ("system-mono", &self.mono_font, egui::FontFamily::Monospace),
@@ -73,6 +91,16 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(resolve_family(&family, false));
+            ctx.request_repaint();
+        });
+    }
+    /// Resolves fonts for scripts egui's bundled fonts lack, in the background.
+    pub(super) fn load_fallback_fonts(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.fallback_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_fallbacks());
             ctx.request_repaint();
         });
     }
@@ -472,6 +500,32 @@ fn resolve_family(name: &str, mono: bool) -> Option<Vec<u8>> {
             .and_then(|p| fs::read(p).ok())
             .and_then(parse)
     })
+}
+
+/// fontconfig's choice of font for a few scripts (Han/kana/Hangul, Arabic, Hebrew,
+/// Devanagari, Thai), each file once. Empty without fontconfig.
+fn resolve_fallbacks() -> Vec<Vec<u8>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for lang in ["ja", "ko", "zh-cn", "ar", "he", "hi", "th"] {
+        let Ok(output) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "--", &format!("sans-serif:lang={lang}")])
+            .output()
+        else {
+            return out;
+        };
+        let file = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || file.is_empty() || !seen.insert(file.clone()) {
+            continue;
+        }
+        if let Some(bytes) = fs::read(&file)
+            .ok()
+            .filter(|b| ab_glyph::FontRef::try_from_slice(b).is_ok())
+        {
+            out.push(bytes);
+        }
+    }
+    out
 }
 
 fn font_dirs() -> Vec<PathBuf> {

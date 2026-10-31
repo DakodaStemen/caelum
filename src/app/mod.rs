@@ -244,6 +244,10 @@ pub struct App {
     ui_font: Option<Vec<u8>>,
     mono_font: Option<Vec<u8>>,
     ui_font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    /// System fonts for scripts the UI and terminal fonts lack (CJK, Arabic, ...),
+    /// appended after them so those glyphs are not drawn as boxes.
+    fallback_fonts: Vec<Vec<u8>>,
+    fallback_rx: Option<std::sync::mpsc::Receiver<Vec<Vec<u8>>>>,
     /// Where the panes of the active tab were laid out last frame.
     pane_area: Option<Rect>,
     /// When the current status message appeared (toasts hide after a few seconds).
@@ -358,6 +362,8 @@ impl App {
             ui_font: None,
             mono_font: None,
             ui_font_rx: None,
+            fallback_fonts: Vec::new(),
+            fallback_rx: None,
             pane_area: None,
             message_shown: None,
             about: false,
@@ -405,6 +411,7 @@ impl App {
         app.restore_drafts();
         app.ensure_focus();
         app.load_ui_font(ctx, look.ui_font.as_ref().map(|(family, _)| family.clone()));
+        app.load_fallback_fonts(ctx);
         app.look = look;
         app
     }
