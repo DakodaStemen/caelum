@@ -469,6 +469,61 @@ impl Pane {
         }
         Err(SplitError::NoRoom)
     }
+    /// Closes the leaf `target`: its sibling takes its place, the panes left in its
+    /// run share the freed space equally (as a split shares it out), and the leaf
+    /// beside the closed one is returned for focus. `None` if `target` is not a
+    /// leaf of a split here.
+    pub fn close(&mut self, target: &str) -> Option<String> {
+        let (focus, run) = self.close_inner(target)?;
+        if let Some(axis) = run {
+            self.equalize_run(axis);
+        }
+        Some(focus)
+    }
+    /// Returns the leaf to focus, and the axis of a run that still needs balancing
+    /// from higher up.
+    fn close_inner(&mut self, target: &str) -> Option<(String, Option<Axis>)> {
+        let Self::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let axis = *axis;
+        let leaf = |p: &Pane, last: bool| {
+            let mut leaves = vec![];
+            p.leaves(&mut leaves);
+            let pick = if last { leaves.last() } else { leaves.first() };
+            pick.map(|l| l.id().to_string()).unwrap_or_default()
+        };
+        if first.id() == target && !matches!(**first, Self::Split { .. }) {
+            let focus = leaf(second, false);
+            *self = *second.clone();
+            return Some((focus, Some(axis)));
+        }
+        if second.id() == target && !matches!(**second, Self::Split { .. }) {
+            let focus = leaf(first, true);
+            *self = *first.clone();
+            return Some((focus, Some(axis)));
+        }
+        for child in [first, second] {
+            if let Some((focus, run)) = child.close_inner(target) {
+                return Some(match run {
+                    // Still inside this split's run: balance from further up.
+                    Some(a) if a == axis => (focus, Some(a)),
+                    Some(a) => {
+                        child.equalize_run(a);
+                        (focus, None)
+                    }
+                    None => (focus, None),
+                });
+            }
+        }
+        None
+    }
     pub fn remove(&mut self, target: &str) -> bool {
         if let Self::Split { first, second, .. } = self {
             if first.id() == target {
@@ -1199,6 +1254,31 @@ mod tests {
         assert!(!p.split_toward(&root, term(), Direction::Right));
         assert_eq!(leaf_ids(&p).len(), 2);
     }
+    #[test]
+    fn closing_a_pane_rebalances_its_run_and_focuses_its_neighbour() {
+        let mut p = term();
+        let area = PaneRect::new(0., 0., 1200., 800.);
+        let mut ids = vec![p.id().to_string()];
+        for _ in 0..3 {
+            let n = term();
+            let target = ids.last().unwrap().clone();
+            ids.push(n.id().to_string());
+            p.try_split(&target, n, Direction::Right, area, MIN_PANE, 1.)
+                .unwrap();
+        }
+        // Four equal columns; close the second.
+        assert_eq!(p.close(&ids[1]), Some(ids[2].clone()));
+        let rects = p.leaf_rects(area, 1.);
+        assert_eq!(rects.len(), 3);
+        for (_, r) in &rects {
+            assert!((r.w - (1200. - 2.) / 3.).abs() < 1., "{rects:?}");
+        }
+        // Closing the last column focuses the one before it.
+        assert_eq!(p.close(&ids[3]), Some(ids[2].clone()));
+        assert_eq!(p.close(&ids[2]), Some(ids[0].clone()));
+        assert_eq!(p.close(&ids[0]), None);
+    }
+
     #[test]
     fn equalize_balances_every_run() {
         let mut p = term();

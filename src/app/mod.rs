@@ -1107,8 +1107,9 @@ impl App {
             PendingClose::Pane => {
                 let focused = self.focused.clone();
                 let cwd = self.cwd();
-                if !self.tab_mut().layout.remove(&focused) {
-                    self.tab_mut().layout = Pane::terminal(cwd);
+                match self.tab_mut().layout.close(&focused) {
+                    Some(next) => self.focused = next,
+                    None => self.tab_mut().layout = Pane::terminal(cwd),
                 }
             }
         }
