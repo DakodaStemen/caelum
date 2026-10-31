@@ -817,7 +817,8 @@ impl App {
                 (
                     i.consume_key(Modifiers::NONE, Key::ArrowUp),
                     i.consume_key(Modifiers::NONE, Key::ArrowDown),
-                    i.key_pressed(Key::Enter),
+                    // Consumed, so a dialog the action opens does not also see it.
+                    i.consume_key(Modifiers::NONE, Key::Enter),
                 )
             });
             let n = matches.len();
