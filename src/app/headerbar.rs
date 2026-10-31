@@ -9,6 +9,8 @@ use egui::{CornerRadius, Margin, ResizeDirection, emath::GuiRounding};
 /// libadwaita headerbar height (47 incl. its bottom shade line).
 const BAR: f32 = 46.;
 const TAB_BAR: f32 = 40.;
+/// Narrowest a tab gets before the tab bar scrolls.
+const MIN_TAB: f32 = 140.;
 
 impl App {
     pub(super) fn headerbar(&mut self, ctx: &egui::Context, theme: &Theme) {
@@ -293,18 +295,42 @@ impl App {
         );
         let gap = 4.;
         let n = tabs.len() as f32;
-        let width = ((area.width() - gap * (n - 1.)) / n).max(60.);
+        // Tabs share the bar down to a minimum width; past that the bar scrolls
+        // (wheel or the selected tab), like `AdwTabBar`.
+        let width = ((area.width() - gap * (n - 1.)) / n).max(MIN_TAB);
+        let total = n * width + gap * (n - 1.);
+        let overflow = (total - area.width()).max(0.);
+        if overflow > 0. && ui.rect_contains_pointer(area) {
+            let delta = ui.input(|i| i.smooth_scroll_delta);
+            self.tab_scroll -= if delta.x != 0. { delta.x } else { delta.y };
+        }
+        let key = (active_id.clone(), tabs.len(), area.width() as i32);
+        if let Some(i) = tabs.iter().position(|(id, _)| *id == active_id)
+            && self.tab_scroll_key != key
+        {
+            self.tab_scroll_key = key;
+            let left = i as f32 * (width + gap);
+            self.tab_scroll = self
+                .tab_scroll
+                .clamp(left + width - area.width(), left.max(0.));
+        }
+        self.tab_scroll = self.tab_scroll.clamp(0., overflow).round();
+        let scroll = self.tab_scroll;
         let ppp = ui.pixels_per_point();
         let rects: Vec<Rect> = (0..tabs.len())
             .map(|i| {
                 Rect::from_min_size(
-                    Pos2::new(area.left() + i as f32 * (width + gap), area.top()),
+                    Pos2::new(area.left() + i as f32 * (width + gap) - scroll, area.top()),
                     Vec2::new(width, area.height()),
                 )
                 .round_to_pixels(ppp)
             })
             .collect();
-        let hovered: Vec<bool> = rects.iter().map(|r| ui.rect_contains_pointer(*r)).collect();
+        ui.set_clip_rect(area.intersect(ui.clip_rect()));
+        let hovered: Vec<bool> = rects
+            .iter()
+            .map(|r| ui.rect_contains_pointer(r.intersect(area)))
+            .collect();
         let raised = |i: usize| tabs[i].0 == active_id || hovered[i];
         for (i, rect) in rects.iter().enumerate().skip(1) {
             if !raised(i - 1) && !raised(i) {
@@ -318,8 +344,15 @@ impl App {
         }
         for (i, (id, name)) in tabs.into_iter().enumerate() {
             let rect = rects[i];
+            if !rect.intersects(area) {
+                continue;
+            }
             let active = active_id == id;
-            let response = ui.interact(rect, egui::Id::new(("tab", &id)), Sense::click());
+            let response = ui.interact(
+                rect.intersect(area),
+                egui::Id::new(("tab", &id)),
+                Sense::click(),
+            );
             response
                 .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
             let fill = if active {
@@ -387,6 +420,27 @@ impl App {
                     self.pending = Some(PendingClose::Tab);
                 }
             });
+        }
+        // Fade the tabs cut off at a scrolled edge into the bar.
+        let fade = 24.;
+        if scroll > 0. {
+            edge_fade(
+                ui,
+                Rect::from_min_size(area.min, Vec2::new(fade, area.height())),
+                chrome,
+                true,
+            );
+        }
+        if scroll < overflow {
+            edge_fade(
+                ui,
+                Rect::from_min_size(
+                    Pos2::new(area.right() - fade, area.top()),
+                    Vec2::new(fade, area.height()),
+                ),
+                chrome,
+                false,
+            );
         }
     }
     /// The find bar, a `GtkSearchBar` under the headerbar: an entry with a find icon,
@@ -761,6 +815,24 @@ fn zoom_row(ui: &mut egui::Ui, theme: &Theme) {
             }
         },
     );
+}
+
+/// A horizontal gradient over `rect` from `color` (at the left edge when
+/// `from_left`) to transparent.
+fn edge_fade(ui: &egui::Ui, rect: Rect, color: Color32, from_left: bool) {
+    let (l, r) = if from_left {
+        (color, Color32::TRANSPARENT)
+    } else {
+        (Color32::TRANSPARENT, color)
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), l);
+    mesh.colored_vertex(rect.right_top(), r);
+    mesh.colored_vertex(rect.right_bottom(), r);
+    mesh.colored_vertex(rect.left_bottom(), l);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(mesh);
 }
 
 fn fill_or(fill: Color32, base: Color32) -> Color32 {

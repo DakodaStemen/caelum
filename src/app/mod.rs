@@ -248,6 +248,10 @@ pub struct App {
     /// appended after them so those glyphs are not drawn as boxes.
     fallback_fonts: Vec<Vec<u8>>,
     fallback_rx: Option<std::sync::mpsc::Receiver<Vec<Vec<u8>>>>,
+    /// Horizontal scroll of an overflowing tab bar, and the (selected tab, tab count,
+    /// bar width) it last scrolled the selected tab into view for.
+    tab_scroll: f32,
+    tab_scroll_key: (String, usize, i32),
     /// Where the panes of the active tab were laid out last frame.
     pane_area: Option<Rect>,
     /// When the current status message appeared (toasts hide after a few seconds).
@@ -364,6 +368,8 @@ impl App {
             ui_font_rx: None,
             fallback_fonts: Vec::new(),
             fallback_rx: None,
+            tab_scroll: 0.,
+            tab_scroll_key: (String::new(), 0, 0),
             pane_area: None,
             message_shown: None,
             about: false,
