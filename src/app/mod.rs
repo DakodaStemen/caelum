@@ -100,7 +100,11 @@ impl FileView {
                             self.entries = entries;
                             self.error.clear();
                         }
-                        Err(e) => self.error = e,
+                        Err(e) => {
+                            // Never leave the previous folder's files under the error.
+                            self.entries.clear();
+                            self.error = e;
+                        }
                     }
                     self.loaded = Some((dir, filter));
                     self.refreshed = Some(Instant::now());

@@ -1,5 +1,6 @@
 use super::icons::{self, Icon, Palette};
 use super::*;
+use egui::emath::GuiRounding;
 
 /// Space between neighbouring panes: a one-point divider line.
 pub(super) const GAP: f32 = 1.;
@@ -386,11 +387,27 @@ impl App {
                 .desired_width(ui.available_width()),
         );
         ui.add_space(2.);
+        let shown = view
+            .loaded
+            .as_ref()
+            .is_some_and(|(p, f)| p == path && *f == view.filter);
         if !view.error.is_empty() {
-            ui.colored_label(theme.ui("danger"), &view.error);
+            // "Permission denied (os error 13)" -> "Permission denied".
+            let reason = view.error.split(" (os error").next().unwrap_or_default();
+            status_page(ui, theme, Icon::Folder, "Cannot Open Folder", reason);
+            return;
+        }
+        if shown && view.entries.is_empty() {
+            let (title, text) = if view.filter.is_empty() {
+                ("Folder Is Empty", "")
+            } else {
+                ("No Results Found", "Try a different filter")
+            };
+            status_page(ui, theme, Icon::Folder, title, text);
+            return;
         }
         let mut open = None;
-        egui::ScrollArea::both()
+        egui::ScrollArea::vertical()
             .scroll_source(
                 egui::scroll_area::ScrollSource::MOUSE_WHEEL
                     | egui::scroll_area::ScrollSource::SCROLL_BAR,
@@ -515,11 +532,10 @@ fn file_row(
     name: &str,
     directory: bool,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(160.), 28.),
-        Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    let mut cut = false;
     if ui.is_rect_visible(rect) {
         if response.hovered() {
             ui.painter()
@@ -544,8 +560,43 @@ fn file_row(
             theme.ui("text"),
             rect.width() - 40.,
         );
+        cut = galley.elided;
         let pos = Pos2::new(rect.left() + 32., rect.center().y - galley.size().y / 2.);
         ui.painter().galley(pos, galley, theme.ui("text"));
     }
-    response
+    // The whole name of one cut short.
+    if cut {
+        response.on_hover_text(name)
+    } else {
+        response
+    }
+}
+
+/// An `AdwStatusPage` in miniature: a dimmed icon, a title and an optional line of
+/// explanation, centered in the space left.
+fn status_page(ui: &mut egui::Ui, theme: &Theme, icon: Icon, title: &str, text: &str) {
+    let muted = theme.ui("muted");
+    let area = ui.available_rect_before_wrap();
+    let width = area.width();
+    let title_g = truncated(ui, title, egui::TextStyle::Heading, theme.ui("text"), width);
+    let text_g = truncated(ui, text, egui::TextStyle::Body, muted, width);
+    let icon_size = 48.;
+    let height = icon_size + 12. + title_g.size().y + 4. + text_g.size().y;
+    // Centered, but never above the top of the space.
+    let top = (area.center().y - height / 2.).max(area.top()).round();
+    let x = area.center().x;
+    icons::paint(
+        ui,
+        Rect::from_center_size(Pos2::new(x, top + icon_size / 2.), Vec2::splat(icon_size)),
+        icon,
+        icon_size,
+        muted.gamma_multiply(0.6),
+    );
+    let ppp = ui.pixels_per_point();
+    let mut y = top + icon_size + 12.;
+    let title_pos = Pos2::new(x - title_g.size().x / 2., y).round_to_pixels(ppp);
+    y += title_g.size().y + 4.;
+    super::adw::paint_bold(ui.painter(), title_pos, title_g, theme.ui("text"));
+    let text_pos = Pos2::new(x - text_g.size().x / 2., y).round_to_pixels(ppp);
+    ui.painter().galley(text_pos, text_g, muted);
 }
