@@ -141,8 +141,8 @@ fn menus_and_split_popover() {
     let d = tempfile::tempdir().unwrap();
     let mut h = harness(Vec2::new(1000., 640.), 1., d.path(), State::default());
     save(&mut h, "tmp");
-    let menu = node_rect(&h, "Main menu", 1.);
-    h.get_all_by_label("Main menu").next().unwrap().click();
+    let menu = node_rect(&h, "Main Menu", 1.);
+    h.get_all_by_label("Main Menu").next().unwrap().click();
     h.hover_at(menu.center() + Vec2::new(-80., 120.));
     save(&mut h, "main-menu");
     h.key_press(egui::Key::Escape);
@@ -205,7 +205,7 @@ fn pane_close_button_zoom_levels() {
             let d = tempfile::tempdir().unwrap();
             let mut h = harness(Vec2::new(900., 560.), ppp, d.path(), State::default());
             save(&mut h, "tmp");
-            let close = node_rect(&h, "Close pane", ppp);
+            let close = node_rect(&h, "Close Pane", ppp);
             if hover {
                 h.hover_at(close.center());
             }

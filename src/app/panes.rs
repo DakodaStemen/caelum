@@ -194,7 +194,7 @@ impl App {
         let ui = &mut bar_ui;
         ui.spacing_mut().item_spacing.x = 2.;
         let button = Vec2::splat(24.);
-        if icons::flat(ui, Icon::Close, button, 14., pal, "Close pane", false).clicked() {
+        if icons::flat(ui, Icon::Close, button, 16., pal, "Close Pane", false).clicked() {
             self.focused = id.to_string();
             self.pending = Some(PendingClose::Pane);
         }
@@ -202,15 +202,15 @@ impl App {
         let roomy = bar.width() > 150.;
         if roomy {
             let (icon, tip) = if zoomed {
-                (Icon::Restore, "Restore pane")
+                (Icon::Restore, "Restore Pane")
             } else {
-                (Icon::Maximize, "Zoom pane")
+                (Icon::Maximize, "Zoom Pane")
             };
-            if icons::flat(ui, icon, button, 14., pal, tip, zoomed).clicked() {
+            if icons::flat(ui, icon, button, 16., pal, tip, zoomed).clicked() {
                 self.focused = id.to_string();
                 self.zoom = if zoomed { None } else { Some(id.to_string()) };
             }
-            let split = icons::flat(ui, Icon::Split, button, 14., pal, "Split pane", false);
+            let split = icons::flat(ui, Icon::Split, button, 16., pal, "Split Pane", false);
             if split.clicked() {
                 self.focused = id.to_string();
             }
@@ -249,7 +249,8 @@ impl App {
         }
         focus_requested
     }
-    /// A popover with four arrows around a balance button; returns the chosen action.
+    /// A popover with four arrows around a balance button, and a caption naming the
+    /// hovered choice and its shortcut; returns the chosen action.
     pub(super) fn split_popover(&self, anchor: &egui::Response, theme: &Theme) -> Option<Action> {
         let mut chosen = None;
         egui::Popup::menu(anchor)
@@ -257,45 +258,71 @@ impl App {
             .gap(4.)
             .show(|ui| {
                 let pal = Palette {
-                    base: theme.ui("surface"),
+                    base: ui.visuals().window_fill,
                     fg: theme.ui("text"),
                 };
-                let cell = Vec2::splat(34.);
-                ui.spacing_mut().item_spacing = Vec2::splat(2.);
-                egui::Grid::new("split-compass")
-                    .striped(false)
-                    .spacing(Vec2::splat(2.))
-                    .show(ui, |ui| {
-                        let shortcut = |name: &str| {
-                            self.keymap
-                                .get(name)
-                                .map(|b| format!(" ({})", binding_label(b)))
-                                .unwrap_or_default()
-                        };
-                        let arrow = |ui: &mut egui::Ui, dir: Direction, key: &str| {
-                            let label = format!("{}{}", dir.label(), shortcut(key));
-                            icons::flat(ui, Icon::Arrow(dir), cell, 16., pal, &label, false)
-                                .clicked()
-                                .then_some(Action::Split(dir))
-                        };
-                        let mut picks = vec![];
-                        ui.allocate_space(cell);
-                        picks.push(arrow(ui, Direction::Up, "split_up"));
-                        ui.allocate_space(cell);
-                        ui.end_row();
-                        picks.push(arrow(ui, Direction::Left, "split_left"));
-                        let label = format!("Balance panes{}", shortcut("balance_panes"));
-                        if icons::flat(ui, Icon::Balance, cell, 16., pal, &label, false).clicked() {
-                            picks.push(Some(Action::Equalize));
-                        }
-                        picks.push(arrow(ui, Direction::Right, "split_right"));
-                        ui.end_row();
-                        ui.allocate_space(cell);
-                        picks.push(arrow(ui, Direction::Down, "split_below"));
-                        ui.allocate_space(cell);
-                        ui.end_row();
-                        chosen = picks.into_iter().flatten().next();
-                    });
+                let cell = Vec2::splat(40.);
+                let gap = 4.;
+                let shortcut =
+                    |name: &str| self.keymap.get(name).map(binding_label).unwrap_or_default();
+                let choices = [
+                    (Some(Icon::Arrow(Direction::Up)), "Split Up", "split_up"),
+                    (None, "", ""),
+                    (
+                        Some(Icon::Arrow(Direction::Left)),
+                        "Split Left",
+                        "split_left",
+                    ),
+                    (Some(Icon::Balance), "Balance Panes", "balance_panes"),
+                    (
+                        Some(Icon::Arrow(Direction::Right)),
+                        "Split Right",
+                        "split_right",
+                    ),
+                    (None, "", ""),
+                    (
+                        Some(Icon::Arrow(Direction::Down)),
+                        "Split Down",
+                        "split_below",
+                    ),
+                ];
+                let width = cell.x * 3. + gap * 2.;
+                let mut caption = ("Split Pane".to_string(), String::new());
+                ui.spacing_mut().item_spacing = Vec2::splat(gap);
+                ui.vertical_centered(|ui| {
+                    ui.set_width(width + 40.);
+                    // Rows: [up], [left balance right], [down].
+                    for row in [&choices[0..1], &choices[2..5], &choices[6..7]] {
+                        let w = row.len() as f32 * cell.x + (row.len() as f32 - 1.) * gap;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(w, cell.y),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                for (icon, label, key) in row {
+                                    let Some(icon) = icon else { continue };
+                                    let r = icons::tile(ui, *icon, cell, pal, label);
+                                    if r.hovered() {
+                                        caption = (label.to_string(), shortcut(key));
+                                    }
+                                    if r.clicked() {
+                                        chosen = Some(match icon {
+                                            Icon::Arrow(dir) => Action::Split(*dir),
+                                            _ => Action::Equalize,
+                                        });
+                                    }
+                                }
+                            },
+                        );
+                    }
+                    ui.add_space(2.);
+                    ui.label(RichText::new(&caption.0).color(theme.ui("text")));
+                    let keys = if caption.1.is_empty() {
+                        " ".to_string()
+                    } else {
+                        caption.1.clone()
+                    };
+                    ui.label(RichText::new(keys).small().color(theme.ui("muted")));
+                });
             });
         chosen
     }
@@ -359,6 +386,10 @@ impl App {
         }
         let mut open = None;
         egui::ScrollArea::both()
+            .scroll_source(
+                egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                    | egui::scroll_area::ScrollSource::SCROLL_BAR,
+            )
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.;
@@ -379,23 +410,28 @@ impl App {
     }
     pub(super) fn system_pane(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         self.system.refresh(ui.ctx());
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(16.);
-            for (name, value) in [
-                ("LOAD AVERAGE", &self.system.load),
-                ("MEMORY", &self.system.memory),
-                ("UPTIME", &self.system.uptime),
-            ] {
-                ui.label(RichText::new(name).small().color(theme.ui("muted")));
-                ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));
-                ui.add_space(20.);
-            }
-            let cpus = std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1);
-            ui.label(format!("{cpus} logical CPUs"));
-            ui.label(std::env::consts::OS);
-        });
+        egui::ScrollArea::vertical()
+            .scroll_source(
+                egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                    | egui::scroll_area::ScrollSource::SCROLL_BAR,
+            )
+            .show(ui, |ui| {
+                ui.add_space(16.);
+                for (name, value) in [
+                    ("LOAD AVERAGE", &self.system.load),
+                    ("MEMORY", &self.system.memory),
+                    ("UPTIME", &self.system.uptime),
+                ] {
+                    ui.label(RichText::new(name).small().color(theme.ui("muted")));
+                    ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));
+                    ui.add_space(20.);
+                }
+                let cpus = std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1);
+                ui.label(format!("{cpus} logical CPUs"));
+                ui.label(std::env::consts::OS);
+            });
     }
     pub(super) fn processes_pane(&mut self, ui: &mut egui::Ui, id: &str) {
         self.system.refresh(ui.ctx());
@@ -406,6 +442,10 @@ impl App {
         );
         let filter = self.process_filter.to_lowercase();
         egui::ScrollArea::both()
+            .scroll_source(
+                egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                    | egui::scroll_area::ScrollSource::SCROLL_BAR,
+            )
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new(("processes", id))
@@ -461,10 +501,10 @@ fn file_row(
         );
         let muted = theme.ui("muted");
         icons::paint(
-            ui.painter(),
+            ui,
             icon,
             if directory { Icon::Folder } else { Icon::File },
-            14.,
+            16.,
             muted,
         );
         let galley = truncated(

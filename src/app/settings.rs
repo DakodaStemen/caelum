@@ -1,4 +1,6 @@
+use super::adw;
 use super::*;
+use egui::emath::GuiRounding;
 
 impl App {
     /// Installs resolved fonts when they arrive and starts resolving a changed
@@ -74,224 +76,356 @@ impl App {
             ctx.request_repaint();
         });
     }
+    /// The preferences dialog, an `AdwPreferencesDialog`: grouped boxed lists of rows.
     pub(super) fn appearance(&mut self, ctx: &egui::Context) {
-        let mut open = true;
+        let theme = self.theme();
         let mut draft = self.theme_draft.take();
         let mut save_draft = false;
         let mut cancel_draft = false;
-        egui::Window::new("Preferences")
-            .open(&mut open)
-            .collapsible(false)
-            .default_pos(ctx.content_rect().center())
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_width(650.)
-            .max_height(650.)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(t) = &mut draft {
-                        ui.label(
-                            "Customize every interface and terminal color. Changes preview live.",
-                        );
-                        ui.text_edit_singleline(&mut t.name);
-                        egui::ComboBox::from_label("Kind")
-                            .selected_text(&t.kind)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut t.kind, "dark".into(), "Dark");
-                                ui.selectable_value(&mut t.kind, "light".into(), "Light");
-                            });
-                        ui.separator();
-                        for (name, values) in [
-                            ("Code", &mut t.syntax),
-                            ("Interface", &mut t.ui),
-                            ("Terminal", &mut t.terminal),
-                        ] {
-                            ui.strong(name);
-                            egui::Grid::new(name).num_columns(2).show(ui, |ui| {
-                                for (key, value) in values {
-                                    ui.label(key);
-                                    ui.horizontal(|ui| {
-                                        if let Some(c) = theme::color(value) {
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                Vec2::splat(18.),
-                                                Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(rect, 3., c);
-                                        }
-                                        ui.add(
-                                            egui::TextEdit::singleline(value).desired_width(110.),
-                                        );
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                        }
-                        if let Err(e) = t.validate() {
-                            ui.colored_label(Color32::LIGHT_RED, e.to_string());
-                        }
-                        ui.horizontal(|ui| {
-                            save_draft = ui
-                                .add_enabled(t.validate().is_ok(), egui::Button::new("Save theme"))
-                                .clicked();
-                            cancel_draft = ui.button("Cancel preview").clicked();
-                        });
-                    } else {
-                        let follow = self.state.preferences.follow_system;
-                        if ui
-                            .radio(follow, "Follow system style")
-                            .on_hover_text("Adwaita light or dark, with the desktop's accent color")
-                            .clicked()
-                        {
-                            self.state.preferences.follow_system = true;
-                        }
-                        ui.add_space(4.);
-                        ui.label(RichText::new("Or pick a theme").small().color(self.theme().ui("muted")));
-                        ui.add_space(4.);
-                        egui::Grid::new("themes")
-                            .num_columns(5)
-                            .spacing([8., 12.])
-                            .show(ui, |ui| {
-                                for (i, (id, t)) in self.presets.iter().enumerate() {
-                                    let b = egui::Button::new(
-                                        RichText::new(&t.name).color(t.ui("text")),
-                                    )
-                                    .fill(t.ui("background"))
-                                    .stroke(if !follow && self.state.preferences.theme == *id {
-                                        Stroke::new(2_f32, self.theme().ui("accent"))
-                                    } else {
-                                        Stroke::NONE
-                                    });
-                                    if ui.add_sized([110., 40.], b).clicked() {
-                                        self.state.preferences.theme = id.clone();
-                                        self.state.preferences.follow_system = false;
-                                    }
-                                    if i % 5 == 4 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                        for t in &self.state.preferences.custom_themes {
-                            if ui
-                                .selectable_label(
-                                    !follow && self.state.preferences.theme == t.id,
-                                    &t.name,
-                                )
-                                .clicked()
-                            {
-                                self.state.preferences.theme = t.id.clone();
-                                self.state.preferences.follow_system = false;
-                            }
-                        }
-                        if ui.button("Customize current theme").clicked() {
-                            let mut t = self.theme();
-                            t.id = model::id();
-                            t.name = format!("{} custom", t.name);
-                            draft = Some(t);
-                        }
-                        ui.separator();
-                        ui.strong("Type and cursor");
-                        egui::ComboBox::from_label("Terminal font")
-                            .selected_text(if self.state.preferences.terminal_font.is_empty() {
-                                "System monospace"
-                            } else {
-                                &self.state.preferences.terminal_font
-                            })
-                            .show_ui(ui, |ui| {
-                                for name in ["monospace", "DejaVu Sans Mono", "Liberation Mono"] {
-                                    ui.selectable_value(
-                                        &mut self.state.preferences.terminal_font,
-                                        name.into(),
-                                        name,
-                                    );
-                                }
-                            });
-                        ui.add(
-                            egui::Slider::new(&mut self.state.preferences.font_size, 10. ..=28.)
-                                .text("Terminal size"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.state.preferences.line_height, 1. ..=2.)
-                                .text("Line height"),
-                        );
-                        egui::ComboBox::from_label("Cursor")
-                            .selected_text(&self.state.preferences.cursor_style)
-                            .show_ui(ui, |ui| {
-                                for style in ["block", "bar", "underline"] {
-                                    ui.selectable_value(
-                                        &mut self.state.preferences.cursor_style,
-                                        style.into(),
-                                        style,
-                                    );
-                                }
-                            });
-                        ui.checkbox(&mut self.state.preferences.cursor_blink, "Blink cursor");
-                        ui.checkbox(
-                            &mut self.state.preferences.confirm_multiline_paste,
-                            "Confirm multi-line paste",
-                        )
-                        .on_hover_text(
-                            "Ask before pasting several lines into a program that has not enabled bracketed paste",
-                        );
-                        ui.separator();
-                        ui.strong("Share themes");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.theme_path)
-                                .hint_text(RichText::new("Absolute path to a theme JSON file").color(ui.visuals().weak_text_color()))
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui.button("Export current theme").clicked() {
-                                let result = (|| -> Result<()> {
-                                    let path = PathBuf::from(&self.theme_path);
-                                    if !path.is_absolute() {
-                                        bail!("Choose an absolute file path");
-                                    }
-                                    let mut file = fs::OpenOptions::new()
-                                        .write(true)
-                                        .create_new(true)
-                                        .open(path)?;
-                                    file.write_all(&serde_json::to_vec_pretty(&self.theme())?)?;
-                                    Ok(())
-                                })();
-                                self.message = match result {
-                                    Ok(()) => "Theme exported".into(),
-                                    Err(e) => e.to_string(),
-                                };
-                            }
-                            if ui.button("Import theme").clicked() {
-                                let result = (|| -> Result<Theme> {
-                                    let mut t: Theme =
-                                        serde_json::from_slice(&fs::read(&self.theme_path)?)?;
-                                    t.validate()?;
-                                    t.id = model::id();
-                                    Ok(t)
-                                })();
-                                match result {
-                                    Ok(t) => {
-                                        self.state.preferences.theme = t.id.clone();
-                                        self.state.preferences.follow_system = false;
-                                        self.state.preferences.custom_themes.push(t);
-                                    }
-                                    Err(e) => self.message = e.to_string(),
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.label(format!("App data: {}", self.profile.display()));
-                        ui.label("Escape closes this window.");
-                    }
-                });
-            });
+        let title = if draft.is_some() {
+            "Customize Theme"
+        } else {
+            "Preferences"
+        };
+        let close = adw::dialog(
+            ctx,
+            "preferences",
+            title,
+            Vec2::new(640., 760.),
+            &theme,
+            |ui| {
+                if let Some(t) = &mut draft {
+                    theme_editor(ui, &theme, t, &mut save_draft, &mut cancel_draft);
+                } else {
+                    self.preferences_page(ui, &theme, &mut draft);
+                }
+            },
+        );
         if save_draft && let Some(t) = draft.take() {
             self.state.preferences.theme = t.id.clone();
             self.state.preferences.follow_system = false;
             self.state.preferences.custom_themes.push(t);
         }
-        if cancel_draft || !open {
+        if cancel_draft {
             draft = None;
         }
+        // Closing the editor returns to the preferences; closing those closes the dialog.
+        if close {
+            if draft.is_some() {
+                draft = None;
+            } else {
+                self.settings = false;
+            }
+        }
         self.theme_draft = draft;
-        self.settings = open;
     }
+
+    fn preferences_page(&mut self, ui: &mut egui::Ui, theme: &Theme, draft: &mut Option<Theme>) {
+        let c = adw::Colors::new(theme);
+        let prefs = &mut self.state.preferences;
+        adw::group(ui, theme, "Appearance", None, |g| {
+            g.row(
+                "Follow System Style",
+                Some("Adwaita light or dark, with the desktop's accent color"),
+                |ui| {
+                    adw::switch(ui, &mut prefs.follow_system, &c);
+                },
+            );
+            g.content(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(10.);
+                // As many columns of at least 96 points as fit, filling the row.
+                let avail = ui.available_width();
+                let columns = ((avail + 10.) / 106.).floor().max(1.);
+                let width = (avail - 10. * (columns - 1.)) / columns - 0.5;
+                ui.horizontal_wrapped(|ui| {
+                    let customs = prefs.custom_themes.iter().map(|t| (&t.id, t));
+                    let mut picked = None;
+                    for (id, t) in self.presets.iter().chain(customs) {
+                        let selected = !prefs.follow_system && prefs.theme == *id;
+                        if swatch(ui, t, selected, width, &c).clicked() {
+                            picked = Some(id.clone());
+                        }
+                    }
+                    if let Some(id) = picked {
+                        prefs.theme = id;
+                        prefs.follow_system = false;
+                    }
+                });
+            });
+            if g.link_row(
+                "Customize Current Theme",
+                Some("Edit every interface and terminal color"),
+            )
+            .clicked()
+            {
+                let mut t = theme.clone();
+                t.id = model::id();
+                t.name = format!("{} Custom", t.name);
+                *draft = Some(t);
+            }
+        });
+        adw::group(ui, theme, "Terminal Font", None, |g| {
+            g.row("Font", None, |ui| {
+                let mut fonts = vec!["System Default", "DejaVu Sans Mono", "Liberation Mono"];
+                let current = match prefs.terminal_font.as_str() {
+                    "" | "monospace" => "System Default",
+                    other => other,
+                };
+                if !fonts.contains(&current) {
+                    fonts.push(current);
+                }
+                if let Some(i) = adw::dropdown(ui, "font", current, &fonts, &c) {
+                    prefs.terminal_font = match fonts[i] {
+                        "System Default" => String::new(),
+                        name => name.to_string(),
+                    };
+                }
+            });
+            g.row("Size", None, |ui| {
+                adw::spin(ui, &mut prefs.font_size, 10. ..=28., 1., 0, &c);
+            });
+            g.row("Line Height", None, |ui| {
+                adw::spin(ui, &mut prefs.line_height, 1. ..=2., 0.05, 2, &c);
+            });
+        });
+        adw::group(ui, theme, "Cursor", None, |g| {
+            g.row("Shape", None, |ui| {
+                let shapes = ["Block", "Bar", "Underline"];
+                let current = shapes
+                    .iter()
+                    .find(|s| s.eq_ignore_ascii_case(&prefs.cursor_style))
+                    .copied()
+                    .unwrap_or("Block");
+                if let Some(i) = adw::dropdown(ui, "cursor", current, &shapes, &c) {
+                    prefs.cursor_style = shapes[i].to_lowercase();
+                }
+            });
+            g.row("Blink", None, |ui| {
+                adw::switch(ui, &mut prefs.cursor_blink, &c);
+            });
+        });
+        adw::group(ui, theme, "Behavior", None, |g| {
+            g.row(
+                "Confirm Multi-line Paste",
+                Some("Ask before pasting several lines into a program without bracketed paste"),
+                |ui| {
+                    adw::switch(ui, &mut prefs.confirm_multiline_paste, &c);
+                },
+            );
+            g.row("Show Workspaces Sidebar", None, |ui| {
+                adw::switch(ui, &mut prefs.sidebar, &c);
+            });
+        });
+        let mut export = false;
+        let mut import = false;
+        adw::group(
+            ui,
+            theme,
+            "Share Themes",
+            Some("Export the current theme as JSON, or import one from a file."),
+            |g| {
+                g.content(|ui| {
+                    ui.add(adw::entry(
+                        &mut self.theme_path,
+                        "Absolute path to a theme JSON file",
+                        &c,
+                    ));
+                    ui.add_space(4.);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.;
+                        let w = (ui.available_width() - 12.) / 2.;
+                        export = adw::button(ui, "Export", adw::Kind::Normal, w, &c).clicked();
+                        import = adw::button(ui, "Import", adw::Kind::Normal, w, &c).clicked();
+                    });
+                });
+            },
+        );
+        if export {
+            let result = (|| -> Result<()> {
+                let path = PathBuf::from(&self.theme_path);
+                if !path.is_absolute() {
+                    bail!("Choose an absolute file path");
+                }
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                file.write_all(&serde_json::to_vec_pretty(theme)?)?;
+                Ok(())
+            })();
+            self.message = match result {
+                Ok(()) => "Theme exported".into(),
+                Err(e) => e.to_string(),
+            };
+        }
+        if import {
+            let result = (|| -> Result<Theme> {
+                let mut t: Theme = serde_json::from_slice(&fs::read(&self.theme_path)?)?;
+                t.validate()?;
+                t.id = model::id();
+                Ok(t)
+            })();
+            match result {
+                Ok(t) => {
+                    self.state.preferences.theme = t.id.clone();
+                    self.state.preferences.follow_system = false;
+                    self.state.preferences.custom_themes.push(t);
+                }
+                Err(e) => self.message = e.to_string(),
+            }
+        }
+        ui.add_space(14.);
+        ui.label(
+            RichText::new(format!("Settings are stored in {}", self.profile.display()))
+                .small()
+                .color(c.muted),
+        );
+    }
+}
+
+/// A theme preview tile: its window color, name, and a strip of its terminal colors;
+/// the selected one gets an accent ring and check.
+fn swatch(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    selected: bool,
+    width: f32,
+    c: &adw::Colors,
+) -> egui::Response {
+    let size = Vec2::new(width, 64.);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, &t.name)
+    });
+    let ppp = ui.pixels_per_point();
+    let rect = rect.round_to_pixels(ppp);
+    let painter = ui.painter();
+    if selected {
+        painter.rect_stroke(
+            rect.expand(3.),
+            13,
+            Stroke::new(2_f32, c.accent),
+            egui::StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        painter.rect_stroke(
+            rect.expand(3.),
+            13,
+            Stroke::new(2_f32, theme::mix(c.card, c.text, 0.25)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let inner = rect.shrink(1.);
+    painter.rect_filled(inner, 10, t.term("background"));
+    painter.rect_stroke(
+        inner,
+        10,
+        Stroke::new(1_f32, Color32::from_white_alpha(18)),
+        egui::StrokeKind::Inside,
+    );
+    let name = super::truncated(
+        ui,
+        &t.name,
+        egui::TextStyle::Small,
+        t.term("foreground"),
+        inner.width() - 12.,
+    );
+    ui.painter().galley(
+        Pos2::new(inner.left() + 8., inner.top() + 9.).round_to_pixels(ppp),
+        name,
+        t.term("foreground"),
+    );
+    let colors = ["red", "green", "yellow", "blue", "magenta", "cyan"];
+    for (i, key) in colors.iter().enumerate() {
+        let center = Pos2::new(inner.left() + 13. + i as f32 * 13., inner.bottom() - 15.);
+        ui.painter().circle_filled(center, 4.5, t.term(key));
+    }
+    response.on_hover_text(&t.name)
+}
+
+/// `borderStrong` → `Border Strong`, for theme color keys.
+fn title_case(key: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in key.chars().enumerate() {
+        if i == 0 {
+            out.extend(ch.to_uppercase());
+        } else if ch.is_uppercase() {
+            out.push(' ');
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The theme editor page: name and style, then every color as a row.
+fn theme_editor(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    t: &mut Theme,
+    save: &mut bool,
+    cancel: &mut bool,
+) {
+    let c = adw::Colors::new(theme);
+    ui.label(RichText::new("Changes preview live.").color(c.muted));
+    adw::group(ui, theme, "Theme", None, |g| {
+        g.content(|ui| {
+            ui.add(adw::entry(&mut t.name, "Name", &c));
+        });
+        g.row("Style", None, |ui| {
+            let kinds = ["Dark", "Light"];
+            let current = if t.kind == "light" { "Light" } else { "Dark" };
+            if let Some(i) = adw::dropdown(ui, "kind", current, &kinds, &c) {
+                t.kind = kinds[i].to_lowercase();
+            }
+        });
+    });
+    for (name, values) in [
+        ("Interface", &mut t.ui),
+        ("Terminal", &mut t.terminal),
+        ("Code", &mut t.syntax),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        adw::group(ui, theme, name, None, |g| {
+            for (key, value) in values.iter_mut() {
+                g.row(&title_case(key), None, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .desired_width(96.)
+                            .margin(Vec2::new(8., 6.)),
+                    );
+                    if let Some(color) = theme::color(value) {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.), Sense::hover());
+                        ui.painter().rect_filled(rect, 6, color);
+                        ui.painter().rect_stroke(
+                            rect,
+                            6,
+                            Stroke::new(1_f32, theme::mix(c.card, c.text, 0.3)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                });
+            }
+        });
+    }
+    ui.add_space(12.);
+    if let Err(e) = t.validate() {
+        ui.colored_label(c.danger, e.to_string());
+    }
+    ui.add_space(6.);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.;
+        let w = (ui.available_width() - 12.) / 2.;
+        *cancel = adw::button(ui, "Cancel", adw::Kind::Normal, w, &c).clicked();
+        let valid = t.validate().is_ok();
+        let r = ui.add_enabled_ui(valid, |ui| {
+            adw::button(ui, "Save Theme", adw::Kind::Suggested, w, &c)
+        });
+        *save = valid && r.inner.clicked();
+    });
 }
 
 /// Resolves a font family (fontconfig first, then standard font directories) and

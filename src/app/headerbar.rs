@@ -73,19 +73,19 @@ impl App {
                 }
                 if icons::flat(
                     &mut left,
-                    Icon::Plus,
+                    Icon::Find,
                     size,
                     16.,
                     pal,
-                    &self.tip("New tab", "new_tab"),
-                    false,
+                    &self.tip("Find", "search"),
+                    self.search_open,
                 )
                 .clicked()
                 {
-                    self.action(Action::NewTab, ctx);
+                    self.action(Action::Search, ctx);
                 }
                 let left_edge = left.min_rect().right();
-                // Right cluster.
+                // Right cluster, laid out from the window edge inwards.
                 let mut right = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(bar)
@@ -97,8 +97,21 @@ impl App {
                     order.reverse();
                     self.window_controls(&mut right, &order, pal, maximized, ctx);
                 }
-                let menu = icons::flat(&mut right, Icon::Menu, size, 16., pal, "Main menu", false);
-                self.main_menu(&menu);
+                let menu = icons::flat(&mut right, Icon::Menu, size, 16., pal, "Main Menu", false);
+                self.main_menu(&menu, theme);
+                if icons::flat(
+                    &mut right,
+                    Icon::NewTab,
+                    size,
+                    16.,
+                    pal,
+                    &self.tip("New Tab", "new_tab"),
+                    false,
+                )
+                .clicked()
+                {
+                    self.action(Action::NewTab, ctx);
+                }
                 let split = icons::flat(&mut right, Icon::Split, size, 16., pal, "Split", false);
                 if let Some(a) = self.split_popover(&split, theme) {
                     self.pending_action = Some(a);
@@ -121,11 +134,8 @@ impl App {
                 let top = bar.center().y - height / 2.;
                 let painter = ui.painter();
                 let ppp = painter.pixels_per_point();
-                painter.galley(
-                    Pos2::new(cx - galley.size().x / 2., top).round_to_pixels(ppp),
-                    galley.clone(),
-                    pal.fg,
-                );
+                let pos = Pos2::new(cx - galley.size().x / 2., top).round_to_pixels(ppp);
+                super::adw::paint_bold(painter, pos, galley.clone(), pal.fg);
                 if let Some(sub) = sub {
                     painter.galley(
                         Pos2::new(cx - sub.size().x / 2., top + galley.size().y)
@@ -144,7 +154,7 @@ impl App {
                         .fill(chrome)
                         .inner_margin(Margin::symmetric(6, 0)),
                 )
-                .show(ctx, |ui| self.tab_bar(ui, ctx, theme));
+                .show(ctx, |ui| self.tab_bar(ui, theme));
         }
         // The headerbar's bottom shade line.
         egui::TopBottomPanel::top("headerbar-shade")
@@ -211,31 +221,31 @@ impl App {
             }
         }
     }
-    fn main_menu(&mut self, anchor: &egui::Response) {
+    /// The primary menu, laid out like a GNOME app's: a zoom row, then sections.
+    fn main_menu(&mut self, anchor: &egui::Response, theme: &Theme) {
         let mut chosen = None;
         egui::Popup::menu(anchor)
             .align(egui::RectAlign::BOTTOM_END)
             .gap(4.)
             .show(|ui| {
-                ui.set_width(250.);
+                ui.set_width(260.);
+                menu_spacing(ui);
+                zoom_row(ui, theme);
+                ui.separator();
                 let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
-                    let mut button = egui::Button::new(label)
-                        .frame_when_inactive(false)
-                        .min_size(Vec2::new(ui.max_rect().width(), 30.));
-                    if let Some(b) = self.keymap.get(key) {
-                        button = button.shortcut_text(binding_label(b));
-                    }
-                    ui.add(button).clicked().then_some(action)
+                    let shortcut = self.keymap.get(key).map(binding_label);
+                    menu_item(ui, label, shortcut).clicked().then_some(action)
                 };
                 let mut picks = vec![
                     item(ui, "New Tab", "new_tab", Action::NewTab),
                     item(ui, "New Workspace", "", Action::NewWorkspace),
+                    item(ui, "Open File…", "open_file", Action::Open),
                 ];
-                ui.separator();
-                picks.push(item(ui, "Open File…", "open_file", Action::Open));
-                ui.menu_button("New Pane", |ui| {
-                    ui.set_width(190.);
+                submenu(ui, "New Pane", |ui| {
+                    ui.set_width(200.);
+                    menu_spacing(ui);
                     for (label, action) in [
+                        ("Terminal", Action::Split(Direction::Right)),
                         ("Files", Action::Files),
                         ("System Monitor", Action::System),
                         ("Processes", Action::Processes),
@@ -247,16 +257,16 @@ impl App {
                     }
                 });
                 ui.separator();
+                picks.push(item(ui, "Find…", "search", Action::Search));
                 picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
                 picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
-                picks.push(item(ui, "Find…", "search", Action::Search));
-                ui.separator();
                 picks.push(item(
                     ui,
                     "Command Palette",
                     "command_palette",
                     Action::Palette,
                 ));
+                ui.separator();
                 picks.push(item(ui, "Preferences", "", Action::Settings));
                 picks.push(item(ui, "About Caelum", "", Action::About));
                 chosen = picks.into_iter().flatten().next();
@@ -265,54 +275,73 @@ impl App {
             self.pending_action = chosen;
         }
     }
-    fn tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &Theme) {
+    /// An `AdwTabBar`: equal-width tabs filling the bar, the selected one raised, thin
+    /// separators between the others, a close button on the selected or hovered tab.
+    fn tab_bar(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let chrome = theme.ui("chrome");
+        let text = theme.ui("text");
         let tabs: Vec<_> = self
             .workspace()
             .tabs
             .iter()
             .map(|t| (t.id.clone(), self.tab_label(t)))
             .collect();
-        let area = ui.max_rect().shrink2(Vec2::new(0., 4.));
+        let active_id = self.workspace().active_tab.clone();
+        let area = Rect::from_min_max(
+            ui.max_rect().min,
+            Pos2::new(ui.max_rect().right(), ui.max_rect().top() + 34.),
+        );
         let gap = 4.;
         let n = tabs.len() as f32;
         let width = ((area.width() - gap * (n - 1.)) / n).max(60.);
-        let mut x = area.left();
-        for (id, name) in tabs {
-            let rect =
-                Rect::from_min_size(Pos2::new(x, area.top()), Vec2::new(width, area.height()));
-            x += width + gap;
-            let active = self.workspace().active_tab == id;
+        let ppp = ui.pixels_per_point();
+        let rects: Vec<Rect> = (0..tabs.len())
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(area.left() + i as f32 * (width + gap), area.top()),
+                    Vec2::new(width, area.height()),
+                )
+                .round_to_pixels(ppp)
+            })
+            .collect();
+        let hovered: Vec<bool> = rects.iter().map(|r| ui.rect_contains_pointer(*r)).collect();
+        let raised = |i: usize| tabs[i].0 == active_id || hovered[i];
+        for (i, rect) in rects.iter().enumerate().skip(1) {
+            if !raised(i - 1) && !raised(i) {
+                let x = (rect.left() - gap / 2.).round_to_pixel_center(ppp);
+                ui.painter().vline(
+                    x,
+                    egui::Rangef::new(area.top() + 4., area.bottom() - 4.),
+                    Stroke::new(1. / ppp, theme::mix(chrome, text, 0.15)),
+                );
+            }
+        }
+        for (i, (id, name)) in tabs.into_iter().enumerate() {
+            let rect = rects[i];
+            let active = active_id == id;
             let response = ui.interact(rect, egui::Id::new(("tab", &id)), Sense::click());
             response
                 .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
             let fill = if active {
-                theme::mix(chrome, theme.ui("text"), 0.10)
-            } else if response.hovered() {
-                theme::mix(chrome, theme.ui("text"), 0.05)
+                theme::mix(chrome, text, 0.10)
+            } else if hovered[i] {
+                theme::mix(chrome, text, 0.06)
             } else {
                 Color32::TRANSPARENT
             };
-            let painter = ui.painter();
-            painter.rect_filled(rect.round_to_pixels(painter.pixels_per_point()), 6, fill);
-            let fg = if active {
-                theme.ui("text")
-            } else {
-                theme.ui("textSecondary")
-            };
+            ui.painter().rect_filled(rect, 8, fill);
             let close_room = 30.;
             let galley = truncated(
                 ui,
                 &name,
                 egui::TextStyle::Body,
-                fg,
+                text,
                 rect.width() - 2. * close_room,
             );
             let pos = rect.center() - galley.size() / 2.;
-            ui.painter()
-                .galley(pos.round_to_pixels(ui.pixels_per_point()), galley, fg);
+            ui.painter().galley(pos.round_to_pixels(ppp), galley, text);
             let mut close = response.middle_clicked();
-            if active || response.hovered() || ui.rect_contains_pointer(rect) {
+            if active || hovered[i] {
                 let button = Rect::from_center_size(
                     Pos2::new(rect.right() - 17., rect.center().y),
                     Vec2::splat(24.),
@@ -320,15 +349,15 @@ impl App {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(button));
                 let pal = Palette {
                     base: fill_or(fill, chrome),
-                    fg,
+                    fg: text,
                 };
                 close |= icons::flat(
                     &mut child,
                     Icon::Close,
                     Vec2::splat(24.),
-                    14.,
+                    16.,
                     pal,
-                    "Close tab",
+                    "Close Tab",
                     false,
                 )
                 .clicked();
@@ -344,11 +373,110 @@ impl App {
                 self.ensure_focus();
             }
             if response.double_clicked() {
-                self.dialog = Some("Rename tab".into());
-                self.dialog_input = self.tab().name.clone();
+                self.action(Action::RenameTab, ui.ctx());
             }
+            response.context_menu(|ui| {
+                ui.set_min_width(180.);
+                if ui.button("Rename…").clicked() {
+                    self.workspace_mut().active_tab = id.clone();
+                    self.action(Action::RenameTab, ui.ctx());
+                }
+                if ui.button("Close").clicked() {
+                    self.workspace_mut().active_tab = id.clone();
+                    self.pending = Some(PendingClose::Tab);
+                }
+            });
         }
-        let _ = ctx;
+    }
+    /// The find bar, a `GtkSearchBar` under the headerbar: an entry with a find icon,
+    /// then previous and next. Enter finds the next match, Shift+Enter the previous,
+    /// Escape closes it.
+    pub(super) fn search_bar(&mut self, ctx: &egui::Context, theme: &Theme) {
+        if !self.search_open {
+            return;
+        }
+        let c = super::adw::Colors::new(theme);
+        // Part of the content area, like Console's search bar over the terminal.
+        let chrome = theme.term("background");
+        egui::TopBottomPanel::top("searchbar")
+            .exact_height(46.)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(chrome))
+            .show(ctx, |ui| {
+                let bar = ui.max_rect();
+                let width = (bar.width() - 24. - 2. * 40.).clamp(120., 380.);
+                let total = width + 2. * 40.;
+                let row = Rect::from_center_size(bar.center(), Vec2::new(total, 34.));
+                let mut row_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let ui = &mut row_ui;
+                ui.spacing_mut().item_spacing.x = 6.;
+                let miss = self.search_miss && !self.search_query.is_empty();
+                let edit = egui::TextEdit::singleline(&mut self.search_query)
+                    .id(egui::Id::new("find-entry"))
+                    .hint_text(RichText::new("Find text").color(c.muted))
+                    .margin(egui::Margin {
+                        left: 32,
+                        right: 8,
+                        top: 7,
+                        bottom: 7,
+                    })
+                    .desired_width(width - 6.)
+                    .text_color(if miss { c.danger } else { c.text });
+                let response = ui.add(edit);
+                let icon = Rect::from_center_size(
+                    Pos2::new(response.rect.left() + 17., response.rect.center().y),
+                    Vec2::splat(16.),
+                );
+                icons::paint(ui, icon, Icon::Find, 16., c.muted);
+                if response.changed() {
+                    self.search_miss = false;
+                }
+                let pal = Palette {
+                    base: chrome,
+                    fg: theme.ui("text"),
+                };
+                let mut find = None;
+                if icons::flat(
+                    ui,
+                    Icon::Arrow(Direction::Up),
+                    Vec2::splat(34.),
+                    16.,
+                    pal,
+                    "Previous Match (Shift+Enter)",
+                    false,
+                )
+                .clicked()
+                {
+                    find = Some(false);
+                }
+                if icons::flat(
+                    ui,
+                    Icon::Arrow(Direction::Down),
+                    Vec2::splat(34.),
+                    16.,
+                    pal,
+                    "Next Match (Enter)",
+                    false,
+                )
+                .clicked()
+                {
+                    find = Some(true);
+                }
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    find = Some(!ui.input(|i| i.modifiers.shift));
+                    response.request_focus();
+                }
+                self.search_focus = response.has_focus();
+                if let Some(forward) = find
+                    && let Some(session) = self.terminals.get_mut(&self.focused)
+                {
+                    self.search_miss = !session.search(&self.search_query, forward);
+                }
+            });
     }
     /// The status message as a libadwaita-style toast at the bottom of the window.
     pub(super) fn toast(&mut self, ctx: &egui::Context, theme: &Theme) {
@@ -420,37 +548,55 @@ impl App {
             ctx.request_repaint_after(Duration::from_secs(6) - age);
         }
     }
+    /// An `AdwAboutDialog`: the app icon, name, developer and version, then links.
     pub(super) fn about_dialog(&mut self, ctx: &egui::Context, theme: &Theme) {
-        let mut open = self.about;
-        egui::Window::new("About Caelum")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size([300., 0.])
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(8.);
-                    ui.label(
-                        RichText::new("Caelum")
-                            .heading()
-                            .color(theme.ui("textStrong")),
-                    );
-                    ui.label(
-                        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                            .color(theme.ui("muted")),
-                    );
-                    ui.add_space(6.);
-                    ui.label("A native workspace terminal.");
-                    ui.hyperlink_to("Website", env!("CARGO_PKG_REPOSITORY"));
-                    ui.add_space(6.);
-                    if ui.button("Close").clicked() {
-                        self.about = false;
-                    }
-                });
+        if !self.about {
+            return;
+        }
+        let c = super::adw::Colors::new(theme);
+        let close = super::adw::dialog(ctx, "about", "", Vec2::new(360., 470.), theme, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Image::from_bytes(
+                        "bytes://caelum-icon.png",
+                        include_bytes!("../../assets/brand/icon.png"),
+                    )
+                    .fit_to_exact_size(Vec2::splat(128.)),
+                );
+                ui.add_space(10.);
+                let size = egui::TextStyle::Body.resolve(ui.style()).size * 1.6;
+                super::adw::bold(ui, "Caelum", Some(size), c.text);
+                ui.label(RichText::new("Dakoda Stemen").color(c.text));
+                ui.add_space(6.);
+                // The version, in an accent-tinted pill.
+                let version = env!("CARGO_PKG_VERSION").to_string();
+                let galley = ui.painter().layout_no_wrap(
+                    version,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    c.accent,
+                );
+                let (rect, _) =
+                    ui.allocate_exact_size(galley.size() + Vec2::new(24., 10.), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 99, c.accent.gamma_multiply(0.18));
+                ui.painter().galley(
+                    (rect.center() - galley.size() / 2.).round_to_pixels(ui.pixels_per_point()),
+                    galley,
+                    c.accent,
+                );
+                ui.add_space(4.);
+                ui.label(RichText::new("A native workspace terminal.").color(c.muted));
             });
-        self.about &= open;
+            super::adw::group(ui, theme, "", None, |g| {
+                if g.link_row("Website", None).clicked() {
+                    g.ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab(env!("CARGO_PKG_REPOSITORY")));
+                }
+            });
+        });
+        if close {
+            self.about = false;
+        }
     }
     /// With client-side decorations the window has no frame to grab, so the outer few
     /// points resize it. Call before the panels so the headerbar can tell a resize
@@ -539,6 +685,81 @@ impl App {
             );
         }
     }
+}
+
+/// GTK popover menus: 32-point rows, 12 points of padding, no gap between rows.
+pub(super) fn menu_spacing(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.y = 0.;
+    ui.spacing_mut().button_padding = Vec2::new(12., 0.);
+}
+
+/// One row of a popover menu, with its shortcut dimmed on the right.
+pub(super) fn menu_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: Option<String>,
+) -> egui::Response {
+    let mut button = egui::Button::new(label)
+        .frame_when_inactive(false)
+        .min_size(Vec2::new(ui.available_width(), 32.));
+    if let Some(s) = shortcut {
+        button = button.shortcut_text(s);
+    }
+    ui.add(button)
+}
+
+/// A menu row that opens a submenu, marked with GTK's `pan-end` arrow.
+pub(super) fn submenu(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
+    let color = ui.visuals().text_color();
+    let button = egui::Button::new(label)
+        .frame_when_inactive(false)
+        .min_size(Vec2::new(ui.available_width(), 32.))
+        .right_text(icons::image(Icon::PanEnd, 16., color));
+    egui::containers::menu::SubMenuButton::from_button(button).ui(ui, content);
+}
+
+/// The zoom row at the top of the main menu: out, the current level (resets), in.
+fn zoom_row(ui: &mut egui::Ui, theme: &Theme) {
+    let ctx = ui.ctx().clone();
+    let pal = Palette {
+        base: ui.visuals().window_fill,
+        fg: theme.ui("text"),
+    };
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 40.),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 0.;
+            let side = Vec2::new(width / 3., 34.);
+            if icons::flat(
+                ui,
+                Icon::ZoomOut,
+                side,
+                16.,
+                pal,
+                "Zoom Out (Ctrl+-)",
+                false,
+            )
+            .clicked()
+            {
+                egui::gui_zoom::zoom_out(&ctx);
+            }
+            let level = format!("{:.0}%", ctx.zoom_factor() * 100.);
+            let reset = ui
+                .add_sized(
+                    side,
+                    egui::Button::new(RichText::new(level).strong()).frame_when_inactive(false),
+                )
+                .on_hover_text("Reset Zoom (Ctrl+0)");
+            if reset.clicked() {
+                ctx.set_zoom_factor(1.);
+            }
+            if icons::flat(ui, Icon::ZoomIn, side, 16., pal, "Zoom In (Ctrl+=)", false).clicked() {
+                egui::gui_zoom::zoom_in(&ctx);
+            }
+        },
+    );
 }
 
 fn fill_or(fill: Color32, base: Color32) -> Color32 {

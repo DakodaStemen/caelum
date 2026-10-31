@@ -1,3 +1,4 @@
+mod adw;
 mod editor;
 mod headerbar;
 mod icons;
@@ -29,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Action {
     NewTab,
     NewWorkspace,
@@ -212,11 +213,18 @@ pub struct App {
     message: String,
     palette: bool,
     palette_query: String,
+    palette_index: usize,
     settings: bool,
     theme_draft: Option<Theme>,
     theme_path: String,
     dialog: Option<String>,
     dialog_input: String,
+    /// The find bar under the headerbar: open, its text, whether the entry has focus,
+    /// and whether the last search found nothing.
+    search_open: bool,
+    search_query: String,
+    search_focus: bool,
+    search_miss: bool,
     pending: Option<PendingClose>,
     allow_close: bool,
     last_save: Instant,
@@ -288,6 +296,7 @@ impl App {
         look: SystemLook,
         csd: bool,
     ) -> Self {
+        egui_extras::install_image_loaders(ctx);
         if smoke.is_some() {
             let demo = profile.join("demo");
             let _ = fs::create_dir_all(demo.join("src"));
@@ -326,11 +335,16 @@ impl App {
             message,
             palette: false,
             palette_query: String::new(),
+            palette_index: 0,
             settings: false,
             theme_draft: None,
             theme_path: String::new(),
             dialog: None,
             dialog_input: String::new(),
+            search_open: false,
+            search_query: String::new(),
+            search_focus: false,
+            search_miss: false,
             pending: None,
             allow_close: false,
             last_save: Instant::now(),
@@ -587,12 +601,12 @@ impl App {
             }
             Action::About => self.about = true,
             Action::RenameWorkspace => {
-                self.dialog = Some("Rename workspace".into());
+                self.dialog = Some("Rename Workspace".into());
                 self.dialog_input = self.workspace().name.clone();
             }
             Action::CloseWorkspace => self.pending = Some(PendingClose::Workspace),
             Action::RenameTab => {
-                self.dialog = Some("Rename tab".into());
+                self.dialog = Some("Rename Tab".into());
                 self.dialog_input = self.tab().name.clone();
             }
             Action::Files => self.insert(Pane::Files {
@@ -612,7 +626,7 @@ impl App {
             Action::Settings => self.settings = true,
             Action::Sidebar => self.state.preferences.sidebar = !self.state.preferences.sidebar,
             Action::Open => {
-                self.dialog = Some("Open file".into());
+                self.dialog = Some("Open File".into());
                 self.dialog_input = self.cwd().display().to_string() + "/";
             }
             Action::Connect => {
@@ -639,6 +653,7 @@ impl App {
             Action::Palette => {
                 self.palette = !self.palette;
                 self.palette_query.clear();
+                self.palette_index = 0;
             }
             Action::NextTab | Action::PrevTab => {
                 let forward = matches!(action, Action::NextTab);
@@ -650,8 +665,15 @@ impl App {
                 self.ensure_focus();
             }
             Action::Search => {
-                self.dialog = Some("Search terminal".into());
-                self.dialog_input.clear();
+                self.search_open = !self.search_open;
+                self.search_miss = false;
+                if self.search_open {
+                    // Opening the bar puts the cursor in its entry.
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("find-entry")));
+                } else {
+                    self.search_focus = false;
+                    ctx.memory_mut(|m| m.stop_text_input());
+                }
             }
             Action::Copy => {
                 if let Some(text) = self
@@ -674,32 +696,35 @@ impl App {
     }
     fn actions(&self) -> Vec<(String, Action)> {
         let mut a = vec![
-            ("New tab".into(), Action::NewTab),
-            ("New workspace".into(), Action::NewWorkspace),
-            ("Rename workspace".into(), Action::RenameWorkspace),
-            ("Close workspace".into(), Action::CloseWorkspace),
-            ("Rename tab".into(), Action::RenameTab),
-            ("Split right".into(), Action::Split(Direction::Right)),
-            ("Split down".into(), Action::Split(Direction::Down)),
-            ("Split left".into(), Action::Split(Direction::Left)),
-            ("Split up".into(), Action::Split(Direction::Up)),
-            ("Balance panes".into(), Action::Equalize),
-            ("Zoom / restore pane".into(), Action::Zoom),
-            ("Close pane".into(), Action::ClosePane),
-            ("Open file".into(), Action::Open),
+            ("New Tab".into(), Action::NewTab),
+            ("New Workspace".into(), Action::NewWorkspace),
+            ("Rename Workspace…".into(), Action::RenameWorkspace),
+            ("Close Workspace".into(), Action::CloseWorkspace),
+            ("Rename Tab…".into(), Action::RenameTab),
+            ("Split Right".into(), Action::Split(Direction::Right)),
+            ("Split Down".into(), Action::Split(Direction::Down)),
+            ("Split Left".into(), Action::Split(Direction::Left)),
+            ("Split Up".into(), Action::Split(Direction::Up)),
+            ("Balance Panes".into(), Action::Equalize),
+            ("Zoom Pane".into(), Action::Zoom),
+            ("Close Pane".into(), Action::ClosePane),
+            ("Open File…".into(), Action::Open),
             ("Files".into(), Action::Files),
-            ("System overview".into(), Action::System),
-            ("Process viewer".into(), Action::Processes),
-            ("SSH connection".into(), Action::Connect),
-            ("Launch Codex".into(), Action::Assistant("codex".into())),
-            ("Launch Claude".into(), Action::Assistant("claude".into())),
-            ("Toggle sidebar".into(), Action::Sidebar),
+            ("System Monitor".into(), Action::System),
+            ("Processes".into(), Action::Processes),
+            ("SSH Connection…".into(), Action::Connect),
+            ("Codex".into(), Action::Assistant("codex".into())),
+            ("Claude".into(), Action::Assistant("claude".into())),
+            ("Workspaces Sidebar".into(), Action::Sidebar),
             ("Preferences".into(), Action::Settings),
+            ("Find".into(), Action::Search),
+            ("Next Tab".into(), Action::NextTab),
+            ("Previous Tab".into(), Action::PrevTab),
             ("About Caelum".into(), Action::About),
-            ("Previous prompt".into(), Action::PrevPrompt),
-            ("Next prompt".into(), Action::NextPrompt),
+            ("Previous Prompt".into(), Action::PrevPrompt),
+            ("Next Prompt".into(), Action::NextPrompt),
         ];
-        a.push(("Theme: Follow system".into(), Action::Theme(String::new())));
+        a.push(("Theme: Follow System".into(), Action::Theme(String::new())));
         for (id, t) in &self.presets {
             a.push((format!("Theme: {}", t.name), Action::Theme(id.clone())));
         }
@@ -721,11 +746,13 @@ impl App {
                 self.action(a, ctx);
             }
         }
+        // Dialogs built on `egui::Modal` (preferences, alerts) close themselves on Escape.
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.palette = false;
-            self.settings = false;
-            self.theme_draft = None;
-            self.dialog = None;
+            if self.search_open && self.search_focus {
+                self.search_open = false;
+                self.search_focus = false;
+            }
         }
     }
     fn overlays(&mut self, ctx: &egui::Context) {
@@ -735,53 +762,122 @@ impl App {
         }
         if self.palette {
             let mut action = None;
-            egui::Window::new("Command palette")
-                .title_bar(false)
-                .collapsible(false)
-                .resizable(false)
-                .min_width(520.)
-                .max_width(520.)
-                .frame(egui::Frame::window(&ctx.style()).inner_margin(8))
-                .anchor(egui::Align2::CENTER_TOP, [0., 80.])
+            let theme = self.theme();
+            let c = adw::Colors::new(&theme);
+            let query = self.palette_query.to_lowercase();
+            let matches: Vec<_> = self
+                .actions()
+                .into_iter()
+                .filter(|(label, _)| label.to_lowercase().contains(&query))
+                .collect();
+            // Up and Down move the selection; Enter runs it.
+            let (up, down, enter) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.key_pressed(Key::Enter),
+                )
+            });
+            let n = matches.len();
+            if n > 0 {
+                if down {
+                    self.palette_index = (self.palette_index + 1) % n;
+                }
+                if up {
+                    self.palette_index = (self.palette_index + n - 1) % n;
+                }
+            }
+            self.palette_index = self.palette_index.min(n.saturating_sub(1));
+            if enter {
+                action = matches.get(self.palette_index).map(|(_, a)| a.clone());
+            }
+            let shortcuts: Vec<_> = shortcut_table()
+                .into_iter()
+                .filter_map(|(name, a)| self.keymap.get(name).map(|b| (a, binding_label(b))))
+                .collect();
+            let width = 520_f32.min(ctx.content_rect().width() - 24.);
+            let area = egui::Area::new(egui::Id::new("command-palette"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_TOP, [0., 64.])
                 .show(ctx, |ui| {
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.palette_query)
-                            .hint_text(
-                                RichText::new("Type a command or theme…")
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .margin(Vec2::new(10., 8.))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if !ctx.wants_keyboard_input() {
-                        edit.request_focus();
-                    }
-                    let query = self.palette_query.to_lowercase();
-                    let matches: Vec<_> = self
-                        .actions()
-                        .into_iter()
-                        .filter(|(label, _)| label.to_lowercase().contains(&query))
-                        .collect();
-                    if ui.input(|i| i.key_pressed(Key::Enter)) {
-                        action = matches.first().map(|(_, a)| a.clone());
-                    }
-                    ui.add_space(2.);
-                    egui::ScrollArea::vertical()
-                        .max_height(380.)
+                    egui::Frame::popup(ui.style())
+                        .corner_radius(12)
+                        .inner_margin(6)
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.;
-                            for (i, (label, a)) in matches.into_iter().enumerate() {
-                                // Enter runs the first match, so it is shown selected.
-                                let row = egui::Button::new(label)
-                                    .frame_when_inactive(i == 0)
-                                    .selected(i == 0)
-                                    .min_size(Vec2::new(ui.available_width(), 32.));
-                                if ui.add(row).clicked() {
-                                    action = Some(a);
-                                }
+                            ui.set_width(width);
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.palette_query)
+                                    .hint_text(
+                                        RichText::new("Search commands and themes").color(c.muted),
+                                    )
+                                    .margin(egui::Margin {
+                                        left: 34,
+                                        right: 10,
+                                        top: 8,
+                                        bottom: 8,
+                                    })
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if edit.changed() {
+                                self.palette_index = 0;
                             }
+                            let icon = Rect::from_center_size(
+                                Pos2::new(edit.rect.left() + 18., edit.rect.center().y),
+                                Vec2::splat(16.),
+                            );
+                            icons::paint(ui, icon, icons::Icon::Find, 16., c.muted);
+                            if !ctx.wants_keyboard_input() {
+                                edit.request_focus();
+                            }
+                            ui.add_space(4.);
+                            if matches.is_empty() {
+                                ui.add_space(8.);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new("No Results").color(c.muted));
+                                });
+                                ui.add_space(8.);
+                                return;
+                            }
+                            egui::ScrollArea::vertical()
+                                .scroll_source(
+                                    egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                                        | egui::scroll_area::ScrollSource::SCROLL_BAR,
+                                )
+                                .max_height(384.)
+                                .show(ui, |ui| {
+                                    headerbar::menu_spacing(ui);
+                                    for (i, (label, a)) in matches.iter().enumerate() {
+                                        let selected = i == self.palette_index;
+                                        let mut row = egui::Button::new(label.as_str())
+                                            .frame_when_inactive(selected)
+                                            .fill(theme::mix(
+                                                ui.visuals().window_fill,
+                                                c.text,
+                                                0.10,
+                                            ))
+                                            .min_size(Vec2::new(ui.available_width(), 32.));
+                                        if let Some((_, keys)) =
+                                            shortcuts.iter().find(|(sa, _)| sa == a)
+                                        {
+                                            row = row.shortcut_text(keys.as_str());
+                                        }
+                                        let r = ui.add(row);
+                                        if selected && (up || down) {
+                                            r.scroll_to_me(None);
+                                        }
+                                        if r.clicked() {
+                                            action = Some(a.clone());
+                                        }
+                                    }
+                                });
                         });
                 });
+            // A click elsewhere dismisses it, like a popover.
+            if ctx.input(|i| i.pointer.any_pressed())
+                && !ctx.rect_contains_pointer(area.response.layer_id, area.response.rect)
+            {
+                self.palette = false;
+            }
             if let Some(a) = action {
                 self.palette = false;
                 ctx.memory_mut(|m| m.stop_text_input());
@@ -795,72 +891,48 @@ impl App {
             self.paste_confirm(ctx);
         }
         if let Some(title) = self.dialog.clone() {
-            let mut done = false;
-            let mut cancel = false;
-            egui::Window::new(&title)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(540.)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    let hint = match title.as_str() {
-                        "Connect with SSH" => "host or user@host",
-                        "Open file" => "path to a file",
-                        "Search terminal" => "search text",
-                        _ => "name",
-                    };
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.dialog_input)
-                            .hint_text(RichText::new(hint).color(ui.visuals().weak_text_color()))
-                            .desired_width(f32::INFINITY),
-                    );
+            let theme = self.theme();
+            let c = adw::Colors::new(&theme);
+            let (body, hint, verb) = match title.as_str() {
+                "Connect with SSH" => (
+                    "Opens a terminal pane running ssh.",
+                    "host or user@host",
+                    "Connect",
+                ),
+                "Open File" => (
+                    "Opens the file in an editor pane.",
+                    "Path to a file",
+                    "Open",
+                ),
+                _ => ("", "Name", "Rename"),
+            };
+            let mut submit = false;
+            let picked = adw::alert(
+                ctx,
+                "text-dialog",
+                &title,
+                body,
+                &[("Cancel", adw::Kind::Normal), (verb, adw::Kind::Suggested)],
+                0,
+                &theme,
+                |ui| {
+                    let edit = ui.add(adw::entry(&mut self.dialog_input, hint, &c));
                     if !ctx.wants_keyboard_input() {
                         edit.request_focus();
                     }
-                    if title == "Search terminal" {
-                        ui.label("Search terminal output and scrollback.");
-                        ui.horizontal(|ui| {
-                            for (name, forward) in [("Previous", false), ("Next", true)] {
-                                if ui.button(name).clicked()
-                                    && let Some(session) = self.terminals.get_mut(&self.focused)
-                                    && !session.search(&self.dialog_input, forward)
-                                {
-                                    self.message = "No terminal match".into();
-                                }
-                            }
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(if title == "Search terminal" {
-                                "Done"
-                            } else {
-                                match title.as_str() {
-                                    "Connect with SSH" => "Connect",
-                                    "Open file" => "Open",
-                                    _ => "Rename",
-                                }
-                            })
-                            .clicked()
-                            || ui.input(|i| i.key_pressed(Key::Enter))
-                        {
-                            done = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if done {
+                    submit = ui.input(|i| i.key_pressed(Key::Enter));
+                },
+            );
+            if picked == Some(1) || submit {
                 let value = self.dialog_input.trim().to_string();
                 match title.as_str() {
-                    "Open file" => self.open_file(PathBuf::from(value)),
-                    "Rename tab" => {
+                    "Open File" => self.open_file(PathBuf::from(value)),
+                    "Rename Tab" => {
                         if !value.is_empty() {
                             self.tab_mut().name = value;
                         }
                     }
-                    "Rename workspace" => {
+                    "Rename Workspace" => {
                         if !value.is_empty() {
                             self.workspace_mut().name = value;
                         }
@@ -881,8 +953,7 @@ impl App {
                 }
                 self.dialog = None;
                 ctx.memory_mut(|m| m.stop_text_input());
-            }
-            if cancel {
+            } else if picked == Some(0) {
                 self.dialog = None;
             }
         }
@@ -891,43 +962,50 @@ impl App {
             if dirty.is_empty() {
                 self.finish_close(ctx);
             } else {
-                let mut save = false;
-                let mut discard = false;
-                let mut cancel = false;
-                egui::Window::new("Unsaved changes")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                    .show(ctx, |ui| {
-                        ui.label(format!(
-                            "{} edited file(s) have unsaved changes.",
-                            dirty.len()
-                        ));
-                        ui.horizontal(|ui| {
-                            save = ui.button("Save and close").clicked();
-                            discard = ui.button("Discard and close").clicked();
-                            cancel = ui.button("Keep working").clicked();
-                        });
-                    });
-                if cancel {
-                    self.pending = None;
-                }
-                if save {
-                    // Saves run on the IO thread; once they land the documents are clean
-                    // and the close completes above. A failed save keeps this dialog open.
-                    for id in &dirty {
-                        self.save_document(id);
+                let theme = self.theme();
+                let body = if dirty.len() == 1 {
+                    "An edited file has unsaved changes. Save it before closing?".to_string()
+                } else {
+                    format!(
+                        "{} edited files have unsaved changes. Save them before closing?",
+                        dirty.len()
+                    )
+                };
+                let picked = adw::alert(
+                    ctx,
+                    "unsaved-dialog",
+                    "Save Changes?",
+                    &body,
+                    &[
+                        ("Cancel", adw::Kind::Normal),
+                        ("Discard", adw::Kind::Destructive),
+                        ("Save", adw::Kind::Suggested),
+                    ],
+                    0,
+                    &theme,
+                    |_| {},
+                );
+                match picked {
+                    Some(0) => self.pending = None,
+                    Some(2) => {
+                        // Saves run on the IO thread; once they land the documents are
+                        // clean and the close completes above. A failed save keeps this
+                        // dialog open.
+                        for id in &dirty {
+                            self.save_document(id);
+                        }
                     }
-                }
-                if discard {
-                    for id in dirty {
-                        // A prior "Save and close" may still be queued on the IO thread;
-                        // cancel it so discarding never writes. A save already running
-                        // finishes (see `DocumentIo::discard`).
-                        self.docio.discard(&id);
-                        self.documents.remove(&id);
+                    Some(1) => {
+                        for id in dirty {
+                            // A prior save may still be queued on the IO thread; cancel it
+                            // so discarding never writes. A save already running finishes
+                            // (see `DocumentIo::discard`).
+                            self.docio.discard(&id);
+                            self.documents.remove(&id);
+                        }
+                        self.finish_close(ctx);
                     }
-                    self.finish_close(ctx);
+                    _ => {}
                 }
             }
         }
@@ -1242,6 +1320,7 @@ impl App {
         }
         self.window_edges(ctx);
         self.headerbar(ctx, &theme);
+        self.search_bar(ctx, &theme);
         self.sidebar(ctx, &theme);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme.ui("background")))

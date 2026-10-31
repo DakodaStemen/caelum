@@ -60,13 +60,7 @@ impl App {
                     Pos2::new(add.rect.right() - 18., add.rect.center().y),
                     Vec2::splat(16.),
                 );
-                super::icons::paint(
-                    ui.painter(),
-                    icon,
-                    super::icons::Icon::Plus,
-                    14.,
-                    theme.ui("muted"),
-                );
+                super::icons::paint(ui, icon, super::icons::Icon::Add, 16., theme.ui("muted"));
                 if add
                     .on_hover_text("Right-click a workspace to rename or close it")
                     .clicked()

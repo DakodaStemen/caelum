@@ -24,6 +24,7 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 toml = "0.9"
 notify = "8"
+egui_extras = { version = "0.33", default-features = false, features = ["svg", "image"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -56,10 +56,11 @@ impl App {
             && !self.palette
             && !self.settings
             && self.dialog.is_none()
+            && !self.search_focus
             && self.pending.is_none()
             && self.pending_paste.is_none();
-        let search = if self.dialog.as_deref() == Some("Search terminal") {
-            self.dialog_input.as_str()
+        let search = if self.search_open {
+            self.search_query.as_str()
         } else {
             ""
         };
@@ -90,32 +91,51 @@ impl App {
     /// Modal asking whether a held multi-line paste should reach the terminal.
     /// Enter pastes, Escape cancels; "Don't ask again" is saved on Paste.
     pub(super) fn paste_confirm(&mut self, ctx: &egui::Context) {
+        let theme = self.theme();
         let Some(p) = self.pending_paste.as_mut() else {
             return;
         };
-        let mut paste = ctx.input(|i| i.key_pressed(Key::Enter));
-        let mut cancel = ctx.input(|i| i.key_pressed(Key::Escape));
-        egui::Window::new("Paste multiple lines?")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(540.)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "This paste has {} lines. The program has not enabled bracketed paste, \
-                     so each line break will act as Enter.",
-                    p.lines
-                ));
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(egui::RichText::new(&p.preview).monospace()).wrap());
-                });
+        let c = super::adw::Colors::new(&theme);
+        let body = format!(
+            "This paste has {} lines. The program has not enabled bracketed paste, so \
+             each line break will act as Enter.",
+            p.lines
+        );
+        let picked = super::adw::alert(
+            ctx,
+            "paste-dialog",
+            "Paste Multiple Lines?",
+            &body,
+            &[
+                ("Cancel", super::adw::Kind::Normal),
+                ("Paste", super::adw::Kind::Suggested),
+            ],
+            0,
+            &theme,
+            |ui| {
+                egui::Frame::new()
+                    .fill(c.card)
+                    .corner_radius(10)
+                    .inner_margin(10)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .max_height(160.)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&p.preview).monospace().color(c.text),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    });
+                ui.add_space(6.);
                 ui.checkbox(&mut p.dont_ask, "Don't ask again");
-                ui.horizontal(|ui| {
-                    paste |= ui.button("Paste").clicked();
-                    cancel |= ui.button("Cancel").clicked();
-                });
-            });
+            },
+        );
+        let paste = picked == Some(1) || ctx.input(|i| i.key_pressed(Key::Enter));
+        let cancel = picked == Some(0);
         if cancel {
             self.pending_paste = None;
         } else if paste && let Some(p) = self.pending_paste.take() {

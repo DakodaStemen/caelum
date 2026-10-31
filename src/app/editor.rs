@@ -77,6 +77,10 @@ impl App {
             .code_editor()
             .layouter(&mut layouter);
         egui::ScrollArea::both()
+            .scroll_source(
+                egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                    | egui::scroll_area::ScrollSource::SCROLL_BAR,
+            )
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let size = ui.available_size().max(Vec2::new(1., 100.));
