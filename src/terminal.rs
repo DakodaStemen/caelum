@@ -1047,11 +1047,18 @@ pub fn show(
     let (response, m) = layout(ui, s, theme, prefs, &font);
     let pointer = pointer_mode(ui, s);
     handle_selection(s, &response, &m, pointer);
-    manage_focus(ui, &response, focused);
+    // Not while a modal dialog (preferences, about, an alert) is over the window:
+    // its keys, Tab included, are not the shell's.
+    let blocked = !ui.memory(|mem| mem.allows_interaction(ui.layer_id()));
+    if blocked {
+        response.surrender_focus();
+    } else {
+        manage_focus(ui, &response, focused);
+    }
     let mut clicked = response.clicked() || response.drag_started();
     handle_links(ui, s, &response, &m, pointer);
     handle_scroll(ui, s, &response, &m, pointer);
-    if focused && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
+    if focused && !blocked && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
         handle_events(ui, s, prefs, &response, &m, pointer);
     }
     let painter = ui.painter_at(m.rect);
