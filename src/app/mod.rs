@@ -255,6 +255,8 @@ pub struct App {
     /// Horizontal scroll of an overflowing tab bar, and the (selected tab, tab count,
     /// bar width) it last scrolled the selected tab into view for.
     tab_scroll: f32,
+    /// The main menu was opened with F10: focus its first row.
+    menu_by_keyboard: bool,
     tab_scroll_key: (String, usize, i32),
     /// Where the panes of the active tab were laid out last frame.
     pane_area: Option<Rect>,
@@ -375,6 +377,7 @@ impl App {
             fallback_fonts: Vec::new(),
             fallback_rx: None,
             tab_scroll: 0.,
+            menu_by_keyboard: false,
             tab_scroll_key: (String::new(), 0, 0),
             pane_area: None,
             message_shown: None,

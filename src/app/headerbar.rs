@@ -99,7 +99,20 @@ impl App {
                     order.reverse();
                     self.window_controls(&mut right, &order, pal, maximized, ctx);
                 }
-                let menu = icons::flat(&mut right, Icon::Menu, size, 16., pal, "Main Menu", false);
+                let menu = icons::flat(
+                    &mut right,
+                    Icon::Menu,
+                    size,
+                    16.,
+                    pal,
+                    "Main Menu (F10)",
+                    false,
+                );
+                // F10 opens the primary menu with its first row focused, as in GTK.
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
+                    egui::Popup::toggle_id(ctx, egui::Popup::default_response_id(&menu));
+                    self.menu_by_keyboard = true;
+                }
                 self.main_menu(&menu, theme);
                 if icons::flat(
                     &mut right,
@@ -244,16 +257,20 @@ impl App {
                     menu_spacing(ui);
                     zoom_row(ui, theme);
                     ui.separator();
-                    let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
+                    let mut rows = vec![];
+                    let mut item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
                         let shortcut = self.keymap.get(key).map(binding_label);
-                        menu_item(ui, label, shortcut).clicked().then_some(action)
+                        let r = menu_item(ui, label, shortcut);
+                        if r.clicked() {
+                            chosen = Some(action);
+                        }
+                        rows.push(r);
                     };
-                    let mut picks = vec![
-                        item(ui, "New Tab", "new_tab", Action::NewTab),
-                        item(ui, "New Workspace", "", Action::NewWorkspace),
-                        item(ui, "Open File…", "open_file", Action::Open),
-                    ];
-                    submenu(ui, "New Pane", |ui| {
+                    item(ui, "New Tab", "new_tab", Action::NewTab);
+                    item(ui, "New Workspace", "", Action::NewWorkspace);
+                    item(ui, "Open File…", "open_file", Action::Open);
+                    let mut sub_rows = vec![];
+                    let new_pane = submenu(ui, "New Pane", |ui| {
                         ui.set_width(200.);
                         menu_spacing(ui);
                         for (label, action) in [
@@ -265,26 +282,49 @@ impl App {
                             ("Codex", Action::Assistant("codex".into())),
                             ("Claude", Action::Assistant("claude".into())),
                         ] {
-                            picks.push(item(ui, label, "", action));
+                            let r = menu_item(ui, label, None);
+                            if r.clicked() {
+                                chosen = Some(action);
+                            }
+                            sub_rows.push(r);
                         }
+                        menu_keys(ui, &sub_rows);
                     });
+                    rows.push(new_pane);
                     ui.separator();
-                    picks.push(item(ui, "Find…", "search", Action::Search));
-                    picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
-                    picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
-                    picks.push(item(
-                        ui,
-                        "Command Palette",
-                        "command_palette",
-                        Action::Palette,
-                    ));
+                    for (label, key, action) in [
+                        ("Find…", "search", Action::Search),
+                        ("Balance Panes", "balance_panes", Action::Equalize),
+                        ("Zoom Pane", "zoom_pane", Action::Zoom),
+                        ("Command Palette", "command_palette", Action::Palette),
+                    ] {
+                        let shortcut = self.keymap.get(key).map(binding_label);
+                        let r = menu_item(ui, label, shortcut);
+                        if r.clicked() {
+                            chosen = Some(action);
+                        }
+                        rows.push(r);
+                    }
                     ui.separator();
-                    picks.push(item(ui, "Preferences", "", Action::Settings));
-                    picks.push(item(ui, "About Caelum", "", Action::About));
-                    chosen = picks.into_iter().flatten().next();
+                    for (label, action) in [
+                        ("Preferences", Action::Settings),
+                        ("About Caelum", Action::About),
+                    ] {
+                        let r = menu_item(ui, label, None);
+                        if r.clicked() {
+                            chosen = Some(action);
+                        }
+                        rows.push(r);
+                    }
+                    if std::mem::take(&mut self.menu_by_keyboard) {
+                        rows[0].request_focus();
+                    }
+                    menu_keys(ui, &rows);
                 });
             });
         if chosen.is_some() {
+            // A row activated from the keyboard does not close the menu by itself.
+            egui::Popup::close_id(&anchor.ctx, egui::Popup::default_response_id(anchor));
             self.pending_action = chosen;
         }
     }
@@ -774,16 +814,56 @@ pub(super) fn menu_item(
     ui.add(button)
 }
 
+/// Keyboard navigation inside a popover menu: Up/Down (and Tab/Shift+Tab) move
+/// between `rows` and wrap around, instead of egui's spatial focus search
+/// wandering out of the popover; Right opens a focused submenu row.
+pub(super) fn menu_keys(ui: &egui::Ui, rows: &[egui::Response]) {
+    let Some(i) = rows.iter().position(egui::Response::has_focus) else {
+        return;
+    };
+    ui.memory_mut(|m| {
+        m.set_focus_lock_filter(
+            rows[i].id,
+            egui::EventFilter {
+                tab: true,
+                vertical_arrows: true,
+                horizontal_arrows: false,
+                escape: false,
+            },
+        );
+    });
+    let (down, up) = ui.input_mut(|inp| {
+        let tab = inp.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+        let back = inp.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+        (
+            inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) || tab,
+            inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) || back,
+        )
+    });
+    let n = rows.len();
+    if down {
+        rows[(i + 1) % n].request_focus();
+    } else if up {
+        rows[(i + n - 1) % n].request_focus();
+    }
+}
+
 /// A menu row that opens a submenu, marked with GTK's `pan-end` arrow.
-pub(super) fn submenu(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn submenu(
+    ui: &mut egui::Ui,
+    label: &str,
+    content: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
     let color = ui.visuals().text_color();
     let button = egui::Button::new(label)
         .frame_when_inactive(false)
         .min_size(Vec2::new(ui.available_width(), 32.))
         .right_text(icons::image(Icon::PanEnd, 16., color));
-    egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
-        fit_height(ui, content);
-    });
+    egui::containers::menu::SubMenuButton::from_button(button)
+        .ui(ui, |ui| {
+            fit_height(ui, content);
+        })
+        .0
 }
 
 /// Shows `content` as is, or in a scroll area once it was taller than the window
