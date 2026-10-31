@@ -399,3 +399,19 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod live {
+    /// Prints what this machine reports: `cargo test --lib appearance -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the live desktop settings"]
+    fn print_detected_look() {
+        let start = std::time::Instant::now();
+        let look = super::detect();
+        eprintln!(
+            "{look:?} in {:?}; csd={}",
+            start.elapsed(),
+            super::client_side_decorations()
+        );
+    }
+}
