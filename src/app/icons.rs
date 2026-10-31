@@ -333,11 +333,17 @@ pub fn flat(
     on: bool,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     if ui.is_rect_visible(rect) {
-        let fill = pal.fill(&response, on);
+        let radius = (size.min_elem() * 0.18).round().clamp(4., 8.) as u8;
+        let fill = if ui.is_enabled() {
+            pal.fill(&response, on)
+        } else {
+            Color32::TRANSPARENT
+        };
         if fill != Color32::TRANSPARENT {
-            let radius = (size.min_elem() * 0.18).round().clamp(4., 8.) as u8;
             let painter = ui.painter();
             painter.rect_filled(
                 rect.round_to_pixels(painter.pixels_per_point()),
@@ -345,7 +351,14 @@ pub fn flat(
                 fill,
             );
         }
-        paint(ui, rect, icon, icon_size, pal.fg);
+        // libadwaita dims insensitive buttons to half opacity.
+        let fg = if ui.is_enabled() {
+            pal.fg
+        } else {
+            pal.fg.gamma_multiply(0.5)
+        };
+        paint(ui, rect, icon, icon_size, fg);
+        focus_ring(ui, &response, rect, radius);
     }
     response.on_hover_text(label)
 }
@@ -369,8 +382,25 @@ pub fn tile(ui: &mut egui::Ui, icon: Icon, size: Vec2, pal: Palette, label: &str
             caelum_rs::theme::mix(pal.base, pal.fg, t),
         );
         paint(ui, rect, icon, 16., pal.fg);
+        focus_ring(ui, &response, rect, 8);
     }
     response
+}
+
+/// libadwaita's keyboard focus ring: a 2px half-transparent accent outline just
+/// inside the widget.
+pub fn focus_ring(ui: &egui::Ui, response: &Response, rect: egui::Rect, radius: u8) {
+    if !response.has_focus() {
+        return;
+    }
+    let painter = ui.painter();
+    let ppp = painter.pixels_per_point();
+    painter.rect_stroke(
+        rect.round_to_pixels(ppp),
+        radius,
+        egui::Stroke::new(2_f32, ui.visuals().hyperlink_color.gamma_multiply(0.5)),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// A round window-control button (libadwaita: a 24px circle in a 34px slot, always
@@ -390,6 +420,13 @@ pub fn window_control(ui: &mut egui::Ui, icon: Icon, pal: Palette, label: &str) 
         let center = rect.center().round_to_pixels(painter.pixels_per_point());
         painter.circle_filled(center, 12., caelum_rs::theme::mix(pal.base, pal.fg, t));
         paint(ui, rect, icon, 16., pal.fg);
+        if response.has_focus() {
+            painter.circle_stroke(
+                center,
+                13.,
+                egui::Stroke::new(2_f32, ui.visuals().hyperlink_color.gamma_multiply(0.5)),
+            );
+        }
     }
     response.on_hover_text(label)
 }
