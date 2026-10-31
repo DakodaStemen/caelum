@@ -12,8 +12,9 @@ graphics stack, fonts, shells and external commands as dependencies.
 - `files.rs`: strict UTF-8 editing, read-only unknown-encoding display, content-hash
   conflict detection, atomic replacement and recovery documents. File edits resolve
   symlinks and retain permissions. Hard-linked files are not atomically replaced.
-- `theme.rs`: the shared palette model, color validation and native visual styling.
-- `src/app/` (`mod.rs`, `editor.rs`, `panes.rs`, `persist.rs`, `settings.rs`, `sidebar.rs`, `terminal_pane.rs`): native workspace/pane presentation, commands, tools, confirmation flows, dialogs, settings, and application integration checks.
+- `theme.rs`: the shared palette model, color validation and libadwaita-like visual styling.
+- `appearance.rs`: reads the desktop's light/dark preference, accent, UI font and window button layout (portal / gsettings, `defaults`, registry) with short-timeout probes, and decides whether to draw a client-side headerbar (GNOME on Wayland).
+- `src/app/` (`mod.rs`, `headerbar.rs`, `icons.rs`, `editor.rs`, `panes.rs`, `persist.rs`, `settings.rs`, `sidebar.rs`, `terminal_pane.rs`): native workspace/pane presentation (headerbar, tab bar, drawn symbolic icons, split popover), commands, tools, confirmation flows, dialogs, settings, and application integration checks. `screens.rs` renders the real UI offscreen with egui_kittest (ignored tests; `cargo test --bin caelum-rs screens -- --ignored`, PNGs in `target/screenshots/`).
 - `platform.rs`: home/profile dirs, shell resolution, instance lock, system snapshot, process-tree kill across Linux, macOS and Windows.
 - `syntax.rs`: syntect highlighting with language detection and theme palette mapping.
 - `main.rs`: CLI, exclusive profile lock and native window startup.

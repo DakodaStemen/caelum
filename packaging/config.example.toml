@@ -1,10 +1,11 @@
 # Caelum configuration: ~/.config/caelum-rs/config.toml
 # Edits are applied while Caelum is running. A file that fails to parse is ignored
-# (the previous settings stay in effect) and the error is shown in the status line.
+# (the previous settings stay in effect) and the error is shown in a notification.
 # Values set here override the same preferences in the app's JSON profile; the
 # profile (workspace.json) still stores layout and state.
 
-# Id of a bundled or imported theme, e.g. "graphite", "starlight".
+# Id of a bundled or imported theme, e.g. "adwaita-dark", "graphite", "starlight".
+# Setting it stops following the desktop's light/dark style and accent.
 # theme = "graphite"
 
 [font]
@@ -18,9 +19,9 @@
 # blink = false
 
 # Shortcuts are "ctrl+shift+key" style and need ctrl or alt. Actions:
-#   command_palette toggle_sidebar new_tab split_right split_below zoom_pane
-#   close_pane open_file save_file search next_tab prev_tab copy paste
-#   prev_prompt next_prompt
+#   command_palette toggle_sidebar new_tab split_right split_below split_left
+#   split_up balance_panes zoom_pane close_pane open_file save_file search
+#   next_tab prev_tab copy paste prev_prompt next_prompt
 [keybindings]
 # new_tab = "ctrl+shift+t"
 # prev_prompt = "ctrl+shift+up"

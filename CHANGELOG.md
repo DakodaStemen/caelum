@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Minimal, desktop-native look: follows the system light/dark preference and accent
+  color (freedesktop portal, then gsettings; `defaults` on macOS, the registry on
+  Windows) with new Adwaita Dark/Light presets, uses the desktop UI font, and drops the
+  logo, badge, breadcrumb, status bar and accent borders. Choosing a theme stops
+  following the desktop; Preferences has a "Follow system style" option. Existing
+  profiles start following the desktop once (their theme choice is kept).
+- GNOME-style headerbar with drawn symbolic icons, a main menu, and a tab bar that only
+  appears with more than one tab; on GNOME Wayland it replaces the title bar
+  (`CAELUM_RS_CSD=0/1` overrides). Status messages are toasts.
+- Pane close button: fixed the "×" that sat on the pane border and drifted off center
+  at non-integer zoom levels; it is now a pixel-snapped vector icon with hover feedback.
+- Splits: split left/right/up/down (popover and Ctrl+Shift+D/E,
+  Ctrl+Alt+Shift+D/E), panes in the same row or column are rebalanced to equal sizes,
+  splits that would shrink a pane below 160x96 are refused instead of pushing panes
+  off screen, dividers cannot be dragged past that minimum, and "Balance panes"
+  (Ctrl+Shift+R, or double-click a divider) equalizes the layout.
+
 No release tag has been cut yet; `0.1.0` below is the Cargo version, not a published tag.
 
 - In-flight fixes:

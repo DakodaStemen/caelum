@@ -59,9 +59,9 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 | Area | What works today |
 | --- | --- |
 | Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, selection, copy, bracketed paste, scrollback search, OSC 8 hyperlinks |
-| Layout | Workspaces, tabs, nested resizable splits, pane zoom |
+| Layout | Workspaces, tabs, splits in four directions that rebalance and never shrink a pane below a minimum size, pane zoom |
 | Editor | UTF-8 editing with syntax highlighting, external-change checks, atomic saves, recovery snapshots |
-| Themes | Eleven bundled themes, custom color editor with live preview, JSON import/export |
+| Themes | Follows the desktop's light/dark style and accent (Adwaita palette) by default; thirteen bundled themes, custom color editor with live preview, JSON import/export |
 | Tools | File browser, live Linux memory / load / uptime / process views |
 | Remote | SSH through your existing client and configuration |
 | Misc | Command palette, hidden-by-default sidebar, optional legacy workspace import |
@@ -74,15 +74,26 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 | Ctrl+Shift+B | Show / hide the sidebar (hidden by default) |
 | Ctrl+Shift+T | New tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Ctrl+Shift+D / E | Split right / below |
+| Ctrl+Shift+D / E | Split right / down |
+| Ctrl+Alt+Shift+D / E | Split left / up |
+| Ctrl+Shift+R | Balance panes (equal sizes) |
 | Ctrl+Shift+Enter | Zoom / restore pane |
 | Ctrl+Shift+W | Close pane |
 | Ctrl+Shift+C / V | Copy selection / paste |
 | Ctrl+Shift+F | Search terminal output and scrollback |
 | Ctrl+O / Ctrl+S | Open / save file |
 
-Double-click a tab to rename it, drag a divider to resize, and right-click a
-terminal for copy/paste. Ctrl-click an OSC 8 HTTP(S) hyperlink to open it.
+Double-click a tab to rename it, drag a divider to resize (double-click it to
+balance), and right-click a terminal for copy/paste. The split button in the
+headerbar and in each pane header opens a popover with all four directions and
+Balance. Everything else is in the main menu (the three-line button) and the
+command palette.
+
+On GNOME Wayland, which has no server-side window decorations, the headerbar is the
+title bar: it carries the window buttons from your `button-layout`, drag it to move
+the window, double-click to maximize, and drag the window edge to resize. Set
+`CAELUM_RS_CSD=0` to get the platform frame instead (or `1` to force the headerbar
+elsewhere). Other desktops keep their native title bar. Ctrl-click an OSC 8 HTTP(S) hyperlink to open it.
 
 ## Why Caelum
 
