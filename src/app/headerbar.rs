@@ -423,6 +423,12 @@ impl App {
                 rect.width() - 2. * close_room,
             );
             let pos = rect.center() - galley.size() / 2.;
+            // A name cut short shows in full on hover.
+            let response = if galley.elided {
+                response.on_hover_text(&name)
+            } else {
+                response
+            };
             ui.painter().galley(pos.round_to_pixels(ppp), galley, text);
             let mut close = response.middle_clicked();
             if active || hovered[i] {

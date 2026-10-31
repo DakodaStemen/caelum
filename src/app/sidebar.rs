@@ -89,6 +89,7 @@ pub(super) fn nav_row(
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let mut cut = false;
     if ui.is_rect_visible(rect) {
         let base = theme.ui("panel");
         let t = if active {
@@ -103,8 +104,15 @@ pub(super) fn nav_row(
                 .rect_filled(rect, 6, theme::mix(base, theme.ui("text"), t));
         }
         let galley = truncated(ui, label, egui::TextStyle::Body, color, rect.width() - 24.);
+        cut = galley.elided;
         let pos = Pos2::new(rect.left() + 12., rect.center().y - galley.size().y / 2.);
         ui.painter().galley(pos, galley, color);
+        super::icons::focus_ring(ui, &response, rect, 6);
     }
-    response
+    // A name cut short shows in full on hover.
+    if cut {
+        response.on_hover_text(label)
+    } else {
+        response
+    }
 }
