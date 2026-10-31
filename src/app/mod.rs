@@ -242,7 +242,7 @@ pub struct App {
     system_dark: bool,
     /// Resolved UI (proportional) and terminal (monospace) font files.
     ui_font: Option<Vec<u8>>,
-    mono_font: Option<Vec<u8>>,
+    mono_font: settings::MonoFaces,
     ui_font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     /// System fonts for scripts the UI and terminal fonts lack (CJK, Arabic, ...),
     /// appended after them so those glyphs are not drawn as boxes.
@@ -266,7 +266,7 @@ pub struct App {
     recovery_conflict: bool,
     pending_open: Option<PathBuf>,
     applied_font: String,
-    font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    font_rx: Option<std::sync::mpsc::Receiver<settings::MonoFaces>>,
     last_dialog: Option<String>,
     pending_save: Option<String>,
     /// Multi-line paste awaiting confirmation (see `terminal_pane::paste_confirm`).
@@ -305,6 +305,8 @@ impl App {
         csd: bool,
     ) -> Self {
         egui_extras::install_image_loaders(ctx);
+        // Ctrl+=/-/0 are handled in `shortcuts` so the zoom stays in a usable range.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         if smoke.is_some() {
             let demo = profile.join("demo");
             let _ = fs::create_dir_all(demo.join("src"));
@@ -364,7 +366,7 @@ impl App {
             csd,
             system_dark: true,
             ui_font: None,
-            mono_font: None,
+            mono_font: Default::default(),
             ui_font_rx: None,
             fallback_fonts: Vec::new(),
             fallback_rx: None,
@@ -758,6 +760,23 @@ impl App {
             if ctx.input_mut(|i| i.consume_key(b.modifiers, b.key)) {
                 self.action(a, ctx);
             }
+        }
+        use egui::gui_zoom::kb_shortcuts as zoom;
+        let (zoom_in, zoom_out, reset) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&zoom::ZOOM_IN) || i.consume_shortcut(&zoom::ZOOM_IN_SECONDARY),
+                i.consume_shortcut(&zoom::ZOOM_OUT),
+                i.consume_shortcut(&zoom::ZOOM_RESET),
+            )
+        });
+        if zoom_in {
+            step_zoom(ctx, 1);
+        }
+        if zoom_out {
+            step_zoom(ctx, -1);
+        }
+        if reset {
+            ctx.set_zoom_factor(1.);
         }
         // Dialogs built on `egui::Modal` (preferences, alerts) close themselves on Escape.
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1381,6 +1400,15 @@ impl App {
             },
         ));
     }
+}
+/// Interface zoom limits: beyond these the headerbar no longer fits a minimum-size
+/// window, or text gets too small to read.
+pub(crate) const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+/// Zooms the interface one 10% step in (`dir` > 0) or out, within [`ZOOM_RANGE`].
+fn step_zoom(ctx: &egui::Context, dir: i32) {
+    let steps = (ctx.zoom_factor() * 10.).round() as i32 + dir.signum();
+    let z = (steps as f32 / 10.).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+    ctx.set_zoom_factor(z);
 }
 /// Lays `text` out on one line, cut with an ellipsis to fit `width`.
 fn truncated(

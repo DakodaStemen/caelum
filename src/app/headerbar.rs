@@ -129,14 +129,22 @@ impl App {
                     .map(|s| truncated(ui, &s, egui::TextStyle::Small, theme.ui("muted"), room));
                 let height = galley.size().y + sub.as_ref().map_or(0., |g| g.size().y);
                 let width = galley.size().x.max(sub.as_ref().map_or(0., |g| g.size().x));
-                let cx = bar.center().x.clamp(
-                    left_edge + 12. + width / 2.,
-                    (right_edge - 12. - width / 2.).max(left_edge),
-                );
+                // Centered on the window, else pushed off whichever cluster it meets.
+                let lo = left_edge + 12. + width / 2.;
+                let cx = bar
+                    .center()
+                    .x
+                    .max(lo)
+                    .min((right_edge - 12. - width / 2.).max(lo));
                 let top = bar.center().y - height / 2.;
                 let painter = ui.painter();
                 let ppp = painter.pixels_per_point();
                 let pos = Pos2::new(cx - galley.size().x / 2., top).round_to_pixels(ppp);
+                // Even the ellipsis does not fit: leave the title out rather than draw it
+                // over the buttons.
+                if width > room {
+                    return;
+                }
                 super::adw::paint_bold(painter, pos, galley.clone(), pal.fg);
                 if let Some(sub) = sub {
                     painter.galley(
@@ -230,48 +238,54 @@ impl App {
             .align(egui::RectAlign::BOTTOM_END)
             .gap(4.)
             .show(|ui| {
-                ui.set_width(260.);
-                menu_spacing(ui);
-                zoom_row(ui, theme);
-                ui.separator();
-                let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
-                    let shortcut = self.keymap.get(key).map(binding_label);
-                    menu_item(ui, label, shortcut).clicked().then_some(action)
-                };
-                let mut picks = vec![
-                    item(ui, "New Tab", "new_tab", Action::NewTab),
-                    item(ui, "New Workspace", "", Action::NewWorkspace),
-                    item(ui, "Open File…", "open_file", Action::Open),
-                ];
-                submenu(ui, "New Pane", |ui| {
-                    ui.set_width(200.);
-                    menu_spacing(ui);
-                    for (label, action) in [
-                        ("Terminal", Action::Split(Direction::Right)),
-                        ("Files", Action::Files),
-                        ("System Monitor", Action::System),
-                        ("Processes", Action::Processes),
-                        ("SSH Connection…", Action::Connect),
-                        ("Codex", Action::Assistant("codex".into())),
-                        ("Claude", Action::Assistant("claude".into())),
-                    ] {
-                        picks.push(item(ui, label, "", action));
-                    }
-                });
-                ui.separator();
-                picks.push(item(ui, "Find…", "search", Action::Search));
-                picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
-                picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
-                picks.push(item(
-                    ui,
-                    "Command Palette",
-                    "command_palette",
-                    Action::Palette,
-                ));
-                ui.separator();
-                picks.push(item(ui, "Preferences", "", Action::Settings));
-                picks.push(item(ui, "About Caelum", "", Action::About));
-                chosen = picks.into_iter().flatten().next();
+                // Scrolls when the window is too short for it (small window, big zoom).
+                let max_height = ui.ctx().content_rect().height() - 16.;
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        ui.set_width(260.);
+                        menu_spacing(ui);
+                        zoom_row(ui, theme);
+                        ui.separator();
+                        let item = |ui: &mut egui::Ui, label: &str, key: &str, action: Action| {
+                            let shortcut = self.keymap.get(key).map(binding_label);
+                            menu_item(ui, label, shortcut).clicked().then_some(action)
+                        };
+                        let mut picks = vec![
+                            item(ui, "New Tab", "new_tab", Action::NewTab),
+                            item(ui, "New Workspace", "", Action::NewWorkspace),
+                            item(ui, "Open File…", "open_file", Action::Open),
+                        ];
+                        submenu(ui, "New Pane", |ui| {
+                            ui.set_width(200.);
+                            menu_spacing(ui);
+                            for (label, action) in [
+                                ("Terminal", Action::Split(Direction::Right)),
+                                ("Files", Action::Files),
+                                ("System Monitor", Action::System),
+                                ("Processes", Action::Processes),
+                                ("SSH Connection…", Action::Connect),
+                                ("Codex", Action::Assistant("codex".into())),
+                                ("Claude", Action::Assistant("claude".into())),
+                            ] {
+                                picks.push(item(ui, label, "", action));
+                            }
+                        });
+                        ui.separator();
+                        picks.push(item(ui, "Find…", "search", Action::Search));
+                        picks.push(item(ui, "Balance Panes", "balance_panes", Action::Equalize));
+                        picks.push(item(ui, "Zoom Pane", "zoom_pane", Action::Zoom));
+                        picks.push(item(
+                            ui,
+                            "Command Palette",
+                            "command_palette",
+                            Action::Palette,
+                        ));
+                        ui.separator();
+                        picks.push(item(ui, "Preferences", "", Action::Settings));
+                        picks.push(item(ui, "About Caelum", "", Action::About));
+                        chosen = picks.into_iter().flatten().next();
+                    });
             });
         if chosen.is_some() {
             self.pending_action = chosen;
@@ -310,9 +324,9 @@ impl App {
         {
             self.tab_scroll_key = key;
             let left = i as f32 * (width + gap);
-            self.tab_scroll = self
-                .tab_scroll
-                .clamp(left + width - area.width(), left.max(0.));
+            // Scroll just far enough to show the whole tab (its start, if it is wider
+            // than the bar).
+            self.tab_scroll = self.tab_scroll.max(left + width - area.width()).min(left);
         }
         self.tab_scroll = self.tab_scroll.clamp(0., overflow).round();
         let scroll = self.tab_scroll;
@@ -770,7 +784,12 @@ pub(super) fn submenu(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut 
         .frame_when_inactive(false)
         .min_size(Vec2::new(ui.available_width(), 32.))
         .right_text(icons::image(Icon::PanEnd, 16., color));
-    egui::containers::menu::SubMenuButton::from_button(button).ui(ui, content);
+    egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
+        let max_height = ui.ctx().content_rect().height() - 16.;
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .show(ui, content);
+    });
 }
 
 /// The zoom row at the top of the main menu: out, the current level (resets), in.
@@ -787,18 +806,21 @@ fn zoom_row(ui: &mut egui::Ui, theme: &Theme) {
         |ui| {
             ui.spacing_mut().item_spacing.x = 0.;
             let side = Vec2::new(width / 3., 34.);
-            if icons::flat(
-                ui,
-                Icon::ZoomOut,
-                side,
-                16.,
-                pal,
-                "Zoom Out (Ctrl+-)",
-                false,
-            )
-            .clicked()
-            {
-                egui::gui_zoom::zoom_out(&ctx);
+            let zoom = ctx.zoom_factor();
+            let (min, max) = (*super::ZOOM_RANGE.start(), *super::ZOOM_RANGE.end());
+            let out = ui.add_enabled_ui(zoom > min + 0.01, |ui| {
+                icons::flat(
+                    ui,
+                    Icon::ZoomOut,
+                    side,
+                    16.,
+                    pal,
+                    "Zoom Out (Ctrl+-)",
+                    false,
+                )
+            });
+            if out.inner.clicked() {
+                super::step_zoom(&ctx, -1);
             }
             let level = format!("{:.0}%", ctx.zoom_factor() * 100.);
             let reset = ui
@@ -810,8 +832,11 @@ fn zoom_row(ui: &mut egui::Ui, theme: &Theme) {
             if reset.clicked() {
                 ctx.set_zoom_factor(1.);
             }
-            if icons::flat(ui, Icon::ZoomIn, side, 16., pal, "Zoom In (Ctrl+=)", false).clicked() {
-                egui::gui_zoom::zoom_in(&ctx);
+            let zoom_in = ui.add_enabled_ui(zoom < max - 0.01, |ui| {
+                icons::flat(ui, Icon::ZoomIn, side, 16., pal, "Zoom In (Ctrl+=)", false)
+            });
+            if zoom_in.inner.clicked() {
+                super::step_zoom(&ctx, 1);
             }
         },
     );
