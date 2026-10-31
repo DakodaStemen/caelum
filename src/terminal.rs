@@ -14,6 +14,7 @@ use alacritty_terminal::{
 };
 #[cfg_attr(not(unix), allow(unused_imports))]
 use anyhow::{Context, Result, bail};
+use eframe::egui::emath::GuiRounding;
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::{
@@ -1057,6 +1058,7 @@ pub fn show(
     let faces = Faces::new(ui, prefs.font_size);
     paint_grid(ui, s, theme, prefs, &painter, &m, &faces, focused, search);
     paint_exit_badge(s, theme, prefs, &painter, m.rect);
+    paint_scroll_indicator(ui, s, theme, &painter, &response, m.rect);
     context_menu(s, &response, &mut clicked);
     clicked
 }
@@ -1520,6 +1522,42 @@ fn paint_cursor(theme: &Theme, prefs: &Preferences, painter: &egui::Painter, r: 
             painter.rect_stroke(r, 0., Stroke::new(1.5_f32, color), egui::StrokeKind::Inside);
         }
     }
+}
+
+/// An overlay scroll indicator like GTK's: a slim thumb at the right edge, shown
+/// while the pointer is over the terminal or the view is scrolled back.
+fn paint_scroll_indicator(
+    ui: &egui::Ui,
+    s: &Session,
+    theme: &Theme,
+    painter: &egui::Painter,
+    response: &egui::Response,
+    rect: Rect,
+) {
+    let (history, offset, rows) = {
+        let term = lock(&s.term);
+        let grid = term.grid();
+        (
+            grid.history_size(),
+            grid.display_offset(),
+            grid.screen_lines(),
+        )
+    };
+    let scrolled = offset > 0;
+    if history == 0 || !(scrolled || response.hovered()) {
+        return;
+    }
+    let total = (history + rows) as f32;
+    let track = rect.shrink2(Vec2::new(3., 4.));
+    let height = (track.height() * rows as f32 / total)
+        .max(24.)
+        .min(track.height());
+    let travel = track.height() - height;
+    let top = track.top() + travel * (1. - offset as f32 / history as f32);
+    let thumb = Rect::from_min_size(egui::pos2(track.right() - 4., top), Vec2::new(4., height))
+        .round_to_pixels(ui.pixels_per_point());
+    let alpha = if scrolled { 0.45 } else { 0.25 };
+    painter.rect_filled(thumb, 2., theme.term("foreground").gamma_multiply(alpha));
 }
 
 /// Small "exit N" badge in the corner after a command reported a non-zero status.
