@@ -165,6 +165,94 @@ pub enum Axis {
     Horizontal,
     Vertical,
 }
+/// Which side of the focused pane a new pane appears on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+impl Direction {
+    pub const ALL: [Direction; 4] = [Self::Up, Self::Left, Self::Right, Self::Down];
+    pub fn axis(self) -> Axis {
+        match self {
+            Self::Left | Self::Right => Axis::Horizontal,
+            Self::Up | Self::Down => Axis::Vertical,
+        }
+    }
+    /// The new pane is the split's `first` child.
+    pub fn before(self) -> bool {
+        matches!(self, Self::Left | Self::Up)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Split left",
+            Self::Right => "Split right",
+            Self::Up => "Split up",
+            Self::Down => "Split down",
+        }
+    }
+}
+/// Layouts nest at most this deep (also enforced when loading a workspace).
+pub const MAX_DEPTH: usize = 32;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneSize {
+    pub width: f32,
+    pub height: f32,
+}
+/// The smallest a pane may become through splitting or dragging a divider.
+pub const MIN_PANE: PaneSize = PaneSize {
+    width: 160.,
+    height: 96.,
+};
+/// A plain rectangle (x, y, width, height) so layout math stays testable without egui.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+impl PaneRect {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+    /// The two halves of a split: `first` gets `ratio` of the space left after `gap`.
+    pub fn split(self, axis: Axis, ratio: f32, gap: f32) -> (Self, Self) {
+        let length = match axis {
+            Axis::Horizontal => self.w,
+            Axis::Vertical => self.h,
+        };
+        // Each side gives up half the gap, so nested equal shares stay equal.
+        let a = (length * ratio - gap / 2.)
+            .round()
+            .clamp(0., (length - gap).max(0.));
+        let b = (length - gap - a).max(0.);
+        match axis {
+            Axis::Horizontal => (
+                Self::new(self.x, self.y, a, self.h),
+                Self::new(self.x + a + gap, self.y, b, self.h),
+            ),
+            Axis::Vertical => (
+                Self::new(self.x, self.y, self.w, a),
+                Self::new(self.x, self.y + a + gap, self.w, b),
+            ),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitOutcome {
+    Split,
+    /// The split only fit after balancing every pane in the tab.
+    Rebalanced,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitError {
+    NotFound,
+    /// A pane would end up smaller than [`MIN_PANE`].
+    NoRoom,
+}
 impl Pane {
     pub fn terminal(cwd: PathBuf) -> Self {
         Self::Terminal {
@@ -193,21 +281,193 @@ impl Pane {
             _ => out.push(self),
         }
     }
+    /// Splits `target` along `axis`, putting `new` after it (right / below).
     pub fn split(&mut self, target: &str, new: Pane, axis: Axis) -> bool {
+        let dir = match axis {
+            Axis::Horizontal => Direction::Right,
+            Axis::Vertical => Direction::Down,
+        };
+        self.split_toward(target, new, dir)
+    }
+    /// Splits `target`, placing `new` on the `dir` side of it, then gives every tile
+    /// in the same-direction run the new pane joined an equal share (splitting right
+    /// four times yields five equal columns). Returns false if `target` is not a leaf here.
+    pub fn split_toward(&mut self, target: &str, new: Pane, dir: Direction) -> bool {
+        let mut new = Some(new);
+        self.insert(target, &mut new, dir).is_some()
+    }
+    /// Returns `None` if `target` was not found, else whether this node still belongs
+    /// to the run of `dir.axis()` splits that starts at the inserted split.
+    fn insert(&mut self, target: &str, new: &mut Option<Pane>, dir: Direction) -> Option<bool> {
         if self.id() == target {
+            if matches!(self, Self::Split { .. }) {
+                return None;
+            }
+            let new = Box::new(new.take()?);
+            let old = Box::new(std::mem::replace(self, Self::System { id: String::new() }));
+            let (first, second) = if dir.before() { (new, old) } else { (old, new) };
             *self = Self::Split {
                 id: id(),
-                axis,
+                axis: dir.axis(),
                 ratio: 0.5,
-                first: Box::new(self.clone()),
-                second: Box::new(new),
+                first,
+                second,
             };
-            true
-        } else if let Self::Split { first, second, .. } = self {
-            first.split(target, new.clone(), axis) || second.split(target, new, axis)
-        } else {
-            false
+            return Some(true);
         }
+        let Self::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let axis = *axis;
+        let open = first
+            .insert(target, new, dir)
+            .or_else(|| second.insert(target, new, dir))?;
+        if open && axis == dir.axis() {
+            self.equalize_run(axis);
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+    /// How many tiles this subtree shows side by side along `axis` (a nested split on
+    /// the other axis counts as one tile).
+    fn weight(&self, axis: Axis) -> f32 {
+        match self {
+            Self::Split {
+                axis: a,
+                first,
+                second,
+                ..
+            } if *a == axis => first.weight(axis) + second.weight(axis),
+            _ => 1.,
+        }
+    }
+    /// Equal shares for the run of `axis` splits rooted here; other-axis subtrees keep
+    /// their own ratios.
+    fn equalize_run(&mut self, axis: Axis) {
+        if let Self::Split {
+            axis: a,
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+            && *a == axis
+        {
+            let (f, s) = (first.weight(axis), second.weight(axis));
+            *ratio = f / (f + s);
+            first.equalize_run(axis);
+            second.equalize_run(axis);
+        }
+    }
+    /// Balances every split in the tree: tiles that sit side by side in the same
+    /// direction all get the same size.
+    pub fn equalize(&mut self) {
+        if let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        {
+            let (f, s) = (first.weight(*axis), second.weight(*axis));
+            *ratio = f / (f + s);
+            first.equalize();
+            second.equalize();
+        }
+    }
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::Split { first, second, .. } => 1 + first.depth().max(second.depth()),
+            _ => 0,
+        }
+    }
+    /// The smallest size this subtree can be laid out in along `axis` while every
+    /// leaf keeps at least `min` and splits are `gap` apart.
+    pub fn min_extent(&self, axis: Axis, min: PaneSize, gap: f32) -> f32 {
+        match self {
+            Self::Split {
+                axis: a,
+                first,
+                second,
+                ..
+            } => {
+                let (f, s) = (
+                    first.min_extent(axis, min, gap),
+                    second.min_extent(axis, min, gap),
+                );
+                if *a == axis { f + gap + s } else { f.max(s) }
+            }
+            _ => match axis {
+                Axis::Horizontal => min.width,
+                Axis::Vertical => min.height,
+            },
+        }
+    }
+    /// The rectangle of every leaf when this tree fills `area`.
+    pub fn leaf_rects(&self, area: PaneRect, gap: f32) -> Vec<(String, PaneRect)> {
+        let mut out = vec![];
+        self.collect_rects(area, gap, &mut out);
+        out
+    }
+    fn collect_rects(&self, area: PaneRect, gap: f32, out: &mut Vec<(String, PaneRect)>) {
+        match self {
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let (a, b) = area.split(*axis, *ratio, gap);
+                first.collect_rects(a, gap, out);
+                second.collect_rects(b, gap, out);
+            }
+            _ => out.push((self.id().to_string(), area)),
+        }
+    }
+    /// Whether every leaf is at least `min` when the tree fills `area`.
+    pub fn fits(&self, area: PaneRect, min: PaneSize, gap: f32) -> bool {
+        self.leaf_rects(area, gap)
+            .iter()
+            .all(|(_, r)| r.w + 0.5 >= min.width && r.h + 0.5 >= min.height)
+    }
+    /// Splits like [`Pane::split_toward`] but refuses when the result would leave a
+    /// pane smaller than `min` in `area` (or nest too deeply). If the split only fits
+    /// once the whole tree is balanced, it balances instead of refusing.
+    pub fn try_split(
+        &mut self,
+        target: &str,
+        new: Pane,
+        dir: Direction,
+        area: PaneRect,
+        min: PaneSize,
+        gap: f32,
+    ) -> Result<SplitOutcome, SplitError> {
+        let mut next = self.clone();
+        if !next.split_toward(target, new, dir) {
+            return Err(SplitError::NotFound);
+        }
+        if next.depth() > MAX_DEPTH {
+            return Err(SplitError::NoRoom);
+        }
+        if next.fits(area, min, gap) {
+            *self = next;
+            return Ok(SplitOutcome::Split);
+        }
+        next.equalize();
+        if next.fits(area, min, gap) {
+            *self = next;
+            return Ok(SplitOutcome::Rebalanced);
+        }
+        Err(SplitError::NoRoom)
     }
     pub fn remove(&mut self, target: &str) -> bool {
         if let Self::Split { first, second, .. } = self {
@@ -278,6 +538,9 @@ impl Workspace {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
+    /// Use Adwaita light/dark with the desktop's accent instead of `theme`. Profiles
+    /// saved before this existed lack the key and so start following the desktop.
+    pub follow_system: bool,
     pub theme: String,
     pub font_size: f32,
     pub terminal_font: String,
@@ -293,7 +556,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            theme: "graphite".into(),
+            follow_system: true,
+            theme: "adwaita-dark".into(),
             font_size: 15.,
             terminal_font: String::new(),
             line_height: 1.2,
@@ -360,7 +624,7 @@ impl State {
             warnings: &mut Vec<String>,
             depth: usize,
         ) -> Result<()> {
-            if depth > 32 {
+            if depth > MAX_DEPTH {
                 bail!("Workspace layout is too deeply nested");
             }
             if !ids.insert(p.id().to_string()) {
@@ -786,6 +1050,211 @@ mod tests {
         fs::remove_file(&drafts).unwrap();
         check_profile_trust(&profile).unwrap();
     }
+    fn term() -> Pane {
+        Pane::terminal(PathBuf::from("/tmp"))
+    }
+    fn leaf_ids(p: &Pane) -> Vec<String> {
+        let mut leaves = vec![];
+        p.leaves(&mut leaves);
+        leaves.iter().map(|l| l.id().to_string()).collect()
+    }
+    const AREA: PaneRect = PaneRect {
+        x: 0.,
+        y: 0.,
+        w: 1200.,
+        h: 800.,
+    };
+    #[test]
+    fn repeated_splits_make_equal_columns() {
+        let mut p = term();
+        let mut focus = p.id().to_string();
+        for _ in 0..4 {
+            let n = term();
+            let next = n.id().to_string();
+            assert!(p.split_toward(&focus, n, Direction::Right));
+            focus = next;
+        }
+        let rects = p.leaf_rects(AREA, 1.);
+        assert_eq!(rects.len(), 5);
+        let usable = AREA.w - 4.;
+        for (_, r) in &rects {
+            assert!((r.w - usable / 5.).abs() <= 1., "{rects:?}");
+            assert_eq!(r.h, AREA.h);
+        }
+        // Splitting a middle column re-balances the whole row, not just its half.
+        let middle = rects[2].0.clone();
+        p.split_toward(&middle, term(), Direction::Left);
+        let rects = p.leaf_rects(AREA, 1.);
+        for (_, r) in &rects {
+            assert!((r.w - (AREA.w - 5.) / 6.).abs() <= 1., "{rects:?}");
+        }
+    }
+    #[test]
+    fn rebalance_leaves_other_axis_alone() {
+        let mut p = term();
+        let a = p.id().to_string();
+        let b = term();
+        let bid = b.id().to_string();
+        p.split_toward(&a, b, Direction::Down);
+        if let Pane::Split { ratio, .. } = &mut p {
+            *ratio = 0.7;
+        }
+        // A row inside the bottom pane does not touch the custom vertical ratio.
+        p.split_toward(&bid, term(), Direction::Right);
+        assert!(matches!(&p, Pane::Split { ratio, .. } if (*ratio - 0.7).abs() < 1e-6));
+    }
+    #[test]
+    fn repeated_splits_stay_within_bounds() {
+        let area = PaneRect::new(0., 0., 1000., 600.);
+        let mut p = term();
+        let mut focus = p.id().to_string();
+        let mut refused = false;
+        for _ in 0..40 {
+            let n = term();
+            let next = n.id().to_string();
+            match p.try_split(&focus, n, Direction::Right, area, MIN_PANE, 1.) {
+                Ok(_) => focus = next,
+                Err(e) => {
+                    assert_eq!(e, SplitError::NoRoom);
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "a 1000pt wide area cannot hold 40 columns");
+        let rects = p.leaf_rects(area, 1.);
+        assert_eq!(rects.len(), (1000. / (MIN_PANE.width + 1.)) as usize);
+        for (_, r) in rects {
+            assert!(r.w >= MIN_PANE.width && r.x >= 0. && r.x + r.w <= area.w + 0.01);
+        }
+        // Same for rows.
+        let mut p = term();
+        let mut focus = p.id().to_string();
+        loop {
+            let n = term();
+            let next = n.id().to_string();
+            if p.try_split(&focus, n, Direction::Down, area, MIN_PANE, 1.)
+                .is_err()
+            {
+                break;
+            }
+            focus = next;
+        }
+        for (_, r) in p.leaf_rects(area, 1.) {
+            assert!(r.h >= MIN_PANE.height && r.y + r.h <= area.h + 0.01);
+        }
+    }
+    #[test]
+    fn try_split_rebalances_when_that_makes_room() {
+        let area = PaneRect::new(0., 0., 700., 400.);
+        let mut p = term();
+        let a = p.id().to_string();
+        let b = term();
+        let bid = b.id().to_string();
+        p.split_toward(&a, b, Direction::Right);
+        let c = term();
+        let cid = c.id().to_string();
+        p.split_toward(&bid, c, Direction::Down);
+        // Squash the right column so splitting `c` sideways does not fit as-is.
+        if let Pane::Split { ratio, .. } = &mut p {
+            *ratio = 0.75;
+        }
+        let out = p.try_split(&cid, term(), Direction::Right, area, MIN_PANE, 1.);
+        assert_eq!(out, Ok(SplitOutcome::Rebalanced));
+        assert!(p.fits(area, MIN_PANE, 1.));
+        assert_eq!(leaf_ids(&p).len(), 4);
+        let before = p.clone();
+        assert_eq!(
+            p.try_split("missing", term(), Direction::Up, area, MIN_PANE, 1.),
+            Err(SplitError::NotFound)
+        );
+        assert_eq!(leaf_ids(&p), leaf_ids(&before));
+    }
+    #[test]
+    fn all_four_directions_insert_on_the_correct_side() {
+        for dir in Direction::ALL {
+            let mut p = term();
+            let old = p.id().to_string();
+            let n = term();
+            let new = n.id().to_string();
+            assert!(p.split_toward(&old, n, dir));
+            let rects: std::collections::HashMap<_, _> =
+                p.leaf_rects(AREA, 1.).into_iter().collect();
+            let (o, n) = (rects[&old], rects[&new]);
+            match dir {
+                Direction::Left => assert!(n.x + n.w <= o.x && n.y == o.y),
+                Direction::Right => assert!(o.x + o.w <= n.x && n.y == o.y),
+                Direction::Up => assert!(n.y + n.h <= o.y && n.x == o.x),
+                Direction::Down => assert!(o.y + o.h <= n.y && n.x == o.x),
+            }
+            assert!(matches!(&p, Pane::Split { axis, .. } if *axis == dir.axis()));
+        }
+    }
+    #[test]
+    fn split_targets_only_leaves() {
+        let mut p = term();
+        let a = p.id().to_string();
+        p.split_toward(&a, term(), Direction::Right);
+        let root = p.id().to_string();
+        assert!(!p.split_toward(&root, term(), Direction::Right));
+        assert_eq!(leaf_ids(&p).len(), 2);
+    }
+    #[test]
+    fn equalize_balances_every_run() {
+        let mut p = term();
+        let a = p.id().to_string();
+        let b = term();
+        let bid = b.id().to_string();
+        p.split_toward(&a, b, Direction::Right);
+        let c = term();
+        let cid = c.id().to_string();
+        p.split_toward(&bid, c, Direction::Down);
+        p.split_toward(&cid, term(), Direction::Down);
+        fn skew(p: &mut Pane) {
+            if let Pane::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } = p
+            {
+                *ratio = 0.2;
+                skew(first);
+                skew(second);
+            }
+        }
+        skew(&mut p);
+        p.equalize();
+        let rects: std::collections::HashMap<_, _> = p.leaf_rects(AREA, 0.).into_iter().collect();
+        assert_eq!(rects[&a].w, 600.);
+        // Right column: three rows of equal height.
+        let rows: Vec<f32> = rects
+            .iter()
+            .filter(|(id, _)| **id != a)
+            .map(|(_, r)| r.h)
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for h in rows {
+            assert!((h - 800. / 3.).abs() <= 1.);
+        }
+    }
+    #[test]
+    fn min_extent_counts_nested_tiles() {
+        let mut p = term();
+        let a = p.id().to_string();
+        let b = term();
+        let bid = b.id().to_string();
+        p.split_toward(&a, b, Direction::Right);
+        p.split_toward(&bid, term(), Direction::Down);
+        assert_eq!(
+            p.min_extent(Axis::Horizontal, MIN_PANE, 1.),
+            2. * MIN_PANE.width + 1.
+        );
+        assert_eq!(
+            p.min_extent(Axis::Vertical, MIN_PANE, 1.),
+            2. * MIN_PANE.height + 1.
+        );
+    }
     #[test]
     fn duplicate_panes_are_rejected() {
         let mut s = State::default();
@@ -916,6 +1385,40 @@ mod migration_tests {
             only_command(&State::read(&destination).unwrap()),
             Some(vec!["claude".to_string()])
         );
+    }
+
+    /// A workspace.json written before four-direction splits (and before panes were
+    /// rebalanced) still loads unchanged, and its layout can be split further.
+    #[test]
+    fn pre_rebalance_workspace_still_loads_and_splits() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("workspace.json");
+        let v = serde_json::json!({"version":1,"activeWorkspace":"w","workspaces":[{"id":"w","name":"Mission Control","activeTab":"t","tabs":[{"id":"t","name":"Terminal","layout":{"id":"s","kind":"split","axis":"horizontal","ratio":0.83,"first":{"id":"a","kind":"terminal","cwd":"/tmp"},"second":{"id":"s2","kind":"split","axis":"horizontal","ratio":0.5,"first":{"id":"b","kind":"terminal","cwd":"/tmp"},"second":{"id":"f","kind":"files","path":"/tmp"}}}}]}],"preferences":{"theme":"graphite","fontSize":15.0,"terminalFont":"","lineHeight":1.2,"cursorStyle":"block","cursorBlink":false,"sidebar":false,"confirmMultilinePaste":true,"customThemes":[]}});
+        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let mut state = State::read(&path).unwrap();
+        // Profiles from before `followSystem` existed switch to the desktop style
+        // once, keeping their chosen theme for when it is turned off again.
+        assert!(state.preferences.follow_system);
+        assert_eq!(state.preferences.theme, "graphite");
+        let layout = &mut state.workspaces[0].tabs[0].layout;
+        // Saved ratios are kept as-is on load.
+        assert!(matches!(layout, Pane::Split { ratio, .. } if (*ratio - 0.83).abs() < 1e-6));
+        assert!(layout.split_toward("b", Pane::System { id: "n".into() }, Direction::Left));
+        let mut leaves = vec![];
+        layout.leaves(&mut leaves);
+        let ids: Vec<_> = leaves.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["a", "n", "b", "f"]);
+        // The row the new pane joined is now four equal columns.
+        let rects = layout.leaf_rects(PaneRect::new(0., 0., 1203., 500.), 1.);
+        for (_, r) in rects {
+            assert!((r.w - 300.).abs() <= 1., "{r:?}");
+        }
+        // An explicit choice to stop following the desktop is saved and kept.
+        state.preferences.follow_system = false;
+        state.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"followSystem\": false"), "{text}");
+        assert!(!State::read(&path).unwrap().preferences.follow_system);
     }
 
     #[test]
