@@ -574,6 +574,9 @@ impl App {
             Err(_) => {
                 self.message =
                     "No room for another pane here. Close a pane or make the window larger.".into();
+                // A zoomed pane looks roomy; show the layout that has no room, as a
+                // split that worked would have.
+                self.zoom = None;
                 false
             }
         }
@@ -1109,6 +1112,13 @@ impl App {
                 let cwd = self.cwd();
                 match self.tab_mut().layout.close(&focused) {
                     Some(next) => self.focused = next,
+                    // The tab's only pane: close the tab, unless it is the last one.
+                    None if self.workspace().tabs.len() > 1 => {
+                        let w = self.workspace_mut();
+                        let i = w.active_index();
+                        w.tabs.remove(i);
+                        w.active_tab = w.tabs[i.min(w.tabs.len() - 1)].id.clone();
+                    }
                     None => self.tab_mut().layout = Pane::terminal(cwd),
                 }
             }
