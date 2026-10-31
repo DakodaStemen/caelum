@@ -478,18 +478,22 @@ impl App {
                     .rect_filled(rect, 6, theme::mix(base, text, 0.05));
             }
             let y = rect.center().y;
-            let pid_g = truncated(ui, pid, egui::TextStyle::Body, muted, 64.);
+            // A narrow pane drops the PID column so names keep some room.
+            let pid_w = if rect.width() < 240. { 0. } else { 72. };
             let rss_g = truncated(ui, rss, egui::TextStyle::Body, color, 90.);
-            let name_w = (rect.width() - 72. - rss_g.size().x - 24.).max(20.);
+            let name_w = (rect.width() - pid_w - rss_g.size().x - 24.).max(0.);
             let name_g = truncated(ui, name, egui::TextStyle::Body, color, name_w);
             let p = ui.painter();
+            if pid_w > 0. {
+                let pid_g = truncated(ui, pid, egui::TextStyle::Body, muted, 64.);
+                p.galley(
+                    Pos2::new(rect.left() + 6., y - pid_g.size().y / 2.),
+                    pid_g,
+                    muted,
+                );
+            }
             p.galley(
-                Pos2::new(rect.left() + 6., y - pid_g.size().y / 2.),
-                pid_g,
-                muted,
-            );
-            p.galley(
-                Pos2::new(rect.left() + 72., y - name_g.size().y / 2.),
+                Pos2::new(rect.left() + 6. + pid_w, y - name_g.size().y / 2.),
                 name_g,
                 color,
             );
