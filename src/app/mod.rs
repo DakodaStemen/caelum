@@ -1,4 +1,6 @@
 mod editor;
+mod headerbar;
+mod icons;
 mod panes;
 mod persist;
 #[cfg(test)]
@@ -8,9 +10,10 @@ mod sidebar;
 mod terminal_pane;
 use anyhow::{Context, Result, bail};
 use caelum_rs::{
+    appearance::{self, SystemLook},
     config::{self, Config, Keymap},
     files::{self, Document, Draft},
-    model::{self, Axis, Pane, State, Tab, Workspace},
+    model::{self, Direction, Pane, State, Tab, Workspace},
     syntax::Highlighter,
     terminal::{self, Session},
     theme::{self, Theme},
@@ -30,7 +33,12 @@ use std::{
 enum Action {
     NewTab,
     NewWorkspace,
-    Split(Axis),
+    Split(Direction),
+    Equalize,
+    About,
+    RenameWorkspace,
+    CloseWorkspace,
+    RenameTab,
     Files,
     System,
     Processes,
@@ -214,7 +222,30 @@ pub struct App {
     last_save: Instant,
     system: SystemInfo,
     process_filter: String,
-    logo: egui::TextureHandle,
+    /// Desktop light/dark preference, accent, UI font and window buttons.
+    look: SystemLook,
+    /// A re-check of the desktop colors running in the background (on focus).
+    look_rx: Option<std::sync::mpsc::Receiver<SystemLook>>,
+    look_checked: Instant,
+    was_focused: bool,
+    /// Draw the headerbar's window controls and handle move/resize ourselves.
+    csd: bool,
+    /// Resolved from `look` or the windowing system each frame.
+    system_dark: bool,
+    /// Resolved UI (proportional) and terminal (monospace) font files.
+    ui_font: Option<Vec<u8>>,
+    mono_font: Option<Vec<u8>>,
+    ui_font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    /// Where the panes of the active tab were laid out last frame.
+    pane_area: Option<Rect>,
+    /// When the current status message appeared (toasts hide after a few seconds).
+    message_shown: Option<(String, Instant)>,
+    about: bool,
+    /// An action picked in a popover, run after the frame's layout.
+    pending_action: Option<Action>,
+    window_title: String,
+    /// Window edge under the pointer (client-side decorations only).
+    resize_edge: Option<egui::ResizeDirection>,
     smoke: Option<Smoke>,
     recovery_conflict: bool,
     pending_open: Option<PathBuf>,
@@ -246,6 +277,7 @@ struct Smoke {
     screenshot: bool,
 }
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &egui::Context,
         profile: PathBuf,
@@ -253,27 +285,9 @@ impl App {
         message: String,
         smoke: Option<PathBuf>,
         config_path: PathBuf,
+        look: SystemLook,
+        csd: bool,
     ) -> Self {
-        // The logo is compiled in; a decode failure falls back to a blank texture.
-        let image = image::load_from_memory(include_bytes!("../../assets/brand/logo.png"))
-            .map(|i| i.to_rgba8())
-            .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
-        let size = [image.width() as usize, image.height() as usize];
-        let logo = ctx.load_texture(
-            "Caelum",
-            egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
-            Default::default(),
-        );
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = Vec2::new(8., 8.);
-        style.spacing.button_padding = Vec2::new(12., 7.);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(14.));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(14.));
-        ctx.set_style(style);
         if smoke.is_some() {
             let demo = profile.join("demo");
             let _ = fs::create_dir_all(demo.join("src"));
@@ -306,6 +320,7 @@ impl App {
             documents: HashMap::new(),
             files: HashMap::new(),
             presets: theme::presets(),
+            look: SystemLook::default(),
             focused: String::new(),
             zoom: None,
             message,
@@ -321,7 +336,20 @@ impl App {
             last_save: Instant::now(),
             system: SystemInfo::new(),
             process_filter: String::new(),
-            logo,
+            look_rx: None,
+            look_checked: Instant::now(),
+            was_focused: true,
+            csd,
+            system_dark: true,
+            ui_font: None,
+            mono_font: None,
+            ui_font_rx: None,
+            pane_area: None,
+            message_shown: None,
+            about: false,
+            pending_action: None,
+            window_title: String::new(),
+            resize_edge: None,
             smoke: smoke.map(|report| Smoke {
                 report,
                 stage: 0,
@@ -362,9 +390,14 @@ impl App {
         }
         app.restore_drafts();
         app.ensure_focus();
+        app.load_ui_font(ctx, look.ui_font.as_ref().map(|(family, _)| family.clone()));
+        app.look = look;
         app
     }
     fn theme(&self) -> Theme {
+        if self.theme_draft.is_none() && self.state.preferences.follow_system {
+            return self.system_theme();
+        }
         self.theme_draft
             .clone()
             .or_else(|| {
@@ -376,7 +409,23 @@ impl App {
                     .cloned()
             })
             .or_else(|| self.presets.get(&self.state.preferences.theme).cloned())
-            .unwrap_or_else(|| self.presets["graphite"].clone())
+            .unwrap_or_else(|| self.system_theme())
+    }
+    /// Adwaita light or dark (following the desktop) with the desktop's accent.
+    fn system_theme(&self) -> Theme {
+        let id = if self.system_dark {
+            "adwaita-dark"
+        } else {
+            "adwaita-light"
+        };
+        self.presets[id].clone().with_accent(self.look.accent())
+    }
+    /// Body text size: the desktop's UI font size (GTK points are 1/72 inch at 96 dpi).
+    fn ui_font_size(&self) -> f32 {
+        self.look
+            .ui_font
+            .as_ref()
+            .map_or(14., |(_, pt)| (pt * 96. / 72.).clamp(11., 22.))
     }
     fn workspace(&self) -> &Workspace {
         &self.state.workspaces[self.state.active_index()]
@@ -438,6 +487,7 @@ impl App {
                             .any(|t| &t.id == id);
                     if known {
                         self.state.preferences.theme = id.clone();
+                        self.state.preferences.follow_system = false;
                     } else {
                         self.message = format!("config.toml: unknown theme {id:?}");
                     }
@@ -453,18 +503,47 @@ impl App {
         }
     }
     fn insert(&mut self, pane: Pane) {
-        let target = self.focused.clone();
+        self.split_with(pane, Direction::Right);
+    }
+    /// Opens `pane` beside the focused pane. Refuses (with a message) rather than
+    /// squeezing any pane below [`model::MIN_PANE`]; balances the tab when that is
+    /// what makes room.
+    fn split_with(&mut self, pane: Pane, dir: Direction) -> bool {
         let next = pane.id().to_string();
-        if !self
-            .tab_mut()
-            .layout
-            .split(&target, pane.clone(), Axis::Horizontal)
-        {
-            let root = self.tab().layout.id().to_string();
-            self.tab_mut().layout.split(&root, pane, Axis::Horizontal);
+        let area = self
+            .pane_area
+            .map(|r| model::PaneRect::new(r.left(), r.top(), r.width(), r.height()))
+            // Before the first frame there is no area yet; never refuse then.
+            .unwrap_or(model::PaneRect::new(0., 0., 1e6, 1e6));
+        let mut target = self.focused.clone();
+        if self.tab().layout.find(&target).is_none() {
+            target = self.tab().layout.id().to_string();
         }
-        self.focused = next;
-        self.zoom = None;
+        // A split root is not a leaf: fall back to its first leaf.
+        if let Some(Pane::Split { .. }) = self.tab().layout.find(&target) {
+            let mut leaves = vec![];
+            self.tab().layout.leaves(&mut leaves);
+            target = leaves[0].id().to_string();
+        }
+        let result =
+            self.tab_mut()
+                .layout
+                .try_split(&target, pane, dir, area, model::MIN_PANE, panes::GAP);
+        match result {
+            Ok(outcome) => {
+                if outcome == model::SplitOutcome::Rebalanced {
+                    self.message = "Panes were balanced to make room".into();
+                }
+                self.focused = next;
+                self.zoom = None;
+                true
+            }
+            Err(_) => {
+                self.message =
+                    "No room for another pane here. Close a pane or make the window larger.".into();
+                false
+            }
+        }
     }
     fn action(&mut self, action: Action, ctx: &egui::Context) {
         let reset_focus = matches!(
@@ -499,13 +578,22 @@ impl App {
                 self.zoom = None;
                 self.ensure_focus();
             }
-            Action::Split(axis) => {
-                let pane = Pane::terminal(self.cwd());
-                let id = pane.id().to_string();
-                let focused = self.focused.clone();
-                self.tab_mut().layout.split(&focused, pane, axis);
-                self.focused = id;
+            Action::Split(dir) => {
+                self.split_with(Pane::terminal(self.cwd()), dir);
+            }
+            Action::Equalize => {
+                self.tab_mut().layout.equalize();
                 self.zoom = None;
+            }
+            Action::About => self.about = true,
+            Action::RenameWorkspace => {
+                self.dialog = Some("Rename workspace".into());
+                self.dialog_input = self.workspace().name.clone();
+            }
+            Action::CloseWorkspace => self.pending = Some(PendingClose::Workspace),
+            Action::RenameTab => {
+                self.dialog = Some("Rename tab".into());
+                self.dialog_input = self.tab().name.clone();
             }
             Action::Files => self.insert(Pane::Files {
                 id: model::id(),
@@ -538,7 +626,13 @@ impl App {
                     command: Some(vec![command]),
                 });
             }
-            Action::Theme(id) => self.state.preferences.theme = id,
+            // An empty id means "follow the desktop".
+            Action::Theme(id) => {
+                self.state.preferences.follow_system = id.is_empty();
+                if !id.is_empty() {
+                    self.state.preferences.theme = id;
+                }
+            }
             Action::Save => {
                 self.pending_save = Some(self.focused.clone());
             }
@@ -582,8 +676,14 @@ impl App {
         let mut a = vec![
             ("New tab".into(), Action::NewTab),
             ("New workspace".into(), Action::NewWorkspace),
-            ("Split right".into(), Action::Split(Axis::Horizontal)),
-            ("Split below".into(), Action::Split(Axis::Vertical)),
+            ("Rename workspace".into(), Action::RenameWorkspace),
+            ("Close workspace".into(), Action::CloseWorkspace),
+            ("Rename tab".into(), Action::RenameTab),
+            ("Split right".into(), Action::Split(Direction::Right)),
+            ("Split down".into(), Action::Split(Direction::Down)),
+            ("Split left".into(), Action::Split(Direction::Left)),
+            ("Split up".into(), Action::Split(Direction::Up)),
+            ("Balance panes".into(), Action::Equalize),
             ("Zoom / restore pane".into(), Action::Zoom),
             ("Close pane".into(), Action::ClosePane),
             ("Open file".into(), Action::Open),
@@ -594,10 +694,12 @@ impl App {
             ("Launch Codex".into(), Action::Assistant("codex".into())),
             ("Launch Claude".into(), Action::Assistant("claude".into())),
             ("Toggle sidebar".into(), Action::Sidebar),
-            ("Appearance and settings".into(), Action::Settings),
+            ("Preferences".into(), Action::Settings),
+            ("About Caelum".into(), Action::About),
             ("Previous prompt".into(), Action::PrevPrompt),
             ("Next prompt".into(), Action::NextPrompt),
         ];
+        a.push(("Theme: Follow system".into(), Action::Theme(String::new())));
         for (id, t) in &self.presets {
             a.push((format!("Theme: {}", t.name), Action::Theme(id.clone())));
         }
@@ -634,14 +736,21 @@ impl App {
         if self.palette {
             let mut action = None;
             egui::Window::new("Command palette")
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(520.)
-                .anchor(egui::Align2::CENTER_TOP, [0., 95.])
+                .min_width(520.)
+                .max_width(520.)
+                .frame(egui::Frame::window(&ctx.style()).inner_margin(8))
+                .anchor(egui::Align2::CENTER_TOP, [0., 80.])
                 .show(ctx, |ui| {
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.palette_query)
-                            .hint_text("Type a command or theme…")
+                            .hint_text(
+                                RichText::new("Type a command or theme…")
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .margin(Vec2::new(10., 8.))
                             .desired_width(f32::INFINITY),
                     );
                     if !ctx.wants_keyboard_input() {
@@ -656,17 +765,18 @@ impl App {
                     if ui.input(|i| i.key_pressed(Key::Enter)) {
                         action = matches.first().map(|(_, a)| a.clone());
                     }
+                    ui.add_space(2.);
                     egui::ScrollArea::vertical()
-                        .max_height(400.)
+                        .max_height(380.)
                         .show(ui, |ui| {
-                            for (label, a) in matches {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width(), 30.],
-                                        egui::Button::new(label),
-                                    )
-                                    .clicked()
-                                {
+                            ui.spacing_mut().item_spacing.y = 0.;
+                            for (i, (label, a)) in matches.into_iter().enumerate() {
+                                // Enter runs the first match, so it is shown selected.
+                                let row = egui::Button::new(label)
+                                    .frame_when_inactive(i == 0)
+                                    .selected(i == 0)
+                                    .min_size(Vec2::new(ui.available_width(), 32.));
+                                if ui.add(row).clicked() {
                                     action = Some(a);
                                 }
                             }
@@ -701,7 +811,7 @@ impl App {
                     };
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.dialog_input)
-                            .hint_text(hint)
+                            .hint_text(RichText::new(hint).color(ui.visuals().weak_text_color()))
                             .desired_width(f32::INFINITY),
                     );
                     if !ctx.wants_keyboard_input() {
@@ -945,7 +1055,7 @@ impl App {
                         "Real PTY executes a shell command and decodes true-color output".into(),
                     );
                     self.focused = s.terminal.clone();
-                    self.action(Action::Split(Axis::Vertical), ctx);
+                    self.action(Action::Split(Direction::Down), ctx);
                 }
                 2 => {
                     if self.terminals.len() < 2 {
@@ -1120,6 +1230,7 @@ impl App {
         {
             self.apply_config(latest, ctx, true);
         }
+        self.poll_look(ctx);
         self.shortcuts(ctx);
         self.apply_font(ctx);
         let theme = self.theme();
@@ -1127,35 +1238,39 @@ impl App {
             session.poll(&theme);
         }
         if theme.validate().is_ok() {
-            theme.apply(ctx);
+            theme.apply(ctx, self.ui_font_size());
         }
-        self.top(ctx, &theme);
+        self.window_edges(ctx);
+        self.headerbar(ctx, &theme);
         self.sidebar(ctx, &theme);
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme.ui("background"))
-                    .inner_margin(6.),
-            )
+            .frame(egui::Frame::new().fill(theme.ui("background")))
             .show(ctx, |ui| {
-                self.tabs(ui, ctx);
-                let rect = ui.available_rect_before_wrap();
+                let rect = ui.max_rect();
+                self.pane_area = Some(rect);
                 let mut layout = self.tab().layout.clone();
                 if let Some(zoom) = self.zoom.clone() {
                     if let Some(node) = layout.find(&zoom).cloned() {
                         let mut node = node;
-                        self.layout(ui, rect, &mut node, ctx, &theme);
+                        self.layout(ui, rect, &mut node, ctx, &theme, true);
                         update_node(&mut layout, &zoom, node);
                     }
                 } else {
-                    self.layout(ui, rect, &mut layout, ctx, &theme);
+                    let headers = matches!(layout, Pane::Split { .. });
+                    self.layout(ui, rect, &mut layout, ctx, &theme, headers);
                 }
                 self.tab_mut().layout = layout;
             });
+        if let Some(action) = self.pending_action.take() {
+            self.action(action, ctx);
+        }
         if let Some(path) = self.pending_open.take() {
             self.open_file(path);
         }
         self.overlays(ctx);
+        self.about_dialog(ctx, &theme);
+        self.toast(ctx, &theme);
+        self.window_frame(ctx, &theme);
         if let Some(id) = self.pending_save.take() {
             self.save_document(&id);
         }
@@ -1174,14 +1289,88 @@ impl App {
         ));
     }
 }
+/// Lays `text` out on one line, cut with an ellipsis to fit `width`.
+fn truncated(
+    ui: &egui::Ui,
+    text: &str,
+    style: egui::TextStyle,
+    color: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        text.to_string(),
+        style.resolve(ui.style()),
+        color,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.));
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+/// "Ctrl+Shift+D"-style text for a binding.
+fn binding_label(b: config::Binding) -> String {
+    let mut parts = vec![];
+    if b.modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if b.modifiers.alt {
+        parts.push("Alt");
+    }
+    if b.modifiers.shift {
+        parts.push("Shift");
+    }
+    let key = b.key.name();
+    parts.push(key);
+    parts.join("+")
+}
+impl App {
+    /// Re-reads the desktop's light/dark preference and accent (off the UI thread)
+    /// when the window regains focus, so flipping the desktop style is picked up.
+    fn poll_look(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.look_rx
+            && let Ok(colors) = rx.try_recv()
+        {
+            self.look.scheme = colors.scheme;
+            self.look.accent = colors.accent;
+            self.look_rx = None;
+        }
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused
+            && !self.was_focused
+            && self.look_rx.is_none()
+            && self.look_checked.elapsed() > Duration::from_secs(2)
+        {
+            self.look_checked = Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            if std::thread::Builder::new()
+                .name("caelum-look".into())
+                .spawn(move || {
+                    let _ = tx.send(appearance::detect_colors());
+                    ctx.request_repaint();
+                })
+                .is_ok()
+            {
+                self.look_rx = Some(rx);
+            }
+        }
+        self.was_focused = focused;
+        self.system_dark = match self.look.scheme {
+            Some(appearance::Scheme::Dark) => true,
+            Some(appearance::Scheme::Light) => false,
+            None => ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark),
+        };
+    }
+}
 /// Config action name -> app action for every rebindable shortcut in [`config::ACTIONS`].
 fn shortcut_table() -> Vec<(&'static str, Action)> {
     vec![
         ("command_palette", Action::Palette),
         ("toggle_sidebar", Action::Sidebar),
         ("new_tab", Action::NewTab),
-        ("split_right", Action::Split(Axis::Horizontal)),
-        ("split_below", Action::Split(Axis::Vertical)),
+        ("split_right", Action::Split(Direction::Right)),
+        ("split_below", Action::Split(Direction::Down)),
+        ("split_left", Action::Split(Direction::Left)),
+        ("split_up", Action::Split(Direction::Up)),
+        ("balance_panes", Action::Equalize),
         ("zoom_pane", Action::Zoom),
         ("close_pane", Action::ClosePane),
         ("open_file", Action::Open),

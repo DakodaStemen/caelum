@@ -1,30 +1,52 @@
 use super::*;
 
 impl App {
-    /// Applies a resolved system font when one is ready and starts resolving a changed
-    /// selection on a worker thread so `fc-match` never blocks the UI.
+    /// Installs resolved fonts when they arrive and starts resolving a changed
+    /// terminal font on a worker thread so `fc-match` never blocks the UI.
     pub(super) fn apply_font(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
         if let Some(rx) = &self.font_rx {
             match rx.try_recv() {
                 Ok(bytes) => {
                     self.font_rx = None;
-                    if let Some(bytes) = bytes {
-                        let mut fonts = egui::FontDefinitions::default();
-                        fonts.font_data.insert(
-                            "system-mono".into(),
-                            egui::FontData::from_owned(bytes).into(),
-                        );
-                        fonts
-                            .families
-                            .entry(egui::FontFamily::Monospace)
-                            .or_default()
-                            .insert(0, "system-mono".into());
-                        ctx.set_fonts(fonts);
-                    }
+                    self.mono_font = bytes;
+                    changed = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.font_rx = None,
             }
+        }
+        if let Some(rx) = &self.ui_font_rx {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    self.ui_font_rx = None;
+                    self.ui_font = bytes;
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ui_font_rx = None,
+            }
+        }
+        if changed {
+            // egui's bundled fonts stay as fallbacks for missing glyphs.
+            let mut fonts = egui::FontDefinitions::default();
+            for (name, bytes, family) in [
+                ("system-ui", &self.ui_font, egui::FontFamily::Proportional),
+                ("system-mono", &self.mono_font, egui::FontFamily::Monospace),
+            ] {
+                if let Some(bytes) = bytes {
+                    fonts.font_data.insert(
+                        name.into(),
+                        egui::FontData::from_owned(bytes.clone()).into(),
+                    );
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .insert(0, name.into());
+                }
+            }
+            ctx.set_fonts(fonts);
         }
         let name = self.state.preferences.terminal_font.clone();
         if name == self.applied_font {
@@ -39,13 +61,27 @@ impl App {
             ctx.request_repaint();
         });
     }
+    /// Resolves the desktop's interface font (e.g. Adwaita Sans) in the background.
+    pub(super) fn load_ui_font(&mut self, ctx: &egui::Context, family: Option<String>) {
+        let Some(family) = family.filter(|f| !f.is_empty()) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ui_font_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_family(&family, false));
+            ctx.request_repaint();
+        });
+    }
     pub(super) fn appearance(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let mut draft = self.theme_draft.take();
         let mut save_draft = false;
         let mut cancel_draft = false;
-        egui::Window::new("Appearance")
+        egui::Window::new("Preferences")
             .open(&mut open)
+            .collapsible(false)
             .default_pos(ctx.content_rect().center())
             .pivot(egui::Align2::CENTER_CENTER)
             .default_width(650.)
@@ -99,8 +135,17 @@ impl App {
                             cancel_draft = ui.button("Cancel preview").clicked();
                         });
                     } else {
-                        ui.label("ELEVEN PRESETS · YOUR OWN COLORS");
-                        ui.add_space(8.);
+                        let follow = self.state.preferences.follow_system;
+                        if ui
+                            .radio(follow, "Follow system style")
+                            .on_hover_text("Adwaita light or dark, with the desktop's accent color")
+                            .clicked()
+                        {
+                            self.state.preferences.follow_system = true;
+                        }
+                        ui.add_space(4.);
+                        ui.label(RichText::new("Or pick a theme").small().color(self.theme().ui("muted")));
+                        ui.add_space(4.);
                         egui::Grid::new("themes")
                             .num_columns(5)
                             .spacing([8., 12.])
@@ -109,17 +154,15 @@ impl App {
                                     let b = egui::Button::new(
                                         RichText::new(&t.name).color(t.ui("text")),
                                     )
-                                    .fill(t.ui("surface"))
-                                    .stroke(Stroke::new(
-                                        if self.state.preferences.theme == *id {
-                                            2_f32
-                                        } else {
-                                            1_f32
-                                        },
-                                        t.ui("accent"),
-                                    ));
-                                    if ui.add_sized([110., 45.], b).clicked() {
+                                    .fill(t.ui("background"))
+                                    .stroke(if !follow && self.state.preferences.theme == *id {
+                                        Stroke::new(2_f32, self.theme().ui("accent"))
+                                    } else {
+                                        Stroke::NONE
+                                    });
+                                    if ui.add_sized([110., 40.], b).clicked() {
                                         self.state.preferences.theme = id.clone();
+                                        self.state.preferences.follow_system = false;
                                     }
                                     if i % 5 == 4 {
                                         ui.end_row();
@@ -128,10 +171,14 @@ impl App {
                             });
                         for t in &self.state.preferences.custom_themes {
                             if ui
-                                .selectable_label(self.state.preferences.theme == t.id, &t.name)
+                                .selectable_label(
+                                    !follow && self.state.preferences.theme == t.id,
+                                    &t.name,
+                                )
                                 .clicked()
                             {
                                 self.state.preferences.theme = t.id.clone();
+                                self.state.preferences.follow_system = false;
                             }
                         }
                         if ui.button("Customize current theme").clicked() {
@@ -188,7 +235,7 @@ impl App {
                         ui.strong("Share themes");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.theme_path)
-                                .hint_text("Absolute path to a theme JSON file")
+                                .hint_text(RichText::new("Absolute path to a theme JSON file").color(ui.visuals().weak_text_color()))
                                 .desired_width(f32::INFINITY),
                         );
                         ui.horizontal(|ui| {
@@ -221,6 +268,7 @@ impl App {
                                 match result {
                                     Ok(t) => {
                                         self.state.preferences.theme = t.id.clone();
+                                        self.state.preferences.follow_system = false;
                                         self.state.preferences.custom_themes.push(t);
                                     }
                                     Err(e) => self.message = e.to_string(),
@@ -235,6 +283,7 @@ impl App {
             });
         if save_draft && let Some(t) = draft.take() {
             self.state.preferences.theme = t.id.clone();
+            self.state.preferences.follow_system = false;
             self.state.preferences.custom_themes.push(t);
         }
         if cancel_draft || !open {
@@ -248,8 +297,13 @@ impl App {
 /// Resolves a font family (fontconfig first, then standard font directories) and
 /// returns its bytes if egui can parse them.
 fn resolve_font(name: &str) -> Option<Vec<u8>> {
+    resolve_family(name, true)
+}
+/// `mono`: an empty name means the system monospace font, and the platform
+/// fallbacks are monospace families.
+fn resolve_family(name: &str, mono: bool) -> Option<Vec<u8>> {
     // A leading '-' would be parsed by fc-match as an option, not a font pattern.
-    if name.starts_with('-') {
+    if name.starts_with('-') || (!mono && name.is_empty()) {
         return None;
     }
     let parse = |bytes: Vec<u8>| {
@@ -273,7 +327,7 @@ fn resolve_font(name: &str) -> Option<Vec<u8>> {
         return Some(bytes);
     }
     // macOS/Windows (or Linux without fontconfig): scan the standard font directories.
-    let wanted: Vec<&str> = if name.is_empty() {
+    let wanted: Vec<&str> = if name.is_empty() && mono {
         vec!["Menlo", "Consolas", "Courier New", "DejaVuSansMono"]
     } else {
         vec![name]

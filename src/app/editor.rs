@@ -1,4 +1,3 @@
-use super::panes::badge;
 use super::*;
 
 impl App {
@@ -52,10 +51,9 @@ impl App {
             if doc.read_only {
                 ui.colored_label(theme.ui("danger"), "Unknown encoding · read only");
             }
-            badge(ui, theme, &language, theme.syn("function"));
             let lines = doc.text.lines().count().max(1);
             ui.label(
-                RichText::new(format!("{lines} lines"))
+                RichText::new(format!("{language} · {lines} lines"))
                     .small()
                     .color(theme.ui("muted")),
             );

@@ -89,62 +89,146 @@ impl Theme {
             _ => self.term("foreground"),
         }
     }
-    pub fn apply(&self, ctx: &Context) {
-        let mut v = if self.kind == "light" {
+    /// The same theme with `accent` as its accent color (used to follow the desktop).
+    pub fn with_accent(mut self, accent: Color32) -> Self {
+        let [r, g, b, _] = accent.to_array();
+        self.ui
+            .insert("accent".into(), format!("#{r:02x}{g:02x}{b:02x}"));
+        self
+    }
+    /// Applies the theme as libadwaita-like visuals: flat surfaces, no strokes on
+    /// controls, 6pt control radius, 12pt popovers and dialogs, accent only for
+    /// selection, focus and links. `font_size` is the body text size in points.
+    pub fn apply(&self, ctx: &Context, font_size: f32) {
+        let light = self.kind == "light";
+        let mut v = if light {
             Visuals::light()
         } else {
             Visuals::dark()
         };
-        v.override_text_color = Some(self.ui("text"));
-        v.panel_fill = self.ui("panel");
+        let text = self.ui("text");
+        let bg = self.ui("background");
+        let accent = self.ui("accent");
+        // Controls are the text color laid over the window at low opacity.
+        let control = self.ui("button");
+        let hover = mix(control, text, 0.06);
+        let pressed = mix(control, text, 0.16);
+        v.override_text_color = Some(text);
+        v.weak_text_color = Some(self.ui("muted"));
+        v.panel_fill = bg;
         v.window_fill = self.ui("surface");
-        v.extreme_bg_color = self.ui("background");
-        v.selection.bg_fill = self.ui("button");
-        v.selection.stroke.color = self.ui("textStrong");
-        v.widgets.inactive.bg_fill = self.ui("borderStrong");
-        v.widgets.inactive.weak_bg_fill = self.ui("surface");
-        v.widgets.inactive.bg_stroke.color = self.ui("border");
-        v.widgets.hovered.bg_fill = self.ui("tabActive");
-        v.widgets.hovered.weak_bg_fill = self.ui("tabActive");
-        v.widgets.active.bg_fill = self.ui("button");
-        v.widgets.active.weak_bg_fill = self.ui("button");
-        v.hyperlink_color = self.ui("accent");
-        let round = CornerRadius::same(7);
-        for w in [
-            &mut v.widgets.noninteractive,
-            &mut v.widgets.inactive,
-            &mut v.widgets.hovered,
-            &mut v.widgets.active,
-            &mut v.widgets.open,
+        v.extreme_bg_color = control;
+        v.text_edit_bg_color = Some(control);
+        v.code_bg_color = control;
+        v.faint_bg_color = mix(bg, text, 0.03);
+        v.hyperlink_color = accent;
+        v.warn_fg_color = self.syn("number");
+        v.error_fg_color = self.ui("danger");
+        v.selection.bg_fill = accent.gamma_multiply(if light { 0.25 } else { 0.4 });
+        // Also the focus ring of text fields and the text of selected rows, so it is
+        // an accent tint that still reads as text.
+        v.selection.stroke = Stroke::new(1.5_f32, mix(accent, self.ui("textStrong"), 0.45));
+        v.handle_shape = eframe::egui::style::HandleShape::Circle;
+        v.text_cursor.stroke = Stroke::new(1.5_f32, text);
+        v.striped = false;
+        v.interact_cursor = None;
+        v.button_frame = true;
+        v.collapsing_header_frame = false;
+        v.indent_has_left_vline = false;
+        let radius = CornerRadius::same(6);
+        let quiet = Stroke::NONE;
+        let w = &mut v.widgets;
+        w.noninteractive.bg_fill = bg;
+        w.noninteractive.weak_bg_fill = bg;
+        w.noninteractive.bg_stroke = Stroke::new(1_f32, self.ui("border"));
+        w.noninteractive.fg_stroke = Stroke::new(1_f32, text);
+        // Check boxes, radios and slider rails need to show up on dialogs too.
+        w.inactive.bg_fill = mix(self.ui("surface"), text, 0.16);
+        w.inactive.weak_bg_fill = control;
+        w.inactive.bg_stroke = quiet;
+        w.inactive.fg_stroke = Stroke::new(1_f32, text);
+        w.hovered.bg_fill = hover;
+        w.hovered.weak_bg_fill = hover;
+        w.hovered.bg_stroke = quiet;
+        w.hovered.fg_stroke = Stroke::new(1.5_f32, self.ui("textStrong"));
+        w.active.bg_fill = pressed;
+        w.active.weak_bg_fill = pressed;
+        w.active.bg_stroke = quiet;
+        w.active.fg_stroke = Stroke::new(1.5_f32, self.ui("textStrong"));
+        w.open.bg_fill = hover;
+        w.open.weak_bg_fill = hover;
+        w.open.bg_stroke = quiet;
+        w.open.fg_stroke = Stroke::new(1_f32, self.ui("textStrong"));
+        for s in [
+            &mut w.noninteractive,
+            &mut w.inactive,
+            &mut w.hovered,
+            &mut w.active,
+            &mut w.open,
         ] {
-            w.corner_radius = round;
+            s.corner_radius = radius;
+            s.expansion = 0.;
         }
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1_f32, self.ui("border"));
-        v.widgets.hovered.bg_stroke = Stroke::new(1_f32, self.ui("accent"));
-        v.widgets.active.bg_stroke = Stroke::new(1_f32, self.ui("accent"));
-        v.widgets.hovered.fg_stroke.color = self.ui("textStrong");
-        v.widgets.active.fg_stroke.color = self.ui("textStrong");
         v.window_corner_radius = CornerRadius::same(12);
-        v.menu_corner_radius = CornerRadius::same(10);
-        v.window_stroke = Stroke::new(1_f32, self.ui("borderStrong"));
+        v.menu_corner_radius = CornerRadius::same(12);
+        v.window_stroke = Stroke::new(
+            1_f32,
+            if light {
+                Color32::from_black_alpha(30)
+            } else {
+                Color32::from_white_alpha(14)
+            },
+        );
         v.window_shadow = Shadow {
-            offset: [0, 10],
-            blur: 28,
+            offset: [0, 4],
+            blur: 18,
             spread: 0,
-            color: Color32::from_black_alpha(if self.kind == "light" { 50 } else { 140 }),
+            color: Color32::from_black_alpha(if light { 40 } else { 90 }),
         };
-        v.selection.bg_fill = self.ui("accent").gamma_multiply(0.35);
-        v.text_cursor.stroke = Stroke::new(2_f32, self.ui("accent"));
+        v.popup_shadow = Shadow {
+            offset: [0, 2],
+            blur: 10,
+            spread: 0,
+            color: Color32::from_black_alpha(if light { 36 } else { 80 }),
+        };
+        v.window_highlight_topmost = false;
         ctx.set_visuals(v);
         ctx.style_mut(|st| {
-            st.spacing.item_spacing = Vec2::new(8., 7.);
-            st.spacing.button_padding = Vec2::new(11., 6.);
+            use eframe::egui::{FontFamily, FontId, TextStyle};
+            st.text_styles = [
+                (
+                    TextStyle::Small,
+                    FontId::proportional((font_size * 0.86).round()),
+                ),
+                (TextStyle::Body, FontId::proportional(font_size)),
+                (TextStyle::Button, FontId::proportional(font_size)),
+                (
+                    TextStyle::Heading,
+                    FontId::proportional((font_size * 1.2).round()),
+                ),
+                (
+                    TextStyle::Monospace,
+                    FontId::new(font_size, FontFamily::Monospace),
+                ),
+            ]
+            .into();
+            st.spacing.item_spacing = Vec2::new(6., 6.);
+            st.spacing.button_padding = Vec2::new(10., 4.);
             st.spacing.interact_size.y = 28.;
-            st.spacing.scroll.bar_width = 8.;
+            st.spacing.menu_margin = eframe::egui::Margin::same(6);
+            st.spacing.window_margin = eframe::egui::Margin::same(14);
+            st.spacing.scroll.bar_width = 6.;
+            st.spacing.scroll.floating = true;
             st.spacing.slider_width = 180.;
-            st.spacing.slider_rail_height = 6.;
+            st.spacing.slider_rail_height = 4.;
+            st.spacing.combo_width = 160.;
         });
     }
+}
+/// Linear blend of `a` toward `b` (opaque colors), `t` in 0..=1.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 #[cfg(test)]
 mod tests {
@@ -152,7 +236,7 @@ mod tests {
     #[test]
     fn bundled_themes_complete() {
         let p = presets();
-        assert_eq!(p.len(), 11);
+        assert_eq!(p.len(), 13);
         for t in p.values() {
             t.validate().unwrap();
             for key in crate::syntax::KINDS {

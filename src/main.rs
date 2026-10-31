@@ -83,6 +83,9 @@ fn main() -> Result<()> {
     if smoke.is_some() {
         message = "Desktop validation · isolated profile".into();
     }
+    // Desktop colors, font and window buttons are read while the window opens.
+    let look = std::thread::spawn(caelum_rs::appearance::detect);
+    let csd = caelum_rs::appearance::client_side_decorations();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand/icon.png"))
         .context("Loading app icon")?;
     let options = eframe::NativeOptions {
@@ -91,7 +94,9 @@ fn main() -> Result<()> {
             .with_app_id("io.github.DakodaStemen.CaelumRust")
             .with_inner_size([1360., 880.])
             .with_min_inner_size([760., 480.])
-            .with_icon(icon),
+            .with_icon(icon)
+            // GNOME on Wayland draws no title bar for us: the headerbar is the title bar.
+            .with_decorations(!csd),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -107,6 +112,8 @@ fn main() -> Result<()> {
                 message,
                 smoke,
                 config_path,
+                look.join().unwrap_or_default(),
+                csd,
             )))
         }),
     )
