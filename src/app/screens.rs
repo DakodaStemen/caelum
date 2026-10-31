@@ -233,6 +233,12 @@ fn csd_headerbar_preferences_and_palette() {
     let d = tempfile::tempdir().unwrap();
     let mut h = harness(Vec2::new(1000., 640.), 1., d.path(), State::default());
     app_mut(&mut h).csd = true;
+    // All three window buttons, as on desktops that show them.
+    app_mut(&mut h).look.buttons.right = vec![
+        appearance::WindowButton::Minimize,
+        appearance::WindowButton::Maximize,
+        appearance::WindowButton::Close,
+    ];
     app_mut(&mut h).settings = true;
     save(&mut h, "preferences-csd");
     let ctx = h.ctx.clone();
