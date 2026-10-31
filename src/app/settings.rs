@@ -352,6 +352,13 @@ fn swatch(
             Stroke::new(2_f32, c.accent),
             egui::StrokeKind::Inside,
         );
+    } else if response.has_focus() {
+        painter.rect_stroke(
+            rect.expand(3.),
+            13,
+            Stroke::new(2_f32, c.accent.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
     } else if response.hovered() {
         painter.rect_stroke(
             rect.expand(3.),
@@ -362,10 +369,11 @@ fn swatch(
     }
     let inner = rect.shrink(1.);
     painter.rect_filled(inner, 10, t.term("background"));
+    // An outline that shows on the card whether the preview is light or dark.
     painter.rect_stroke(
         inner,
         10,
-        Stroke::new(1_f32, Color32::from_white_alpha(18)),
+        Stroke::new(1_f32, theme::mix(c.card, c.text, 0.14)),
         egui::StrokeKind::Inside,
     );
     let name = super::truncated(

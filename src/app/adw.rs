@@ -302,6 +302,9 @@ impl Group<'_> {
                 mix(card, fg, 0.04),
             );
         }
+        // Around the whole row, chevron included.
+        let row = response.rect.with_max_x(self.ui.max_rect().right());
+        icons::focus_ring(self.ui, &response, row, 8);
         response
     }
     /// A row holding arbitrary content (an entry, a grid of swatches).
@@ -332,6 +335,7 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool, c: &Colors) -> Response {
     painter.rect_filled(rect, 13, track);
     let x = egui::lerp(rect.left() + 13.0..=rect.right() - 13., t);
     painter.circle_filled(Pos2::new(x, rect.center().y), 10., Color32::WHITE);
+    icons::focus_ring(ui, &response, rect.expand(3.), 16);
     response
 }
 
@@ -389,6 +393,13 @@ pub fn round_button(ui: &mut egui::Ui, icon: Icon, pal: Palette, label: &str) ->
     ui.painter()
         .circle_filled(center, 17., mix(pal.base, pal.fg, t));
     icons::paint(ui, rect, icon, 16., pal.fg);
+    if response.has_focus() {
+        ui.painter().circle_stroke(
+            center,
+            16.,
+            Stroke::new(2_f32, ui.visuals().hyperlink_color.gamma_multiply(0.5)),
+        );
+    }
     response.on_hover_text(label)
 }
 
@@ -419,6 +430,7 @@ pub fn dropdown(
     };
     let rect = rect.round_to_pixels(ui.pixels_per_point());
     ui.painter().rect_filled(rect, 8, mix(c.card, c.text, t));
+    icons::focus_ring(ui, &response, rect, 8);
     ui.painter().galley(
         Pos2::new(rect.left() + 12., rect.center().y - galley.size().y / 2.)
             .round_to_pixels(ui.pixels_per_point()),
@@ -486,6 +498,7 @@ pub fn button(ui: &mut egui::Ui, label: &str, kind: Kind, width: f32, c: &Colors
     };
     let rect = rect.round_to_pixels(ui.pixels_per_point());
     ui.painter().rect_filled(rect, 10, fill);
+    icons::focus_ring(ui, &response, rect, 10);
     let galley = ui.painter().layout_no_wrap(
         label.to_string(),
         egui::TextStyle::Body.resolve(ui.style()),
