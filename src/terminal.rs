@@ -972,6 +972,17 @@ impl Metrics {
             ),
         )
     }
+    /// Grid point under `pos` for the terminal's current display offset, clamped to
+    /// its grid. Reading the offset from the same locked `term` that is then indexed
+    /// matters: the reader thread can switch to the alternate screen (which has no
+    /// history) between two locks, and a stale scrolled-back offset would index past it.
+    fn grid_point(&self, term: &Term<Events>, pos: Pos2) -> Point {
+        let p = self.point_at(pos, term.grid().display_offset());
+        Point::new(
+            p.line.clamp(term.topmost_line(), term.bottommost_line()),
+            p.column.min(term.last_column()),
+        )
+    }
     /// Top-left corner of the cell at grid `col`/screen `row`.
     fn cell_pos(&self, col: usize, row: i32) -> Pos2 {
         self.area.min + Vec2::new(col as f32 * self.cw, row as f32 * self.ch)
@@ -1165,6 +1176,13 @@ fn manage_focus(ui: &egui::Ui, response: &egui::Response, focused: bool) {
     }
 }
 
+/// URI of the OSC 8 hyperlink in the cell under `pos`, if any.
+fn link_at(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<String> {
+    term.grid()[m.grid_point(term, pos)]
+        .hyperlink()
+        .map(|link| link.uri().to_string())
+}
+
 /// OSC 8 link text can differ from its target, so the real URI is always revealed
 /// on hover before a Ctrl+click opens it. A plain click clears the selection.
 fn handle_links(
@@ -1175,9 +1193,7 @@ fn handle_links(
     p: PointerMode,
 ) {
     if let Some(pos) = response.hover_pos() {
-        let uri = lock(&s.term).grid()[m.point_at(pos, p.offset)]
-            .hyperlink()
-            .map(|link| link.uri().to_string());
+        let uri = link_at(&lock(&s.term), m, pos);
         if let Some(uri) = uri {
             let tip = if openable_link(&uri) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1195,14 +1211,10 @@ fn handle_links(
     if response.clicked()
         && ctrl
         && let Some(pos) = response.interact_pointer_pos()
+        && let Some(url) = link_at(&lock(&s.term), m, pos)
+        && openable_link(&url)
     {
-        let term = lock(&s.term);
-        if let Some(link) = term.grid()[m.point_at(pos, p.offset)].hyperlink() {
-            let url = link.uri();
-            if openable_link(url) {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-            }
-        }
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
     if response.clicked() && !ctrl && p.selecting {
         lock(&s.term).selection = None;
@@ -1758,6 +1770,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.cwd, crate::model::home());
+    }
+    fn metrics(cols: usize, rows: usize) -> Metrics {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(cols as f32 * 10., rows as f32 * 20.));
+        Metrics {
+            rect,
+            area: rect,
+            cw: 10.,
+            ch: 20.,
+            size: Size { cols, rows },
+        }
+    }
+    #[test]
+    fn hover_uses_the_offset_of_the_grid_it_indexes() {
+        let mut out = String::from("\x1b]8;;https://x.example/\x1b\\link\x1b]8;;\x1b\\\r\n");
+        for i in 0..100 {
+            out.push_str(&format!("line {i}\r\n"));
+        }
+        let (events, _queue) = Events::new();
+        let mut term = Term::new(Config::default(), &Size { cols: 20, rows: 5 }, events);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, out.as_bytes());
+        let m = metrics(20, 5);
+        let top_left = Pos2::new(1., 1.);
+        term.scroll_display(Scroll::Top);
+        let offset = term.grid().display_offset();
+        assert!(offset > 90);
+        // Scrolled to the top, the link on the first line is under the pointer.
+        assert_eq!(
+            link_at(&term, &m, top_left).as_deref(),
+            Some("https://x.example/")
+        );
+        // A program enters the alternate screen while the UI still holds the old
+        // offset: that point is outside the alternate grid and used to be indexed.
+        parser.advance(&mut term, b"\x1b[?1049h");
+        assert!(m.point_at(top_left, offset).line < term.topmost_line());
+        let p = m.grid_point(&term, top_left);
+        assert!(p.line >= term.topmost_line() && p.line <= term.bottommost_line());
+        assert_eq!(link_at(&term, &m, top_left), None);
     }
 }
 
