@@ -12,7 +12,7 @@ alacritty_terminal = "=0.26.0"
 anyhow = "1"
 ab_glyph = "0.2"
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
-dirs = "6"
+dirs = "7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
