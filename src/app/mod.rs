@@ -61,12 +61,22 @@ enum Action {
     PrevPrompt,
     NextPrompt,
 }
-#[derive(Clone)]
+/// A close awaiting the unsaved-changes check. The target is captured by id when the
+/// close is requested, so switching tabs or workspaces while "Save Changes?" is open
+/// can never redirect the close (and its discard) to something else.
+#[derive(Clone, Debug, PartialEq)]
 enum PendingClose {
     Window,
-    Tab,
-    Pane,
-    Workspace,
+    Workspace(String),
+    Tab {
+        workspace: String,
+        tab: String,
+    },
+    Pane {
+        workspace: String,
+        tab: String,
+        pane: String,
+    },
 }
 /// Result of a background directory listing: (path, filter, entries or error).
 type Listing = (
@@ -489,6 +499,25 @@ impl App {
                 .unwrap_or_default();
         }
     }
+    fn request_close_workspace(&mut self) {
+        self.pending = Some(PendingClose::Workspace(self.workspace().id.clone()));
+    }
+    fn request_close_tab(&mut self) {
+        self.pending = Some(PendingClose::Tab {
+            workspace: self.workspace().id.clone(),
+            tab: self.tab().id.clone(),
+        });
+    }
+    /// Closes the focused pane of the visible tab. Focus is revalidated first: it can
+    /// be left on a pane of another tab, and closing that would be invisible.
+    fn request_close_pane(&mut self) {
+        self.ensure_focus();
+        self.pending = Some(PendingClose::Pane {
+            workspace: self.workspace().id.clone(),
+            tab: self.tab().id.clone(),
+            pane: self.focused.clone(),
+        });
+    }
     fn cwd(&self) -> PathBuf {
         self.terminals
             .get(&self.focused)
@@ -629,7 +658,7 @@ impl App {
                 self.dialog = Some("Rename Workspace".into());
                 self.dialog_input = self.workspace().name.clone();
             }
-            Action::CloseWorkspace => self.pending = Some(PendingClose::Workspace),
+            Action::CloseWorkspace => self.request_close_workspace(),
             Action::RenameTab => {
                 self.dialog = Some("Rename Tab".into());
                 self.dialog_input = self.tab().name.clone();
@@ -640,7 +669,7 @@ impl App {
             }),
             Action::System => self.insert(Pane::System { id: model::id() }),
             Action::Processes => self.insert(Pane::Processes { id: model::id() }),
-            Action::ClosePane => self.pending = Some(PendingClose::Pane),
+            Action::ClosePane => self.request_close_pane(),
             Action::Zoom => {
                 self.zoom = if self.zoom.is_some() {
                     None
@@ -1054,36 +1083,13 @@ impl App {
         }
     }
     fn dirty_in_pending(&self) -> Vec<String> {
-        let mut allowed = HashSet::new();
-        let mut add = |p: &Pane| {
-            let mut leaves = vec![];
-            p.leaves(&mut leaves);
-            for p in leaves {
-                allowed.insert(p.id().to_string());
-            }
+        let Some(pending) = &self.pending else {
+            return vec![];
         };
-        match &self.pending {
-            Some(PendingClose::Window) => {
-                for w in &self.state.workspaces {
-                    for t in &w.tabs {
-                        add(&t.layout);
-                    }
-                }
-            }
-            Some(PendingClose::Workspace) => {
-                for t in &self.workspace().tabs {
-                    add(&t.layout);
-                }
-            }
-            Some(PendingClose::Tab) => add(&self.tab().layout),
-            Some(PendingClose::Pane) => {
-                allowed.insert(self.focused.clone());
-            }
-            None => {}
-        }
+        let closing = closing_panes(&self.state, pending);
         self.documents
             .iter()
-            .filter(|(id, doc)| allowed.contains(*id) && doc.dirty())
+            .filter(|(id, doc)| closing.contains(*id) && doc.dirty())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -1091,40 +1097,16 @@ impl App {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        match pending {
-            PendingClose::Window => {
-                self.allow_close = true;
-                self.persist_now();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            PendingClose::Workspace => {
-                let cwd = self.cwd();
-                close_workspace(&mut self.state, cwd);
-            }
-            PendingClose::Tab => {
-                let cwd = self.cwd();
-                let w = self.workspace_mut();
-                let i = w.active_index();
-                w.tabs.remove(i);
-                if w.tabs.is_empty() {
-                    w.tabs.push(Tab::new(cwd));
-                }
-                w.active_tab = w.tabs[i.min(w.tabs.len() - 1)].id.clone();
-            }
-            PendingClose::Pane => {
-                let focused = self.focused.clone();
-                let cwd = self.cwd();
-                match self.tab_mut().layout.close(&focused) {
-                    Some(next) => self.focused = next,
-                    // The tab's only pane: close the tab, unless it is the last one.
-                    None if self.workspace().tabs.len() > 1 => {
-                        let w = self.workspace_mut();
-                        let i = w.active_index();
-                        w.tabs.remove(i);
-                        w.active_tab = w.tabs[i.min(w.tabs.len() - 1)].id.clone();
-                    }
-                    None => self.tab_mut().layout = Pane::terminal(cwd),
-                }
+        if pending == PendingClose::Window {
+            self.allow_close = true;
+            self.persist_now();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            let cwd = self.cwd();
+            if let Some(next) = apply_close(&mut self.state, &pending, cwd)
+                && matches!(&pending, PendingClose::Pane { pane, .. } if *pane == self.focused)
+            {
+                self.focused = next;
             }
         }
         self.zoom = None;
@@ -1346,6 +1328,9 @@ impl eframe::App for App {
 impl App {
     /// One UI frame; split from `eframe::App::update` so offscreen tests can drive it.
     fn frame(&mut self, ctx: &egui::Context) {
+        // Tab and workspace switches from the tab bar, sidebar and menus can leave focus
+        // on a pane that is no longer visible; shortcuts act on the focused pane.
+        self.ensure_focus();
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
@@ -1527,16 +1512,115 @@ fn shortcut_table() -> Vec<(&'static str, Action)> {
 
 /// Removes the active workspace. The state never ends up without a workspace: closing
 /// the last one leaves a fresh workspace at `cwd` in its place.
-fn close_workspace(state: &mut State, cwd: PathBuf) {
-    let i = state.active_index();
-    if i < state.workspaces.len() {
-        state.workspaces.remove(i);
+/// Ids of the leaf panes a pending close would remove; unsaved documents among them
+/// need the "Save Changes?" check. A target that no longer exists closes nothing.
+fn closing_panes(state: &State, pending: &PendingClose) -> HashSet<String> {
+    let mut layouts: Vec<&Pane> = vec![];
+    match pending {
+        PendingClose::Window => {
+            layouts.extend(
+                state
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| &w.tabs)
+                    .map(|t| &t.layout),
+            );
+        }
+        PendingClose::Workspace(id) => {
+            if let Some(w) = state.workspaces.iter().find(|w| w.id == *id) {
+                layouts.extend(w.tabs.iter().map(|t| &t.layout));
+            }
+        }
+        PendingClose::Tab { workspace, tab } => {
+            layouts.extend(find_tab(state, workspace, tab).map(|t| &t.layout));
+        }
+        PendingClose::Pane {
+            workspace,
+            tab,
+            pane,
+        } => {
+            layouts.extend(find_tab(state, workspace, tab).and_then(|t| t.layout.find(pane)));
+        }
     }
+    let mut leaves = vec![];
+    for layout in layouts {
+        layout.leaves(&mut leaves);
+    }
+    leaves.into_iter().map(|p| p.id().to_string()).collect()
+}
+fn find_tab<'a>(state: &'a State, workspace: &str, tab: &str) -> Option<&'a Tab> {
+    state
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace)?
+        .tabs
+        .iter()
+        .find(|t| t.id == tab)
+}
+/// Applies a confirmed close (not `Window`) to its captured target. Returns the pane
+/// to focus when a pane closed inside a split. A target that is gone is a no-op.
+fn apply_close(state: &mut State, pending: &PendingClose, cwd: PathBuf) -> Option<String> {
+    match pending {
+        PendingClose::Window => {}
+        PendingClose::Workspace(id) => close_workspace(state, id, cwd),
+        PendingClose::Tab { workspace, tab } => {
+            if let Some(w) = state.workspaces.iter_mut().find(|w| w.id == *workspace) {
+                close_tab(w, tab, cwd);
+            }
+        }
+        PendingClose::Pane {
+            workspace,
+            tab,
+            pane,
+        } => {
+            let w = state.workspaces.iter_mut().find(|w| w.id == *workspace)?;
+            let others = w.tabs.len() > 1;
+            let t = w.tabs.iter_mut().find(|t| t.id == *tab)?;
+            // `close` also returns None for a pane it cannot find; only a pane that is
+            // really the tab's root may close the tab.
+            t.layout.find(pane)?;
+            match t.layout.close(pane) {
+                Some(next) => return Some(next),
+                // The tab's only pane: close the tab, unless it is the last one.
+                None if others => close_tab(w, tab, cwd),
+                None => t.layout = Pane::terminal(cwd),
+            }
+        }
+    }
+    None
+}
+/// Removes a tab, keeping at least one; the active tab moves to a neighbour only if
+/// it was the one closed.
+fn close_tab(w: &mut Workspace, tab: &str, cwd: PathBuf) {
+    let Some(i) = w.tabs.iter().position(|t| t.id == tab) else {
+        return;
+    };
+    w.tabs.remove(i);
+    if w.tabs.is_empty() {
+        w.tabs.push(Tab::new(cwd));
+    }
+    if !w.tabs.iter().any(|t| t.id == w.active_tab) {
+        w.active_tab = w.tabs[i.min(w.tabs.len() - 1)].id.clone();
+    }
+}
+/// Removes a workspace, keeping at least one; the active workspace moves to a
+/// neighbour only if it was the one closed.
+fn close_workspace(state: &mut State, id: &str, cwd: PathBuf) {
+    let Some(i) = state.workspaces.iter().position(|w| w.id == id) else {
+        return;
+    };
+    state.workspaces.remove(i);
     if state.workspaces.is_empty() {
         state.workspaces.push(Workspace::new("Workspace 1", cwd));
     }
-    let next = i.min(state.workspaces.len() - 1);
-    state.active_workspace = state.workspaces[next].id.clone();
+    if !state
+        .workspaces
+        .iter()
+        .any(|w| w.id == state.active_workspace)
+    {
+        let next = i.min(state.workspaces.len() - 1);
+        state.active_workspace = state.workspaces[next].id.clone();
+    }
 }
 fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
     if root.id() == id {
@@ -1566,15 +1650,132 @@ mod tests {
         assert_eq!(k.get("next_prompt").unwrap().key, Key::ArrowDown);
     }
 
+    fn test_app(profile: &Path, state: State) -> (App, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            profile.to_path_buf(),
+            state,
+            String::new(),
+            None,
+            profile.join("config.toml"),
+            SystemLook::default(),
+            false,
+        );
+        app.test_shell = true;
+        (app, ctx)
+    }
+    /// One workspace with tab A (a terminal, focused and active) and tab B (an editor
+    /// with unsaved changes). Returns the app, its context, B's id and the editor id.
+    fn app_with_dirty_background_tab(dir: &Path) -> (App, egui::Context, String, String) {
+        let file = dir.join("notes.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let mut state = State::default();
+        let editor = model::id();
+        let mut b = Tab::new(dir.to_path_buf());
+        b.layout = Pane::Editor {
+            id: editor.clone(),
+            path: file.clone(),
+        };
+        let b_id = b.id.clone();
+        let w = &mut state.workspaces[0];
+        w.tabs.truncate(1);
+        w.active_tab = w.tabs[0].id.clone();
+        w.tabs.push(b);
+        let (mut app, ctx) = test_app(&dir.join("profile"), state);
+        let mut doc = Document::open(&file).unwrap();
+        doc.text.push_str("unsaved edit\n");
+        app.documents.insert(editor.clone(), doc);
+        app.ensure_focus();
+        assert_eq!(app.tab().id, app.workspace().tabs[0].id);
+        (app, ctx, b_id, editor)
+    }
+    fn has_tab(app: &App, id: &str) -> bool {
+        app.workspace().tabs.iter().any(|t| t.id == id)
+    }
+
+    #[test]
+    fn close_pane_after_a_cancelled_tab_close_still_asks_about_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, b, editor) = app_with_dirty_background_tab(dir.path());
+        // The tab bar's x on background tab B activates it and asks to close it.
+        app.workspace_mut().active_tab = b.clone();
+        app.request_close_tab();
+        assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
+        // Cancel. Focus is still on tab A's pane, so Ctrl+Shift+W used to find no
+        // dirty editor (it checked A's pane) and then close all of tab B silently.
+        app.pending = None;
+        assert_ne!(app.focused, editor);
+        app.action(Action::ClosePane, &ctx);
+        assert_eq!(
+            app.pending,
+            Some(PendingClose::Pane {
+                workspace: app.workspace().id.clone(),
+                tab: b.clone(),
+                pane: editor.clone(),
+            })
+        );
+        assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
+        assert!(has_tab(&app, &b));
+        assert!(app.documents[&editor].dirty());
+    }
+    #[test]
+    fn switching_tabs_during_save_changes_does_not_redirect_the_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, b, editor) = app_with_dirty_background_tab(dir.path());
+        let a = app.workspace().tabs[0].id.clone();
+        app.workspace_mut().active_tab = b.clone();
+        app.request_close_tab();
+        // Ctrl+Tab while "Save Changes?" is open, then Discard.
+        app.workspace_mut().active_tab = a.clone();
+        assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
+        app.documents.remove(&editor);
+        app.finish_close(&ctx);
+        // Tab B (whose edits were discarded) closes; tab A, now active, is kept.
+        assert!(!has_tab(&app, &b));
+        assert!(has_tab(&app, &a));
+        assert_eq!(app.workspace().active_tab, a);
+    }
+    #[test]
+    fn a_close_whose_pane_is_gone_closes_nothing() {
+        let mut state = State::default();
+        let cwd = std::env::temp_dir();
+        let w = &mut state.workspaces[0];
+        w.tabs.push(Tab::new(cwd.clone()));
+        let (workspace, tab) = (w.id.clone(), w.tabs[0].id.clone());
+        let before = state.clone();
+        let stale = PendingClose::Pane {
+            workspace: workspace.clone(),
+            tab: tab.clone(),
+            pane: "not-in-this-tab".into(),
+        };
+        // `Pane::close` returns None for an unknown pane too; that used to close the tab.
+        assert!(closing_panes(&state, &stale).is_empty());
+        assert_eq!(apply_close(&mut state, &stale, cwd.clone()), None);
+        assert_eq!(
+            state.workspaces[0].tabs.len(),
+            before.workspaces[0].tabs.len()
+        );
+        let gone = PendingClose::Tab {
+            workspace,
+            tab: "closed-already".into(),
+        };
+        apply_close(&mut state, &gone, cwd);
+        assert_eq!(
+            state.workspaces[0].tabs.len(),
+            before.workspaces[0].tabs.len()
+        );
+    }
     #[test]
     fn closing_last_workspace_leaves_a_fresh_one() {
         let mut state = State::default();
         let cwd = std::env::temp_dir();
         while state.workspaces.len() > 1 {
-            close_workspace(&mut state, cwd.clone());
+            let id = state.workspaces[0].id.clone();
+            close_workspace(&mut state, &id, cwd.clone());
         }
         let only = state.workspaces[0].id.clone();
-        close_workspace(&mut state, cwd.clone());
+        close_workspace(&mut state, &only, cwd.clone());
         assert_eq!(state.workspaces.len(), 1);
         assert_ne!(state.workspaces[0].id, only);
         assert_eq!(state.active_workspace, state.workspaces[0].id);
@@ -1591,7 +1792,7 @@ mod tests {
         let last = state.workspaces.last().unwrap().id.clone();
         state.active_workspace = last.clone();
         let before = state.workspaces.len();
-        close_workspace(&mut state, cwd);
+        close_workspace(&mut state, &last, cwd);
         assert_eq!(state.workspaces.len(), before - 1);
         assert!(state.workspaces.iter().all(|w| w.id != last));
         assert_eq!(state.active_workspace, state.workspaces.last().unwrap().id);

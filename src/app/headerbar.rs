@@ -454,7 +454,7 @@ impl App {
             }
             if close {
                 self.workspace_mut().active_tab = id;
-                self.pending = Some(PendingClose::Tab);
+                self.request_close_tab();
                 continue;
             }
             if response.clicked() {
@@ -474,7 +474,7 @@ impl App {
                 }
                 if menu_item(ui, "Close", None).clicked() {
                     self.workspace_mut().active_tab = id.clone();
-                    self.pending = Some(PendingClose::Tab);
+                    self.request_close_tab();
                 }
             });
         }
