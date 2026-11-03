@@ -202,7 +202,7 @@ impl App {
             && icons::flat(ui, Icon::Close, button, 16., pal, "Close Pane", false).clicked()
         {
             self.focused = id.to_string();
-            self.pending = Some(PendingClose::Pane);
+            self.request_close_pane();
         }
         let zoomed = self.zoom.is_some();
         let roomy = show_buttons && bar.width() > 150.;
