@@ -184,7 +184,7 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     size: Size,
-    search_origin: Option<(String, Point)>,
+    search_origin: Option<SearchOrigin>,
     pending_input: Vec<u8>,
     /// Multi-line paste held for user confirmation (already sanitised).
     pending_paste: Option<String>,
@@ -449,76 +449,8 @@ impl Session {
         text
     }
     pub fn search(&mut self, query: &str, forward: bool) -> bool {
-        use alacritty_terminal::{index::Direction, term::search::RegexSearch};
-        if query.is_empty() {
-            return false;
-        }
-        let escaped: String = query
-            .chars()
-            .flat_map(|c| {
-                if ".+*?()[]{}|^$\\".contains(c) {
-                    vec!['\\', c]
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
-        let Ok(mut regex) = RegexSearch::new(&escaped) else {
-            return false;
-        };
         let mut term = lock(&self.term);
-        let mut origin = self
-            .search_origin
-            .as_ref()
-            .filter(|(q, _)| q == query)
-            .map(|(_, p)| *p)
-            .unwrap_or_else(|| Point::new(Line(-(term.grid().display_offset() as i32)), Column(0)));
-        if self.search_origin.as_ref().is_some_and(|(q, _)| q == query) {
-            if forward {
-                if origin.column.0 + 1 < term.columns() {
-                    origin.column.0 += 1;
-                } else {
-                    origin.column = Column(0);
-                    origin.line.0 += 1;
-                    if origin.line > term.bottommost_line() {
-                        origin.line = term.topmost_line();
-                    }
-                }
-            } else if origin.column.0 > 0 {
-                origin.column.0 -= 1;
-            } else {
-                origin.column = term.last_column();
-                origin.line.0 -= 1;
-                if origin.line < term.topmost_line() {
-                    origin.line = term.bottommost_line();
-                }
-            }
-        }
-        let found = term.search_next(
-            &mut regex,
-            origin,
-            if forward {
-                Direction::Right
-            } else {
-                Direction::Left
-            },
-            Side::Left,
-            None,
-        );
-        if let Some(found) = found {
-            let start = *found.start();
-            let end = *found.end();
-            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
-            selection.update(end, Side::Right);
-            term.selection = Some(selection);
-            let target = (-start.line.0 + term.screen_lines() as i32 / 2).max(0);
-            term.scroll_display(Scroll::Bottom);
-            term.scroll_display(Scroll::Delta(target));
-            self.search_origin = Some((query.to_string(), start));
-            true
-        } else {
-            false
-        }
+        search_term(&mut term, &mut self.search_origin, query, forward)
     }
     /// Scroll to the previous/next shell prompt (needs OSC 133 integration).
     /// Returns false when there is no such prompt.
@@ -1339,6 +1271,110 @@ fn report_button(s: &mut Session, p: Point, button: egui::PointerButton, pressed
     );
 }
 
+/// Start of the last search match, with the grid shape it was found in. Columns and
+/// the alternate screen change what an absolute point refers to (and how many cells a
+/// row has), so the origin is only reused while both are unchanged.
+struct SearchOrigin {
+    query: String,
+    point: Point,
+    columns: usize,
+    alt_screen: bool,
+}
+
+/// Literal search from the last match (or the top of the view), selecting and
+/// scrolling to the hit. `last` is updated to the new match.
+fn search_term(
+    term: &mut Term<Events>,
+    last: &mut Option<SearchOrigin>,
+    query: &str,
+    forward: bool,
+) -> bool {
+    use alacritty_terminal::{index::Direction, term::search::RegexSearch};
+    if query.is_empty() {
+        return false;
+    }
+    let escaped: String = query
+        .chars()
+        .flat_map(|c| {
+            if ".+*?()[]{}|^$\\".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    let Ok(mut regex) = RegexSearch::new(&escaped) else {
+        return false;
+    };
+    let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+    let previous = last
+        .as_ref()
+        .filter(|o| o.query == query && o.columns == term.columns() && o.alt_screen == alt_screen)
+        .map(|o| o.point);
+    let mut origin = match previous {
+        // History can shrink (clear, resize) without the columns changing, so the
+        // stored point is clamped into the grid before alacritty indexes with it.
+        Some(p) => {
+            let line = p.line.clamp(term.topmost_line(), term.bottommost_line());
+            let column = p.column.min(term.last_column());
+            let mut origin = Point::new(line, column);
+            if forward {
+                if origin.column.0 + 1 < term.columns() {
+                    origin.column.0 += 1;
+                } else {
+                    origin.column = Column(0);
+                    origin.line.0 += 1;
+                    if origin.line > term.bottommost_line() {
+                        origin.line = term.topmost_line();
+                    }
+                }
+            } else if origin.column.0 > 0 {
+                origin.column.0 -= 1;
+            } else {
+                origin.column = term.last_column();
+                origin.line.0 -= 1;
+                if origin.line < term.topmost_line() {
+                    origin.line = term.bottommost_line();
+                }
+            }
+            origin
+        }
+        None => Point::new(Line(-(term.grid().display_offset() as i32)), Column(0)),
+    };
+    origin.line = origin
+        .line
+        .clamp(term.topmost_line(), term.bottommost_line());
+    let found = term.search_next(
+        &mut regex,
+        origin,
+        if forward {
+            Direction::Right
+        } else {
+            Direction::Left
+        },
+        Side::Left,
+        None,
+    );
+    let Some(found) = found else {
+        return false;
+    };
+    let start = *found.start();
+    let end = *found.end();
+    let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+    selection.update(end, Side::Right);
+    term.selection = Some(selection);
+    let target = (-start.line.0 + term.screen_lines() as i32 / 2).max(0);
+    term.scroll_display(Scroll::Bottom);
+    term.scroll_display(Scroll::Delta(target));
+    *last = Some(SearchOrigin {
+        query: query.to_string(),
+        point: start,
+        columns: term.columns(),
+        alt_screen,
+    });
+    true
+}
+
 /// Cells (line, column) covered by literal matches of `search` on the visible screen.
 fn search_cells(
     term: &Term<Events>,
@@ -1767,6 +1803,71 @@ mod regressions {
     use alacritty_terminal::term::cell::Flags;
     #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
+
+    fn term_with(cols: usize, rows: usize, output: &str) -> Term<Events> {
+        let (events, _queue) = Events::new();
+        let mut term = Term::new(Config::default(), &Size { cols, rows }, events);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, output.as_bytes());
+        term
+    }
+    fn feed(term: &mut Term<Events>, output: &str) {
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(term, output.as_bytes());
+    }
+    /// `needle` near the far right of a wide line deep in history, then filler.
+    fn history_with_wide_match() -> String {
+        let mut out = format!("{}needle\r\n", " ".repeat(110));
+        for i in 0..200 {
+            out.push_str(&format!("filler {i}\r\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn repeated_search_after_narrowing_does_not_index_past_the_row() {
+        let mut term = term_with(120, 5, &history_with_wide_match());
+        let mut origin = None;
+        assert!(search_term(&mut term, &mut origin, "needle", false));
+        assert_eq!(origin.as_ref().unwrap().point.column, Column(110));
+        // Column 110 does not exist in an 80-column grid; this used to panic.
+        term.resize(Size { cols: 80, rows: 5 });
+        search_term(&mut term, &mut origin, "needle", false);
+        search_term(&mut term, &mut origin, "needle", true);
+    }
+    #[test]
+    fn repeated_search_on_the_alternate_screen_ignores_a_history_match() {
+        let mut term = term_with(
+            40,
+            5,
+            &history_with_wide_match().replace(&" ".repeat(110), ""),
+        );
+        let mut origin = None;
+        assert!(search_term(&mut term, &mut origin, "needle", false));
+        assert!(origin.as_ref().unwrap().point.line < Line(-100));
+        // The alternate screen has no history, so Line(-200) is outside it; this used
+        // to panic. The match is not on the alternate screen, so nothing is found.
+        feed(&mut term, "\x1b[?1049h");
+        assert!(!search_term(&mut term, &mut origin, "needle", true));
+        assert!(!search_term(&mut term, &mut origin, "needle", false));
+        // Back on the primary screen the history match is found again.
+        feed(&mut term, "\x1b[?1049l");
+        assert!(search_term(&mut term, &mut origin, "needle", false));
+    }
+    #[test]
+    fn repeated_search_after_clearing_history_stays_in_the_grid() {
+        let mut term = term_with(
+            40,
+            5,
+            &history_with_wide_match().replace(&" ".repeat(110), ""),
+        );
+        let mut origin = None;
+        assert!(search_term(&mut term, &mut origin, "needle", false));
+        feed(&mut term, "\x1b[3J");
+        assert_eq!(term.grid().history_size(), 0);
+        assert!(!search_term(&mut term, &mut origin, "needle", true));
+    }
+
     #[test]
     fn parser_preserves_truecolor_wide_cells_and_alternate_screen() {
         let (events, _queue) = Events::new();
