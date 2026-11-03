@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Engineering baseline (2026-11-03): `Makefile` (`help setup lint fmt test build ci`), `SECURITY.md`,
+  PR and issue templates, `.editorconfig`, `.gitattributes`, markdownlint config, pre-commit config,
+  `docs/adr/` with ADR-0001, a markdown lint job, job timeouts and concurrency in CI, and a
+  Dependabot cooldown. No product code changes.
+
 - Minimal, desktop-native look: follows the system light/dark preference and accent
   color (freedesktop portal, then gsettings; `defaults` on macOS, the registry on
   Windows) with new Adwaita Dark/Light presets, uses the desktop UI font, and drops the

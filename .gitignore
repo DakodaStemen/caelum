@@ -1,2 +1,6 @@
 /target/
 /.runtime/
+.env
+.env.*
+*.pem
+*.key

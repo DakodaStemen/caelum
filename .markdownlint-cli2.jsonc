@@ -1,0 +1,34 @@
+{
+  "config": {
+    "default": true,
+    "MD013": false,
+    // Relaxed because the existing docs predate this config; not worth a mass rewrite.
+    "MD022": false,
+    "MD032": false,
+    "MD024": {
+      "siblings_only": true
+    },
+    "MD033": false,
+    "MD034": false,
+    "MD036": false,
+    "MD041": false,
+    "MD047": false,
+    "MD060": false,
+    "MD046": {
+      "style": "fenced"
+    }
+  },
+  "globs": [
+    "**/*.md"
+  ],
+  "ignores": [
+    "node_modules/**",
+    "**/node_modules/**",
+    "dist/**",
+    ".git/**",
+    ".worktrees/**",
+    "target/**",
+    "build/**",
+    "vendor/**"
+  ]
+}
