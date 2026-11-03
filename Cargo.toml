@@ -35,7 +35,7 @@ eframe = { version = "0.33", default-features = false, features = ["x11", "wayla
 
 # Non-Linux hosts have no /proc, so the system panel uses sysinfo there.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 x11rb = { version = "0.14", features = ["xtest"] }
