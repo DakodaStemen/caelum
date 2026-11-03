@@ -25,9 +25,14 @@ fn copy_private(source: &Path, backup: &Path) -> std::io::Result<()> {
     }
     let mut input = fs::File::open(source)?;
     let mut output = options.open(backup)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    restrict(backup)
+    let copied = std::io::copy(&mut input, &mut output)
+        .and_then(|_| output.sync_all())
+        .and_then(|()| restrict(backup));
+    if copied.is_err() {
+        // Don't leave a partial copy that looks like a preserved recovery.
+        let _ = fs::remove_file(backup);
+    }
+    copied
 }
 
 impl App {
@@ -51,6 +56,9 @@ impl App {
                 sync_cwd(&mut t.layout, &self.terminals);
             }
         }
+        // A drafts.json that could not be restored is copied aside before it is
+        // overwritten. Until that succeeds only drafts.json is held back: the
+        // workspace itself is always saved.
         if self.recovery_conflict {
             let source = self.profile.join("drafts.json");
             let stamp = std::time::SystemTime::now()
@@ -64,10 +72,11 @@ impl App {
                     self.message =
                         format!("Conflicting recovery preserved at {}", backup.display());
                 }
-                Err(e) => {
-                    self.message = format!("Cannot preserve recovery: {e}");
-                    return;
+                // Removed since startup (by the user, say): nothing left to preserve.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !source.exists() => {
+                    self.recovery_conflict = false;
                 }
+                Err(e) => self.message = format!("Cannot preserve recovery: {e}"),
             }
         }
 
@@ -162,5 +171,73 @@ impl App {
                 self.recovery_conflict = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(profile: &Path) -> App {
+        let mut app = App::new(
+            &egui::Context::default(),
+            profile.to_path_buf(),
+            State::default(),
+            String::new(),
+            None,
+            profile.join("config.toml"),
+            SystemLook::default(),
+            false,
+        );
+        app.test_shell = true;
+        app
+    }
+
+    #[test]
+    fn workspace_is_saved_while_a_recovery_conflict_cannot_be_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let mut app = test_app(&profile);
+        // drafts.json can't be copied aside (it is a directory here; on a real system
+        // a permission error or a full disk). Every save used to return early, so the
+        // workspace was never written again for the rest of the session.
+        fs::create_dir_all(profile.join("drafts.json")).unwrap();
+        app.recovery_conflict = true;
+        app.persist();
+        app.writer.flush();
+        assert!(profile.join("workspace.json").is_file());
+        assert!(app.recovery_conflict, "drafts.json must still be held back");
+        assert!(
+            profile.join("drafts.json").is_dir(),
+            "conflict was overwritten"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&profile)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("drafts-conflict-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "partial backup left behind");
+        app.state.workspaces[0].name = "Renamed".into();
+        app.persist();
+        app.writer.flush();
+        let saved = fs::read_to_string(profile.join("workspace.json")).unwrap();
+        assert!(saved.contains("Renamed"));
+    }
+    #[test]
+    fn a_removed_recovery_conflict_stops_holding_back_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let mut app = test_app(&profile);
+        // The conflicting drafts.json was deleted after startup.
+        app.recovery_conflict = true;
+        app.persist();
+        app.writer.flush();
+        assert!(!app.recovery_conflict);
+        assert!(profile.join("workspace.json").is_file());
+        assert!(profile.join("drafts.json").is_file());
     }
 }
