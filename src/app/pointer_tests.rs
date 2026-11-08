@@ -196,6 +196,52 @@ fn double_click_selects_a_word_and_triple_click_the_line() {
     assert_eq!(selection(&mut h).as_deref(), Some("alpha http"));
 }
 
+/// Queues a primary press or release without stepping, to batch several events
+/// into one frame as a busy event loop can.
+fn queue(h: &mut H<'_>, pos: Pos2, pressed: bool) {
+    let modifiers = h.input_mut().modifiers;
+    let events = &mut h.input_mut().events;
+    events.push(egui::Event::PointerMoved(pos));
+    events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    });
+}
+
+#[test]
+fn clicks_and_moves_batched_into_one_frame_are_not_lost() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo ABCDEFGHIJ KLMNO");
+    let row = row_of(&mut h, "ABCDEFGHIJ");
+    // A drag whose last moves arrive with the release still ends at the release.
+    let a = at(&mut h, 0, row, 0.2);
+    move_to(&mut h, a);
+    button(&mut h, a, egui::PointerButton::Primary, true);
+    let c = at(&mut h, 2, row, 0.8);
+    move_to(&mut h, c);
+    let e = at(&mut h, 4, row, 0.8);
+    queue(&mut h, e, false);
+    h.step();
+    assert_eq!(selection(&mut h).as_deref(), Some("ABCDE"));
+    // A click with press and release in one frame clears the selection.
+    pause(&mut h);
+    let mid = at(&mut h, 6, row, 0.5);
+    queue(&mut h, mid, true);
+    queue(&mut h, mid, false);
+    h.step();
+    assert_eq!(selection(&mut h), None);
+    // A whole double click in one frame selects the word.
+    pause(&mut h);
+    queue(&mut h, mid, true);
+    queue(&mut h, mid, false);
+    queue(&mut h, mid, true);
+    queue(&mut h, mid, false);
+    h.step();
+    assert_eq!(selection(&mut h).as_deref(), Some("ABCDEFGHIJ"));
+}
+
 #[test]
 fn dragging_past_the_top_scrolls_back_and_keeps_selecting() {
     let d = tempfile::tempdir().unwrap();

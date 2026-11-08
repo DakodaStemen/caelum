@@ -1196,6 +1196,9 @@ fn pointer_mode(ui: &egui::Ui, s: &Session) -> PointerMode {
 /// and dragging after them extends by words or lines. Shift+click extends the
 /// current selection. Dragging past the top or bottom edge scrolls the scrollback.
 /// Returns the selected text when a gesture ends, for the PRIMARY selection.
+///
+/// Button and move events are replayed in order: a quick click can arrive with its
+/// press and release in the same frame, and the last move with the release.
 fn handle_selection(
     ui: &egui::Ui,
     s: &mut Session,
@@ -1203,34 +1206,65 @@ fn handle_selection(
     m: &Metrics,
     p: PointerMode,
 ) -> Option<String> {
-    let (pressed, down, pos, origin, time, dt, mods) = ui.input(|i| {
+    let (events, down, pos, time, dt) = ui.input(|i| {
         (
-            i.pointer.primary_pressed(),
+            i.events.clone(),
             i.pointer.primary_down(),
             i.pointer.interact_pos(),
-            i.pointer.press_origin(),
             i.time,
             i.stable_dt,
-            i.modifiers,
         )
     });
-    if pressed
-        && p.selecting
-        && response.is_pointer_button_down_on()
-        && let Some(origin) = origin
-    {
-        start_gesture(s, m, origin, time, mods);
+    // A press is ours when it lands on the grid and no other widget or layer
+    // (a divider, a menu, a dialog) is on top there.
+    let ours = |pos: Pos2| {
+        m.rect.contains(pos)
+            && (response.is_pointer_button_down_on() || response.contains_pointer())
+    };
+    let mut selected = None;
+    for event in events {
+        match event {
+            egui::Event::PointerMoved(pos) if s.mouse.gesture.is_some() => {
+                extend_gesture(s, m, pos, 0.);
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            } => {
+                if (!p.reporting || modifiers.shift) && ours(pos) {
+                    start_gesture(s, m, pos, time, modifiers);
+                }
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } if s.mouse.gesture.is_some() => {
+                extend_gesture(s, m, pos, 0.);
+                selected = end_gesture(s);
+            }
+            _ => {}
+        }
     }
-    s.mouse.gesture?;
-    if down {
-        if let Some(pos) = pos
+    if s.mouse.gesture.is_some() {
+        if !down {
+            // The release never reached us (outside the window, say).
+            selected = end_gesture(s);
+        } else if let Some(pos) = pos
             && extend_gesture(s, m, pos, dt)
         {
             // Keep scrolling while the pointer rests past the edge.
             ui.ctx().request_repaint();
         }
-        return None;
     }
+    selected
+}
+
+/// Ends the selection gesture; returns the selected text, if any.
+fn end_gesture(s: &mut Session) -> Option<String> {
     s.mouse.gesture = None;
     s.mouse.anchor = None;
     s.mouse.autoscroll = 0.;
@@ -1781,16 +1815,23 @@ fn handle_drop(ui: &egui::Ui, s: &mut Session, response: &egui::Response, focuse
     }
 }
 
-/// Quotes a path for the shell only when it needs it.
+/// Quotes a path for the shell only when it needs it: POSIX single quotes, or on
+/// Windows PowerShell's (the default shell there) literal single quotes, so `$`,
+/// backticks and `$(...)` in a file name are never expanded.
 fn shell_quote(path: &str) -> String {
+    quote_path(path, cfg!(windows))
+}
+fn quote_path(path: &str, powershell: bool) -> String {
+    // PowerShell also treats `,` `@` `%` and `=` specially, so it gets fewer bare characters.
+    let bare = if powershell { "\\/._-:" } else { "/._-+,:@%=" };
     let plain = !path.is_empty()
-        && path.chars().all(|c| {
-            c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c) || (cfg!(windows) && c == '\\')
-        });
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || bare.contains(c));
     if plain {
         path.to_string()
-    } else if cfg!(windows) {
-        format!("\"{path}\"")
+    } else if powershell {
+        format!("'{}'", path.replace('\'', "''"))
     } else {
         format!("'{}'", path.replace('\'', r"'\''"))
     }
@@ -2473,12 +2514,19 @@ mod tests {
     }
     #[test]
     fn dropped_paths_are_quoted_for_the_shell() {
-        assert_eq!(shell_quote("/home/me/notes.txt"), "/home/me/notes.txt");
-        if !cfg!(windows) {
-            assert_eq!(shell_quote("/tmp/My File.txt"), "'/tmp/My File.txt'");
-            assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
-            assert_eq!(shell_quote("/tmp/$(rm)"), "'/tmp/$(rm)'");
-        }
+        let posix = |p| quote_path(p, false);
+        assert_eq!(posix("/home/me/notes.txt"), "/home/me/notes.txt");
+        assert_eq!(posix("/tmp/My File.txt"), "'/tmp/My File.txt'");
+        assert_eq!(posix("/tmp/it's"), r"'/tmp/it'\''s'");
+        assert_eq!(posix("/tmp/$(rm)`x`"), "'/tmp/$(rm)`x`'");
+        // PowerShell: single-quoted literals, quotes doubled; `$(...)` stays text.
+        let ps = |p| quote_path(p, true);
+        assert_eq!(ps(r"C:\Users\me\notes.txt"), r"C:\Users\me\notes.txt");
+        assert_eq!(
+            ps(r"C:\drop\$(Write-Output INJECTED).txt"),
+            r"'C:\drop\$(Write-Output INJECTED).txt'"
+        );
+        assert_eq!(ps(r"C:\it's,a@b.txt"), r"'C:\it''s,a@b.txt'");
     }
     #[test]
     fn selection_sides_follow_the_cell_halves() {
