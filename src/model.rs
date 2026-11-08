@@ -606,6 +606,8 @@ pub struct Preferences {
     pub sidebar: bool,
     /// Ask before a multi-line paste reaches a program without bracketed paste.
     pub confirm_multiline_paste: bool,
+    /// Copy selected text to the clipboard as soon as it is selected.
+    pub copy_on_select: bool,
     pub custom_themes: Vec<crate::theme::Theme>,
 }
 impl Default for Preferences {
@@ -620,6 +622,7 @@ impl Default for Preferences {
             cursor_blink: false,
             sidebar: false,
             confirm_multiline_paste: true,
+            copy_on_select: false,
             custom_themes: vec![],
         }
     }

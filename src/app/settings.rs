@@ -257,6 +257,13 @@ impl App {
                     adw::switch(ui, &mut prefs.confirm_multiline_paste, &c);
                 },
             );
+            g.row(
+                "Copy on Select",
+                Some("Also copy selected text to the clipboard, not just for middle-click paste"),
+                |ui| {
+                    adw::switch(ui, &mut prefs.copy_on_select, &c);
+                },
+            );
             g.row("Show Workspaces Sidebar", None, |ui| {
                 adw::switch(ui, &mut prefs.sidebar, &c);
             });

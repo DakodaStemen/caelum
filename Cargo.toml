@@ -24,6 +24,7 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 toml = "1.1"
 notify = "8"
+raw-window-handle = "0.6"
 egui_extras = { version = "0.33", default-features = false, features = ["svg", "image"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -32,6 +33,9 @@ libc = "0.2"
 # Linux needs explicit windowing backends; Windows (Win32) and macOS (AppKit) use winit's defaults.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.33", default-features = false, features = ["x11", "wayland"] }
+# The PRIMARY selection (select to copy, middle-click to paste); egui only has the clipboard.
+arboard = { version = "3", default-features = false }
+smithay-clipboard = "0.7"
 
 # Non-Linux hosts have no /proc, so the system panel uses sysinfo there.
 [target.'cfg(not(target_os = "linux"))'.dependencies]

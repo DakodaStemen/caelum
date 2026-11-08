@@ -61,6 +61,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("prev_tab", "ctrl+shift+tab"),
     ("copy", "ctrl+shift+c"),
     ("paste", "ctrl+shift+v"),
+    ("select_all", "ctrl+shift+a"),
     ("prev_prompt", "ctrl+shift+up"),
     ("next_prompt", "ctrl+shift+down"),
 ];
