@@ -4,7 +4,8 @@ mod headerbar;
 mod icons;
 mod panes;
 mod persist;
-#[cfg(test)]
+// The tests drive a POSIX shell (echo, printf, seq, cat).
+#[cfg(all(test, unix))]
 mod pointer_tests;
 #[cfg(test)]
 mod screens;

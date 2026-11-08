@@ -456,6 +456,12 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
 fn native_mouse_selection_primary_and_paste() -> Result<()> {
     let _display = one_at_a_time();
     const WORD: &str = "CAELUM_DRAG_OK";
+    // Without xclip every selection would read as empty and the test would fail late.
+    Command::new("xclip")
+        .arg("-version")
+        .stderr(Stdio::null())
+        .output()
+        .context("xclip is required to read the X selections")?;
     let dir = tempfile::tempdir()?;
     let profile = dir.path().join("profile");
     fs::create_dir(&profile)?;
