@@ -4,6 +4,9 @@ mod headerbar;
 mod icons;
 mod panes;
 mod persist;
+// The tests drive a POSIX shell (echo, printf, seq, cat).
+#[cfg(all(test, unix))]
+mod pointer_tests;
 #[cfg(test)]
 mod screens;
 mod settings;
@@ -58,6 +61,8 @@ enum Action {
     Search,
     Copy,
     Paste,
+    SelectAll,
+    ClearScrollback,
     PrevPrompt,
     NextPrompt,
 }
@@ -295,6 +300,9 @@ pub struct App {
     writer: model::BackgroundWriter,
     /// Terminals launch the hermetic test shell (offscreen screenshot tests).
     test_shell: bool,
+    /// The X11/Wayland PRIMARY selection, set up on the first frame that has a window.
+    primary: caelum_rs::primary::Primary,
+    primary_ready: bool,
     docio: files::DocumentIo,
 }
 struct Smoke {
@@ -420,6 +428,8 @@ impl App {
             config_watch: None,
             writer: model::BackgroundWriter::new(),
             test_shell: false,
+            primary: caelum_rs::primary::Primary::none(),
+            primary_ready: false,
             docio: {
                 let ctx = ctx.clone();
                 files::DocumentIo::new(move || ctx.request_repaint())
@@ -739,6 +749,19 @@ impl App {
                 }
             }
             Action::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Action::SelectAll => {
+                if let Some(s) = self.terminals.get_mut(&self.focused) {
+                    s.select_all();
+                    if let Some(text) = s.selection() {
+                        self.primary.set(&text);
+                    }
+                }
+            }
+            Action::ClearScrollback => {
+                if let Some(s) = self.terminals.get_mut(&self.focused) {
+                    s.clear_scrollback();
+                }
+            }
             Action::PrevPrompt | Action::NextPrompt => {
                 // Needs OSC 133 shell integration; silently a no-op otherwise.
                 if let Some(s) = self.terminals.get_mut(&self.focused) {
@@ -772,6 +795,10 @@ impl App {
             ("Workspaces Sidebar".into(), Action::Sidebar),
             ("Preferences".into(), Action::Settings),
             ("Find".into(), Action::Search),
+            ("Copy".into(), Action::Copy),
+            ("Paste".into(), Action::Paste),
+            ("Select All".into(), Action::SelectAll),
+            ("Clear Scrollback".into(), Action::ClearScrollback),
             ("Next Tab".into(), Action::NextTab),
             ("Previous Tab".into(), Action::PrevTab),
             ("About Caelum".into(), Action::About),
@@ -1317,10 +1344,19 @@ impl App {
     }
 }
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if !self.primary_ready {
+            self.primary_ready = true;
+            use raw_window_handle::HasDisplayHandle;
+            let display = frame.display_handle().ok().map(|h| h.as_raw());
+            // SAFETY: eframe keeps its display connection open until after `on_exit`,
+            // which drops this PRIMARY handle first.
+            self.primary = unsafe { caelum_rs::primary::Primary::new(display) };
+        }
         self.frame(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.primary = caelum_rs::primary::Primary::none();
         self.persist_now();
         self.terminals.clear();
     }
@@ -1505,6 +1541,7 @@ fn shortcut_table() -> Vec<(&'static str, Action)> {
         ("prev_tab", Action::PrevTab),
         ("copy", Action::Copy),
         ("paste", Action::Paste),
+        ("select_all", Action::SelectAll),
         ("prev_prompt", Action::PrevPrompt),
         ("next_prompt", Action::NextPrompt),
     ]

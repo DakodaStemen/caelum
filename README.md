@@ -58,7 +58,7 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 
 | Area | What works today |
 | --- | --- |
-| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, selection, copy, bracketed paste, scrollback search, OSC 8 hyperlinks |
+| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, mouse selection (drag, word, line, block), copy/paste with PRIMARY selection, bracketed paste, scrollback search, OSC 8 and plain-text links, mouse reporting for TUIs, file drag-and-drop |
 | Layout | Workspaces, tabs, splits in four directions that rebalance and never shrink a pane below a minimum size, pane zoom |
 | Editor | UTF-8 editing with syntax highlighting, external-change checks, atomic saves, recovery snapshots |
 | Themes | Follows the desktop's light/dark style and accent (Adwaita palette) by default; thirteen bundled themes, custom color editor with live preview, JSON import/export |
@@ -79,15 +79,35 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 | Ctrl+Shift+R | Balance panes (equal sizes) |
 | Ctrl+Shift+Enter | Zoom / restore pane |
 | Ctrl+Shift+W | Close pane |
-| Ctrl+Shift+C / V | Copy selection / paste |
+| Ctrl+Shift+C / V | Copy selection / paste (also Ctrl+Insert / Shift+Insert) |
+| Ctrl+Shift+A | Select all terminal text |
 | Ctrl+Shift+F | Search terminal output and scrollback |
 | Ctrl+O / Ctrl+S | Open / save file |
 
 Double-click a tab to rename it, drag a divider to resize (double-click it to
-balance), and right-click a terminal for copy/paste. The split button in the
+balance), and right-click a terminal for copy, paste, select all, links and
+clearing the scrollback. The split button in the
 headerbar and in each pane header opens a popover with all four directions and
 Balance. Everything else is in the main menu (the three-line button) and the
 command palette.
+
+### Mouse in the terminal
+
+| Mouse | Action |
+| --- | --- |
+| Drag | Select text; dragging past the top or bottom edge scrolls |
+| Double-click / triple-click | Select a word (URLs and `file:line` stay whole) / the whole line; keep dragging to extend by words or lines |
+| Shift+click | Extend the selection |
+| Ctrl+drag | Select a rectangular block |
+| Middle-click | Paste the last selection (Linux PRIMARY selection) |
+| Ctrl+click | Open an http(s) link (OSC 8 or plain text) |
+| Wheel | Scroll the scrollback; in `less`, `man` and other full-screen programs, scroll their text |
+| Drop files | Type their shell-quoted paths |
+
+Selecting text copies it to the PRIMARY selection; turn on **Copy on Select** in
+Preferences to copy it to the clipboard too. When a program such as `vim`, `tmux`
+or `htop` turns on mouse reporting, clicks, drags and the wheel go to that
+program; hold Shift to select text instead.
 
 On GNOME Wayland, which has no server-side window decorations, the headerbar is the
 title bar: it carries the window buttons from your `button-layout`, drag it to move

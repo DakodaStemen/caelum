@@ -48,6 +48,27 @@ fn wait(s: &mut Session, what: &str, cond: impl Fn(&Session) -> bool) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn select_all_and_clear_scrollback() {
+    let mut s = spawn("seq 1 100; echo DONE; sleep 30");
+    wait(&mut s, "output", |s| s.text().contains("DONE"));
+    s.select_all();
+    let all = s.selection().unwrap();
+    assert!(all.starts_with("1\n2\n3\n"), "{all:?}");
+    assert!(all.trim_end().ends_with("99\n100\nDONE"), "{all:?}");
+    assert!(
+        !all.ends_with("\n\n"),
+        "blank rows below the text are left out"
+    );
+    s.clear_selection();
+    assert_eq!(s.selection(), None);
+    assert!(s.term.lock().unwrap().grid().history_size() > 0);
+    s.clear_scrollback();
+    assert_eq!(s.term.lock().unwrap().grid().history_size(), 0);
+    assert!(s.text().contains("DONE"), "the screen itself is kept");
+}
+
 #[test]
 fn terminal_exit_is_detected_and_output_kept() {
     let mut s = spawn("echo hello-caelum; exit 3");

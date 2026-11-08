@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Terminal mouse: drag selection is anchored where the button went down and follows
+  cell halves; triple-click selects a line, double/triple-click then drag extends by
+  words/lines, Shift+click extends, Ctrl+drag selects a block, and dragging past the
+  edge auto-scrolls. Selections go to the PRIMARY selection (middle-click pastes it on
+  X11 and Wayland); optional Copy on Select. Ctrl+Shift+A selects all, Ctrl+Insert /
+  Shift+Insert copy and paste, and the context menu adds Select All, Open/Copy Link
+  and Clear Scrollback. Plain-text http(s) URLs underline on hover and open with
+  Ctrl+click; double-click keeps URLs and `file:line` whole. Dropped files are typed
+  as quoted paths.
+- Mouse reporting for TUIs: drags (1002) and motion (1003) are now reported, in SGR,
+  UTF-8 or X10 encoding as requested, with Alt/Ctrl modifiers; right-click goes to the
+  program (Shift+right-click opens the menu). Focus in/out reports (1004), wheel
+  scrolling by lines (3 per notch), and arrow keys for the wheel on the alternate
+  screen (`less`, `man`).
+
 - Minimal, desktop-native look: follows the system light/dark preference and accent
   color (freedesktop portal, then gsettings; `defaults` on macOS, the registry on
   Windows) with new Adwaita Dark/Light presets, uses the desktop UI font, and drops the

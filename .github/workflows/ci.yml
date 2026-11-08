@@ -19,7 +19,7 @@ jobs:
         with:
           cache-on-failure: true
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig vim-tiny zsh fish
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb xclip fontconfig vim-tiny zsh fish
       - name: Install fish on macOS (zsh is preinstalled)
         if: runner.os == 'macOS'
         run: brew install fish

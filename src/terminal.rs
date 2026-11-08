@@ -188,6 +188,12 @@ pub struct Session {
     pending_input: Vec<u8>,
     /// Multi-line paste held for user confirmation (already sanitised).
     pending_paste: Option<String>,
+    /// Pointer state carried between frames (clicks, drags, reports).
+    mouse: Mouse,
+    /// Grid geometry from the last frame the pane was drawn.
+    metrics: Option<Metrics>,
+    /// Focus state last seen, for focus in/out reports (mode 1004).
+    focus_reported: Option<bool>,
     wake: egui::Context,
     /// Test hook: when set, the cleanup thread waits for a message before doing any
     /// work, so a test can prove `drop` returns while cleanup has not yet run.
@@ -256,7 +262,7 @@ impl Session {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let (listener, events) = Events::new();
-        let term = Arc::new(Mutex::new(Term::new(Config::default(), &size, listener)));
+        let term = Arc::new(Mutex::new(Term::new(term_config(), &size, listener)));
         let stop = Arc::new(AtomicBool::new(false));
         let read_stop = stop.clone();
         let read_term = term.clone();
@@ -294,6 +300,9 @@ impl Session {
             search_origin: None,
             pending_input: Vec::new(),
             pending_paste: None,
+            mouse: Mouse::default(),
+            metrics: None,
+            focus_reported: None,
             wake: ctx,
             #[cfg(test)]
             cleanup_gate: None,
@@ -481,6 +490,46 @@ impl Session {
     }
     pub fn selection(&self) -> Option<String> {
         lock(&self.term).selection_to_string()
+    }
+    /// Selects everything from the top of the scrollback to the last line with text.
+    pub fn select_all(&mut self) {
+        let mut term = lock(&self.term);
+        let last = term.last_column();
+        let mut bottom = term.bottommost_line();
+        while bottom > term.topmost_line()
+            && (0..=last.0).all(|c| term.grid()[Point::new(bottom, Column(c))].c == ' ')
+        {
+            bottom -= 1;
+        }
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(term.topmost_line(), Column(0)),
+            Side::Left,
+        );
+        selection.update(Point::new(bottom, last), Side::Right);
+        term.selection = Some(selection);
+    }
+    pub fn clear_selection(&mut self) {
+        lock(&self.term).selection = None;
+    }
+    /// Drops the scrollback above the screen (like `clear -x` plus history).
+    pub fn clear_scrollback(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        lock(&self.term).clear_screen(ClearMode::Saved);
+        lock(&self.shell).clear_marks();
+        self.search_origin = None;
+    }
+    /// The pane area the terminal was drawn in last frame (grid plus padding).
+    pub fn pane_rect(&self) -> Option<Rect> {
+        Some(self.metrics?.rect)
+    }
+    /// Where the cell at screen `col`/`row` was drawn in the last frame.
+    pub fn cell_rect(&self, col: usize, row: usize) -> Option<Rect> {
+        let m = self.metrics?;
+        Some(Rect::from_min_size(
+            m.cell_pos(col, row as i32),
+            Vec2::new(m.cw, m.ch),
+        ))
     }
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref()?.process_id()
@@ -919,13 +968,73 @@ impl Metrics {
     fn cell_pos(&self, col: usize, row: i32) -> Pos2 {
         self.area.min + Vec2::new(col as f32 * self.cw, row as f32 * self.ch)
     }
+    /// Zero-based screen column and row under `pos`, clamped to the grid.
+    fn screen_cell(&self, pos: Pos2) -> (usize, usize) {
+        let p = self.point_at(pos, 0);
+        (p.column.0, p.line.0.max(0) as usize)
+    }
+    /// Grid point and cell half under `pos`, for selections. Past the left or right
+    /// edge selects to the start or end of the row; above or below the grid, from the
+    /// start of the top row or to the end of the bottom row.
+    fn grid_side(&self, term: &Term<Events>, pos: Pos2) -> (Point, Side) {
+        let point = self.grid_point(term, pos);
+        if pos.y < self.area.top() {
+            return (Point::new(point.line, Column(0)), Side::Left);
+        }
+        if pos.y >= self.area.top() + self.size.rows as f32 * self.ch {
+            return (Point::new(point.line, term.last_column()), Side::Right);
+        }
+        let x = (pos.x - self.area.left()) / self.cw;
+        let side = if x < 0. {
+            Side::Left
+        } else if x >= self.size.cols as f32 || x.fract() >= 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        (point, side)
+    }
+}
+
+/// Two presses this close together (and within a few points) count as a double
+/// or triple click.
+const MULTI_CLICK_SECONDS: f64 = 0.5;
+
+/// Pointer state kept between frames.
+#[derive(Default)]
+struct Mouse {
+    /// Presses in a row at about the same spot: 1, 2 (word) or 3 (line).
+    clicks: u8,
+    last_press: Option<(f64, Pos2)>,
+    /// The selection gesture in progress while the primary button is held.
+    gesture: Option<SelectionType>,
+    /// Where a character or block drag started; the selection is created once the
+    /// pointer leaves that cell half.
+    anchor: Option<(Point, Side)>,
+    /// Fractional lines of drag auto-scroll and of wheel scrolling not yet applied.
+    autoscroll: f32,
+    wheel: f32,
+    /// Button whose press was reported to the program, until its release.
+    reported: Option<u8>,
+    /// Cell of the last motion report, so each cell is reported once.
+    last_motion: Option<(usize, usize)>,
+    /// Link under the pointer when the context menu opened.
+    menu_link: Option<String>,
+    menu_open: bool,
+}
+
+/// Terminal settings: Alacritty's defaults, with `:` dropped from the word
+/// separators so a double click selects whole URLs, `host:port` and `file:line`.
+fn term_config() -> Config {
+    Config {
+        semantic_escape_chars: ",│`|\"' ()[]{}<>\t".into(),
+        ..Config::default()
+    }
 }
 
 /// How pointer input is interpreted this frame.
 #[derive(Clone, Copy)]
 struct PointerMode {
-    /// Display offset (scrollback position) at the start of the frame.
-    offset: usize,
     /// The program asked for mouse reports.
     reporting: bool,
     /// Pointer input selects text (no reporting, or Shift is held).
@@ -978,6 +1087,18 @@ impl Faces {
     }
 }
 
+/// What a terminal pane asks of the app after a frame.
+#[derive(Default)]
+pub struct Shown {
+    /// The pane was clicked, or a drag started on it: focus it.
+    pub clicked: bool,
+    /// A mouse selection just ended (or Select All ran) with this text, for the
+    /// PRIMARY selection and copy-on-select.
+    pub selected: Option<String>,
+    /// A middle click asked to paste the PRIMARY selection.
+    pub paste_primary: bool,
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     s: &mut Session,
@@ -985,11 +1106,11 @@ pub fn show(
     prefs: &Preferences,
     focused: bool,
     search: &str,
-) -> bool {
+) -> Shown {
     let font = FontId::monospace(prefs.font_size);
     let (response, m) = layout(ui, s, theme, prefs, &font);
+    s.metrics = Some(m);
     let pointer = pointer_mode(ui, s);
-    handle_selection(s, &response, &m, pointer);
     // Not while a modal dialog (preferences, about, an alert) is over the window:
     // its keys, Tab included, are not the shell's.
     let blocked = !ui.memory(|mem| mem.allows_interaction(ui.layer_id()));
@@ -998,19 +1119,41 @@ pub fn show(
     } else {
         manage_focus(ui, &response, focused);
     }
-    let mut clicked = response.clicked() || response.drag_started();
-    handle_links(ui, s, &response, &m, pointer);
+    report_focus(ui, s, focused && !blocked);
+    let mut shown = Shown {
+        clicked: response.clicked() || response.drag_started(),
+        ..Shown::default()
+    };
+    if pointer.forwards_to_program() {
+        report_mouse(ui, s, &response, &m);
+    } else {
+        s.mouse.reported = None;
+    }
+    shown.selected = handle_selection(ui, s, &response, &m, pointer);
+    shown.paste_primary = !pointer.forwards_to_program() && response.middle_clicked();
+    let link = handle_links(ui, s, &response, &m, pointer);
     handle_scroll(ui, s, &response, &m, pointer);
     if focused && !blocked && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
-        handle_events(ui, s, prefs, &response, &m, pointer);
+        handle_events(ui, s, prefs);
     }
+    handle_drop(ui, s, &response, focused);
     let painter = ui.painter_at(m.rect);
     let faces = Faces::new(ui, prefs.font_size);
-    paint_grid(ui, s, theme, prefs, &painter, &m, &faces, focused, search);
+    paint_grid(
+        ui, s, theme, prefs, &painter, &m, &faces, focused, search, link,
+    );
     paint_exit_badge(s, theme, prefs, &painter, m.rect);
     paint_scroll_indicator(ui, s, theme, &painter, &response, m.rect);
-    context_menu(s, &response, &mut clicked);
-    clicked
+    if ui.input(|i| !i.raw.hovered_files.is_empty()) && response.contains_pointer() {
+        painter.rect_stroke(
+            m.rect.shrink(1.),
+            0.,
+            Stroke::new(2_f32, theme.ui("accent")),
+            egui::StrokeKind::Inside,
+        );
+    }
+    context_menu(s, &response, &m, pointer, &mut shown);
+    shown
 }
 
 /// Allocates the pane, paints its background, sizes the PTY to fit and drains
@@ -1044,43 +1187,284 @@ fn layout(
 }
 
 fn pointer_mode(ui: &egui::Ui, s: &Session) -> PointerMode {
-    let offset = lock(&s.term).grid().display_offset();
-    let reporting = lock(&s.term)
-        .mode()
-        .intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION);
+    let reporting = lock(&s.term).mode().intersects(TermMode::MOUSE_MODE);
     let selecting = !reporting || ui.input(|i| i.modifiers.shift);
     PointerMode {
-        offset,
         reporting,
         selecting,
     }
 }
 
-/// Drag selects characters, double-click selects a word.
-fn handle_selection(s: &Session, response: &egui::Response, m: &Metrics, p: PointerMode) {
-    if !p.selecting {
+/// Mouse selection. A press clears the selection; dragging selects characters
+/// (Ctrl+drag a block), a double click selects a word and a triple click a line,
+/// and dragging after them extends by words or lines. Shift+click extends the
+/// current selection. Dragging past the top or bottom edge scrolls the scrollback.
+/// Returns the selected text when a gesture ends, for the PRIMARY selection.
+///
+/// Button and move events are replayed in order: a quick click can arrive with its
+/// press and release in the same frame, and the last move with the release.
+fn handle_selection(
+    ui: &egui::Ui,
+    s: &mut Session,
+    response: &egui::Response,
+    m: &Metrics,
+    p: PointerMode,
+) -> Option<String> {
+    let (events, down, pos, time, dt) = ui.input(|i| {
+        (
+            i.events.clone(),
+            i.pointer.primary_down(),
+            i.pointer.interact_pos(),
+            i.time,
+            i.stable_dt,
+        )
+    });
+    let ours =
+        |pos: Pos2| m.rect.contains(pos) && owns_press(response, egui::PointerButton::Primary);
+    let mut selected = None;
+    for event in events {
+        match event {
+            egui::Event::PointerMoved(pos) if s.mouse.gesture.is_some() => {
+                extend_gesture(s, m, pos, 0.);
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            } => {
+                if (!p.reporting || modifiers.shift) && ours(pos) {
+                    start_gesture(s, m, pos, time, modifiers);
+                }
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } if s.mouse.gesture.is_some() => {
+                extend_gesture(s, m, pos, 0.);
+                selected = end_gesture(s);
+            }
+            _ => {}
+        }
+    }
+    if s.mouse.gesture.is_some() {
+        if !down {
+            // The release never reached us (outside the window, say).
+            selected = end_gesture(s);
+        } else if let Some(pos) = pos
+            && extend_gesture(s, m, pos, dt)
+        {
+            // Keep scrolling while the pointer rests past the edge.
+            ui.ctx().request_repaint();
+        }
+    }
+    selected
+}
+
+/// Whether egui gave this pane the press: the button is held on it, or was already
+/// released on it in the same frame as a click or the end of a drag. Unlike
+/// `contains_pointer`, this is false for a press on a widget on top of the pane,
+/// such as a split divider's grab area, a menu or a dialog.
+fn owns_press(response: &egui::Response, button: egui::PointerButton) -> bool {
+    response.is_pointer_button_down_on()
+        || response.clicked_by(button)
+        || response.drag_stopped_by(button)
+}
+
+/// Ends the selection gesture; returns the selected text, if any.
+fn end_gesture(s: &mut Session) -> Option<String> {
+    s.mouse.gesture = None;
+    s.mouse.anchor = None;
+    s.mouse.autoscroll = 0.;
+    s.selection().filter(|text| !text.is_empty())
+}
+
+/// A primary-button press on the grid: counts clicks and starts the gesture.
+fn start_gesture(s: &mut Session, m: &Metrics, pos: Pos2, time: f64, mods: Modifiers) {
+    let mouse = &mut s.mouse;
+    let again = mouse
+        .last_press
+        .is_some_and(|(t, at)| time - t < MULTI_CLICK_SECONDS && at.distance(pos) < 4.);
+    mouse.clicks = if again { mouse.clicks % 3 + 1 } else { 1 };
+    mouse.last_press = Some((time, pos));
+    let mut term = lock(&s.term);
+    let (point, side) = m.grid_side(&term, pos);
+    if mouse.clicks == 1
+        && mods.shift
+        && let Some(selection) = &mut term.selection
+    {
+        selection.update(point, side);
+        mouse.gesture = Some(selection.ty);
+        mouse.anchor = None;
         return;
     }
-    let start = |kind| {
-        response
-            .interact_pointer_pos()
-            .map(|pos| Selection::new(kind, m.point_at(pos, p.offset), Side::Left))
+    let ty = match mouse.clicks {
+        2 => SelectionType::Semantic,
+        3 => SelectionType::Lines,
+        _ if mods.ctrl || mods.command => SelectionType::Block,
+        _ => SelectionType::Simple,
     };
-    if response.drag_started()
-        && let Some(selection) = start(SelectionType::Simple)
-    {
-        lock(&s.term).selection = Some(selection);
+    mouse.gesture = Some(ty);
+    if matches!(ty, SelectionType::Simple | SelectionType::Block) {
+        // Nothing is selected until the pointer moves off the press position.
+        term.selection = None;
+        mouse.anchor = Some((point, side));
+    } else {
+        term.selection = Some(Selection::new(ty, point, side));
+        mouse.anchor = None;
     }
-    if response.dragged()
-        && let Some(pos) = response.interact_pointer_pos()
-        && let Some(selection) = &mut lock(&s.term).selection
-    {
-        selection.update(m.point_at(pos, p.offset), Side::Right);
+}
+
+/// Moves the selection end to `pos`, scrolling when it is past the top or bottom
+/// of the grid. Returns true while auto-scrolling.
+fn extend_gesture(s: &mut Session, m: &Metrics, pos: Pos2, dt: f32) -> bool {
+    let Some(ty) = s.mouse.gesture else {
+        return false;
+    };
+    let mut term = lock(&s.term);
+    let past = if pos.y < m.area.top() {
+        m.area.top() - pos.y
+    } else if pos.y > m.area.bottom() {
+        m.area.bottom() - pos.y
+    } else {
+        0.
+    };
+    let scrolling = past != 0. && !term.mode().contains(TermMode::ALT_SCREEN);
+    if scrolling {
+        // About 15 lines a second at the edge, faster the further out.
+        let rate = 15. * (1. + past.abs() / m.ch);
+        s.mouse.autoscroll += dt.min(0.1) * rate * past.signum();
+        let lines = s.mouse.autoscroll.trunc();
+        s.mouse.autoscroll -= lines;
+        if lines != 0. {
+            term.scroll_display(Scroll::Delta(lines as i32));
+        }
+    } else {
+        s.mouse.autoscroll = 0.;
     }
-    if response.double_clicked()
-        && let Some(selection) = start(SelectionType::Semantic)
+    let (point, side) = m.grid_side(&term, pos);
+    if let Some(selection) = &mut term.selection {
+        selection.update(point, side);
+    } else if let Some((at, at_side)) = s.mouse.anchor
+        && (at, at_side) != (point, side)
     {
-        lock(&s.term).selection = Some(selection);
+        let mut selection = Selection::new(ty, at, at_side);
+        selection.update(point, side);
+        term.selection = Some(selection);
+    }
+    scrolling
+}
+
+/// Focus in/out reports (mode 1004), sent when the pane gains or loses focus.
+fn report_focus(ui: &egui::Ui, s: &mut Session, focused: bool) {
+    let active = focused && ui.input(|i| i.viewport().focused.unwrap_or(true));
+    let before = s.focus_reported.replace(active);
+    if before.is_some_and(|b| b != active) && lock(&s.term).mode().contains(TermMode::FOCUS_IN_OUT)
+    {
+        s.write(if active { b"\x1b[I" } else { b"\x1b[O" }.to_vec());
+    }
+}
+
+/// Mouse button code for a report: left, middle, right.
+fn button_code(button: egui::PointerButton) -> Option<u8> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Middle => Some(1),
+        egui::PointerButton::Secondary => Some(2),
+        _ => None,
+    }
+}
+
+/// Modifier bits of a mouse report. Shift is never reported: it bypasses
+/// reporting to select text instead.
+fn modifier_bits(m: Modifiers) -> u8 {
+    (if m.alt { 8 } else { 0 }) + (if m.ctrl { 16 } else { 0 })
+}
+
+/// One mouse report for `code` (button plus modifier and motion bits) at the
+/// zero-based screen cell, in the encoding the program asked for: SGR (1006),
+/// UTF-8 (1005) or the X10 default. None when the encoding cannot express it.
+fn mouse_report(
+    code: u8,
+    col: usize,
+    row: usize,
+    pressed: bool,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    let (x, y) = (col + 1, row + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if pressed { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{code};{x};{y}{end}").into_bytes());
+    }
+    // Legacy encodings report every release as button 3.
+    let code = if pressed { code } else { (code & !0b11) | 3 };
+    let mut out = b"\x1b[M".to_vec();
+    out.push(32 + code);
+    for v in [x, y] {
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let c = char::from_u32(32 + u32::try_from(v).ok()?).filter(|_| v <= 2015)?;
+            out.extend(c.encode_utf8(&mut [0; 4]).as_bytes());
+        } else {
+            out.push(32 + u8::try_from(v).ok().filter(|v| *v <= 223)?);
+        }
+    }
+    Some(out)
+}
+
+/// Forwards presses, releases, drags and motion to a program that enabled mouse
+/// reporting (1000 clicks, 1002 drags, 1003 all motion).
+fn report_mouse(ui: &egui::Ui, s: &mut Session, response: &egui::Response, m: &Metrics) {
+    let mode = *lock(&s.term).mode();
+    let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
+    for event in events {
+        match event {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            } => {
+                let Some(code) = button_code(button) else {
+                    continue;
+                };
+                if pressed {
+                    if !m.rect.contains(pos) || !owns_press(response, button) {
+                        continue;
+                    }
+                    s.mouse.reported = Some(code);
+                } else if s.mouse.reported != Some(code) {
+                    continue;
+                } else {
+                    s.mouse.reported = None;
+                }
+                let (col, row) = m.screen_cell(pos);
+                s.mouse.last_motion = Some((col, row));
+                let code = code + modifier_bits(modifiers);
+                if let Some(bytes) = mouse_report(code, col, row, pressed, mode) {
+                    s.write(bytes);
+                }
+            }
+            egui::Event::PointerMoved(pos) => {
+                let held = s.mouse.reported;
+                let wanted = mode.contains(TermMode::MOUSE_MOTION)
+                    || (held.is_some() && mode.contains(TermMode::MOUSE_DRAG));
+                if !wanted || (held.is_none() && !(response.hovered() && m.rect.contains(pos))) {
+                    continue;
+                }
+                let cell = m.screen_cell(pos);
+                if s.mouse.last_motion == Some(cell) {
+                    continue;
+                }
+                s.mouse.last_motion = Some(cell);
+                let code = held.unwrap_or(3) + 32 + modifier_bits(mods);
+                if let Some(bytes) = mouse_report(code, cell.0, cell.1, true, mode) {
+                    s.write(bytes);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1115,45 +1499,169 @@ fn link_at(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<String> {
         .map(|link| link.uri().to_string())
 }
 
+/// A link under the pointer: an OSC 8 hyperlink, or a URL written as plain text
+/// together with the cells it covers (to underline it).
+struct Link {
+    uri: String,
+    span: Option<(Point, Point)>,
+}
+
+fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<Link> {
+    if let Some(uri) = link_at(term, m, pos) {
+        return Some(Link { uri, span: None });
+    }
+    let (uri, start, end) = url_at(term, m.grid_point(term, pos))?;
+    Some(Link {
+        uri,
+        span: Some((start, end)),
+    })
+}
+
+/// The web URL written in the text at `point` (following wrapped lines), with its
+/// first and last cells.
+fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
+    use alacritty_terminal::term::cell::Flags;
+    let grid = term.grid();
+    let last = term.last_column();
+    let wraps = |line: Line| grid[Point::new(line, last)].flags.contains(Flags::WRAPLINE);
+    // Bounded so a screen of one wrapped line stays cheap to scan every frame.
+    let (mut top, mut bottom) = (point.line, point.line);
+    while top > term.topmost_line() && wraps(top - 1) && point.line - top < 16 {
+        top -= 1;
+    }
+    while bottom < term.bottommost_line() && wraps(bottom) && bottom - point.line < 16 {
+        bottom += 1;
+    }
+    let mut cells = Vec::new();
+    for line in top.0..=bottom.0 {
+        for col in 0..=last.0 {
+            let p = Point::new(Line(line), Column(col));
+            let cell = &grid[p];
+            if !cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                cells.push((cell.c, p));
+            }
+        }
+    }
+    let at = cells.iter().rposition(|(_, p)| *p <= point)?;
+    let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
+    let (from, to) = find_urls(&chars)
+        .into_iter()
+        .find(|(from, to)| (*from..*to).contains(&at))?;
+    Some((
+        chars[from..to].iter().collect(),
+        cells[from].1,
+        cells[to - 1].1,
+    ))
+}
+
+/// Character ranges of the `http://` and `https://` URLs in `text`. Trailing
+/// punctuation and unbalanced closing brackets are left out, as in prose.
+fn find_urls(text: &[char]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let rest: String = text[i..text.len().min(i + 8)].iter().collect();
+        let rest = rest.to_ascii_lowercase();
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            0
+        };
+        if scheme == 0 || (i > 0 && text[i - 1].is_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + scheme;
+        while end < text.len()
+            && !text[end].is_whitespace()
+            && !text[end].is_control()
+            && !matches!(
+                text[end],
+                '<' | '>' | '"' | '\'' | '`' | '│' | '{' | '}' | '\\' | '^'
+            )
+        {
+            end += 1;
+        }
+        while let Some(&c) = text[i..end].last() {
+            let unbalanced = |open: char| {
+                let body = &text[i..end];
+                body.iter().filter(|x| **x == c).count()
+                    > body.iter().filter(|x| **x == open).count()
+            };
+            let trim = match c {
+                '.' | ',' | ';' | ':' | '!' | '?' | '*' => true,
+                ')' => unbalanced('('),
+                ']' => unbalanced('['),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            end -= 1;
+        }
+        if end > i + scheme {
+            found.push((i, end));
+        }
+        i = end.max(i + 1);
+    }
+    found
+}
+
 /// OSC 8 link text can differ from its target, so the real URI is always revealed
-/// on hover before a Ctrl+click opens it. A plain click clears the selection.
+/// on hover before a Ctrl+click opens it. Plain-text URLs are underlined on hover
+/// and open the same way. Returns the cells of a hovered plain-text URL.
 fn handle_links(
     ui: &egui::Ui,
     s: &Session,
     response: &egui::Response,
     m: &Metrics,
     p: PointerMode,
-) {
-    if let Some(pos) = response.hover_pos() {
-        let uri = link_at(&lock(&s.term), m, pos);
-        if let Some(uri) = uri {
-            let tip = if openable_link(&uri) {
+) -> Option<(Point, Point)> {
+    let mut span = None;
+    if let Some(pos) = response.hover_pos()
+        && s.mouse.gesture.is_none()
+    {
+        let link = link_under(&lock(&s.term), m, pos);
+        if let Some(link) = link {
+            let tip = if openable_link(&link.uri) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                format!("{}\nCtrl+click to open", hover_label(&uri))
+                if link.span.is_some() {
+                    "Ctrl+click to open".to_string()
+                } else {
+                    format!("{}\nCtrl+click to open", hover_label(&link.uri))
+                }
             } else {
                 format!(
                     "{}\n(not opened: only http and https links)",
-                    hover_label(&uri)
+                    hover_label(&link.uri)
                 )
             };
             response.clone().on_hover_text_at_pointer(tip);
+            span = link.span;
+        } else if p.selecting {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
     }
-    let ctrl = ui.input(|i| i.modifiers.ctrl);
+    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     if response.clicked()
         && ctrl
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some(url) = link_at(&lock(&s.term), m, pos)
-        && openable_link(&url)
+        && let Some(link) = link_under(&lock(&s.term), m, pos)
+        && openable_link(&link.uri)
     {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
     }
-    if response.clicked() && !ctrl && p.selecting {
-        lock(&s.term).selection = None;
-    }
+    span
 }
 
-/// Wheel scrolls the scrollback, or is reported to a program that asked for mouse events.
+/// Wheel and touchpad scrolling: reported to a program that asked for mouse
+/// events, sent as arrow keys on the alternate screen (`less`, `man`), and
+/// otherwise moving through the scrollback, three lines per wheel notch.
 fn handle_scroll(
     ui: &egui::Ui,
     s: &mut Session,
@@ -1164,37 +1672,63 @@ fn handle_scroll(
     if !response.hovered() {
         return;
     }
-    let delta = ui.input(|i| i.raw_scroll_delta.y);
-    if delta == 0. {
+    let (events, hover) = ui.input(|i| (i.events.clone(), i.pointer.hover_pos()));
+    let mut mods = Modifiers::NONE;
+    let mut lines = 0.;
+    for event in events {
+        if let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } = event
+        {
+            // Ctrl+wheel zooms the text.
+            if modifiers.ctrl || modifiers.command {
+                continue;
+            }
+            mods = modifiers;
+            lines += match unit {
+                egui::MouseWheelUnit::Line => delta.y * 3.,
+                egui::MouseWheelUnit::Point => delta.y / m.ch,
+                egui::MouseWheelUnit::Page => delta.y * m.size.rows as f32,
+            };
+        }
+    }
+    if lines == 0. {
         return;
     }
+    s.mouse.wheel += lines;
+    let whole = s.mouse.wheel.trunc();
+    s.mouse.wheel -= whole;
+    let n = whole as i32;
+    if n == 0 {
+        return;
+    }
+    let count = n.unsigned_abs().min(100) as usize;
+    let mode = *lock(&s.term).mode();
     if p.forwards_to_program() {
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            let point = m.point_at(pos, 0);
-            s.write(
-                format!(
-                    "\x1b[<{};{};{}M",
-                    if delta > 0. { 64 } else { 65 },
-                    point.column.0 + 1,
-                    point.line.0 + 1
-                )
-                .into_bytes(),
-            );
+        if let Some(pos) = hover {
+            let (col, row) = m.screen_cell(pos);
+            let code = if n > 0 { 64 } else { 65 } + modifier_bits(mods);
+            if let Some(bytes) = mouse_report(code, col, row, true, mode) {
+                s.write(bytes.repeat(count));
+            }
         }
+    } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
+        let key = if n > 0 { 'A' } else { 'B' };
+        let seq = if mode.contains(TermMode::APP_CURSOR) {
+            format!("\x1bO{key}")
+        } else {
+            format!("\x1b[{key}")
+        };
+        s.write(seq.repeat(count).into_bytes());
     } else {
-        lock(&s.term).scroll_display(Scroll::Delta((delta / 12.).round() as i32));
+        lock(&s.term).scroll_display(Scroll::Delta(n));
     }
 }
 
-/// Translates this frame's keyboard, clipboard, IME and mouse-button events into PTY input.
-fn handle_events(
-    ui: &egui::Ui,
-    s: &mut Session,
-    prefs: &Preferences,
-    response: &egui::Response,
-    m: &Metrics,
-    p: PointerMode,
-) {
+/// Translates this frame's keyboard, clipboard and IME events into PTY input.
+fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
     let mode = *lock(&s.term).mode();
     let events = ui.input(|i| i.events.clone());
     for event in events {
@@ -1223,6 +1757,20 @@ fn handle_events(
             egui::Event::Paste(text) => {
                 s.paste_or_hold(&text, prefs.confirm_multiline_paste);
             }
+            // Ctrl+Insert copies and Shift+Insert pastes, as in GTK and Windows.
+            egui::Event::Key {
+                key: Key::Insert,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl != modifiers.shift && !modifiers.alt => {
+                if modifiers.shift {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                } else if let Some(text) = s.selection() {
+                    ui.ctx().copy_text(text);
+                }
+            }
             egui::Event::Key {
                 key,
                 pressed: true,
@@ -1230,14 +1778,6 @@ fn handle_events(
                 ..
             } => handle_key(s, key, modifiers, mode),
             egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
-            egui::Event::PointerButton {
-                pos,
-                button,
-                pressed,
-                ..
-            } if response.hovered() && p.forwards_to_program() => {
-                report_button(s, m.point_at(pos, 0), button, pressed)
-            }
             _ => {}
         }
     }
@@ -1265,22 +1805,46 @@ fn handle_key(s: &mut Session, key: Key, modifiers: Modifiers, mode: TermMode) {
     }
 }
 
-/// SGR (1006) mouse button report.
-fn report_button(s: &mut Session, p: Point, button: egui::PointerButton, pressed: bool) {
-    let b = match button {
-        egui::PointerButton::Primary => 0,
-        egui::PointerButton::Middle => 1,
-        _ => 2,
+/// Files dropped on the pane are typed as shell-quoted paths.
+fn handle_drop(ui: &egui::Ui, s: &mut Session, response: &egui::Response, focused: bool) {
+    let (files, hover) = ui.input(|i| (i.raw.dropped_files.clone(), i.pointer.hover_pos()));
+    if files.is_empty() {
+        return;
+    }
+    let here = match hover {
+        Some(pos) => response.rect.contains(pos),
+        None => focused,
     };
-    s.write(
-        format!(
-            "\x1b[<{b};{};{}{}",
-            p.column.0 + 1,
-            p.line.0 + 1,
-            if pressed { 'M' } else { 'm' }
-        )
-        .into_bytes(),
-    );
+    let paths: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.path.as_ref())
+        .map(|p| shell_quote(&p.to_string_lossy()))
+        .collect();
+    if here && !paths.is_empty() {
+        s.paste(&format!("{} ", paths.join(" ")));
+    }
+}
+
+/// Quotes a path for the shell only when it needs it: POSIX single quotes, or on
+/// Windows PowerShell's (the default shell there) literal single quotes, so `$`,
+/// backticks and `$(...)` in a file name are never expanded.
+fn shell_quote(path: &str) -> String {
+    quote_path(path, cfg!(windows))
+}
+fn quote_path(path: &str, powershell: bool) -> String {
+    // PowerShell also treats `,` `@` `%` and `=` specially, so it gets fewer bare characters.
+    let bare = if powershell { "\\/._-:" } else { "/._-+,:@%=" };
+    let plain = !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || bare.contains(c));
+    if plain {
+        path.to_string()
+    } else if powershell {
+        format!("'{}'", path.replace('\'', "''"))
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
 }
 
 /// Start of the last search match, with the grid shape it was found in. Columns and
@@ -1434,6 +1998,7 @@ fn paint_grid(
     faces: &Faces,
     focused: bool,
     search: &str,
+    link: Option<(Point, Point)>,
 ) {
     let term = lock(&s.term);
     let content = term.renderable_content();
@@ -1472,7 +2037,36 @@ fn paint_grid(
             || !prefs.cursor_blink
             || ui.input(|i| ((i.time * 2.) as u64).is_multiple_of(2)));
     let under = term.grid()[cursor.point].c;
+    let last = term.last_column().0;
     drop(term);
+    // Underline a hovered plain-text URL, row by row.
+    if let Some((start, end)) = link {
+        for line in start.line.0..=end.line.0 {
+            let row = line + offset;
+            if row < 0 || row >= m.size.rows as i32 {
+                continue;
+            }
+            let from = if line == start.line.0 {
+                start.column.0
+            } else {
+                0
+            };
+            let to = if line == end.line.0 {
+                end.column.0
+            } else {
+                last
+            };
+            let left = m.cell_pos(from, row);
+            let y = left.y + m.ch - 2.;
+            painter.line_segment(
+                [
+                    Pos2::new(left.x, y),
+                    Pos2::new(left.x + (to + 1 - from) as f32 * m.cw, y),
+                ],
+                Stroke::new(1_f32, theme.term("foreground")),
+            );
+        }
+    }
     if show_cursor {
         let r = Rect::from_min_size(
             m.cell_pos(cursor.point.column.0, cursor.point.line.0),
@@ -1674,10 +2268,34 @@ fn paint_exit_badge(
     painter.galley(badge.min + Vec2::new(5., 2.), galley, theme.ui("danger"));
 }
 
-fn context_menu(s: &mut Session, response: &egui::Response, clicked: &mut bool) {
+/// Right-click menu. A program with mouse reporting gets right clicks itself;
+/// Shift+right-click still opens the menu there.
+fn context_menu(
+    s: &mut Session,
+    response: &egui::Response,
+    m: &Metrics,
+    p: PointerMode,
+    shown: &mut Shown,
+) {
+    if p.forwards_to_program() && !s.mouse.menu_open {
+        return;
+    }
+    if response.secondary_clicked() {
+        s.mouse.menu_link = response
+            .interact_pointer_pos()
+            .and_then(|pos| link_under(&lock(&s.term), m, pos))
+            .map(|link| link.uri);
+    }
+    let mut open = false;
     response.context_menu(|ui| {
-        if ui.button("Copy selection").clicked() {
-            if let Some(text) = s.selection() {
+        open = true;
+        shown.clicked = true;
+        let selection = s.selection().filter(|t| !t.is_empty());
+        if ui
+            .add_enabled(selection.is_some(), egui::Button::new("Copy"))
+            .clicked()
+        {
+            if let Some(text) = selection {
                 ui.ctx().copy_text(text);
             }
             ui.close();
@@ -1687,12 +2305,40 @@ fn context_menu(s: &mut Session, response: &egui::Response, clicked: &mut bool) 
                 .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             ui.close();
         }
-        if ui.button("Scroll to bottom").clicked() {
+        if ui.button("Select All").clicked() {
+            s.select_all();
+            shown.selected = s.selection();
+            ui.close();
+        }
+        if let Some(uri) = s.mouse.menu_link.clone() {
+            ui.separator();
+            if openable_link(&uri) && ui.button("Open Link").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&uri));
+                ui.close();
+            }
+            if ui.button("Copy Link Address").clicked() {
+                ui.ctx().copy_text(uri);
+                ui.close();
+            }
+        }
+        ui.separator();
+        let (history, offset) = {
+            let term = lock(&s.term);
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        if offset > 0 && ui.button("Scroll to Bottom").clicked() {
             lock(&s.term).scroll_display(Scroll::Bottom);
             ui.close();
         }
-        *clicked = true;
+        if ui
+            .add_enabled(history > 0, egui::Button::new("Clear Scrollback"))
+            .clicked()
+        {
+            s.clear_scrollback();
+            ui.close();
+        }
     });
+    s.mouse.menu_open = open;
 }
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -1816,6 +2462,94 @@ mod tests {
             ch: 20.,
             size: Size { cols, rows },
         }
+    }
+    fn urls(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        find_urls(&chars)
+            .into_iter()
+            .map(|(a, b)| chars[a..b].iter().collect())
+            .collect()
+    }
+    #[test]
+    fn plain_text_urls_leave_out_prose_punctuation() {
+        assert_eq!(urls("see https://x.example/a."), ["https://x.example/a"]);
+        assert_eq!(
+            urls("(https://en.wikipedia.org/wiki/Rust_(language)), and"),
+            ["https://en.wikipedia.org/wiki/Rust_(language)"]
+        );
+        assert_eq!(
+            urls("<http://x.example/?q=1&b=2>"),
+            ["http://x.example/?q=1&b=2"]
+        );
+        assert_eq!(
+            urls("HTTPS://X.EXAMPLE 'http://y.example'"),
+            ["HTTPS://X.EXAMPLE", "http://y.example"]
+        );
+        assert!(urls("xhttps://x.example http:// ftp://x.example").is_empty());
+    }
+    #[test]
+    fn plain_text_urls_are_found_across_wrapped_lines() {
+        let (events, _queue) = Events::new();
+        let mut term = Term::new(term_config(), &Size { cols: 10, rows: 5 }, events);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"go https://x.example/long/path now");
+        let on_second_row = Point::new(Line(1), Column(5));
+        let (uri, start, end) = url_at(&term, on_second_row).unwrap();
+        assert_eq!(uri, "https://x.example/long/path");
+        assert_eq!(start, Point::new(Line(0), Column(3)));
+        assert_eq!(end, Point::new(Line(2), Column(9)));
+        assert!(url_at(&term, Point::new(Line(0), Column(0))).is_none());
+    }
+    #[test]
+    fn mouse_reports_use_the_requested_encoding() {
+        let sgr = TermMode::SGR_MOUSE;
+        assert_eq!(mouse_report(0, 2, 4, true, sgr).unwrap(), b"\x1b[<0;3;5M");
+        assert_eq!(
+            mouse_report(16 + 32, 0, 0, true, sgr).unwrap(),
+            b"\x1b[<48;1;1M"
+        );
+        assert_eq!(mouse_report(2, 9, 0, false, sgr).unwrap(), b"\x1b[<2;10;1m");
+        // X10: 32 + code, 32 + x, 32 + y; a release is button 3.
+        let none = TermMode::empty();
+        assert_eq!(mouse_report(0, 0, 0, true, none).unwrap(), b"\x1b[M !!");
+        assert_eq!(
+            mouse_report(8 + 1, 0, 0, false, none).unwrap(),
+            b"\x1b[M+!!"
+        );
+        assert_eq!(mouse_report(64, 1, 1, true, none).unwrap(), b"\x1b[M`\"\"");
+        assert!(mouse_report(0, 300, 0, true, none).is_none());
+        // UTF-8 (1005) carries larger coordinates.
+        let utf8 = mouse_report(0, 300, 0, true, TermMode::UTF8_MOUSE).unwrap();
+        assert_eq!(utf8, "\x1b[M \u{14d}!".as_bytes());
+    }
+    #[test]
+    fn dropped_paths_are_quoted_for_the_shell() {
+        let posix = |p| quote_path(p, false);
+        assert_eq!(posix("/home/me/notes.txt"), "/home/me/notes.txt");
+        assert_eq!(posix("/tmp/My File.txt"), "'/tmp/My File.txt'");
+        assert_eq!(posix("/tmp/it's"), r"'/tmp/it'\''s'");
+        assert_eq!(posix("/tmp/$(rm)`x`"), "'/tmp/$(rm)`x`'");
+        // PowerShell: single-quoted literals, quotes doubled; `$(...)` stays text.
+        let ps = |p| quote_path(p, true);
+        assert_eq!(ps(r"C:\Users\me\notes.txt"), r"C:\Users\me\notes.txt");
+        assert_eq!(
+            ps(r"C:\drop\$(Write-Output INJECTED).txt"),
+            r"'C:\drop\$(Write-Output INJECTED).txt'"
+        );
+        assert_eq!(ps(r"C:\it's,a@b.txt"), r"'C:\it''s,a@b.txt'");
+    }
+    #[test]
+    fn selection_sides_follow_the_cell_halves() {
+        let (events, _queue) = Events::new();
+        let term = Term::new(term_config(), &Size { cols: 20, rows: 5 }, events);
+        let m = metrics(20, 5);
+        let p = |x: f32, y: f32| m.grid_side(&term, Pos2::new(x, y));
+        assert_eq!(p(32., 5.), (Point::new(Line(0), Column(3)), Side::Left));
+        assert_eq!(p(37., 5.), (Point::new(Line(0), Column(3)), Side::Right));
+        assert_eq!(p(500., 5.), (Point::new(Line(0), Column(19)), Side::Right));
+        assert_eq!(p(-5., 25.), (Point::new(Line(1), Column(0)), Side::Left));
+        // Below the grid: to the end of the last row.
+        assert_eq!(p(32., 500.), (Point::new(Line(4), Column(19)), Side::Right));
     }
     #[test]
     fn hover_uses_the_offset_of_the_grid_it_indexes() {

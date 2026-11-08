@@ -64,7 +64,7 @@ impl App {
         } else {
             ""
         };
-        let focused = terminal::show(
+        let shown = terminal::show(
             ui,
             session,
             theme,
@@ -72,6 +72,19 @@ impl App {
             allow_input,
             search,
         );
+        // Selecting copies to the PRIMARY selection (and the clipboard with copy on
+        // select); a middle click pastes PRIMARY, through the multi-line check.
+        if let Some(text) = &shown.selected {
+            self.primary.set(text);
+            if self.state.preferences.copy_on_select {
+                ctx.copy_text(text.clone());
+            }
+        }
+        if shown.paste_primary
+            && let Some(text) = self.primary.get()
+        {
+            session.paste_or_hold(&text, self.state.preferences.confirm_multiline_paste);
+        }
         if let Some(text) = session.take_pending_paste() {
             let (lines, preview) = terminal::paste_preview(&text);
             self.pending_paste = Some(PendingPaste {
@@ -86,7 +99,7 @@ impl App {
         if let Some(error) = session.error.take() {
             self.message = error;
         }
-        focused
+        shown.clicked
     }
     /// Modal asking whether a held multi-line paste should reach the terminal.
     /// Enter pastes, Escape cancels; "Don't ask again" is saved on Paste.
