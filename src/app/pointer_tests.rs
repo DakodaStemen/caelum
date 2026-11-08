@@ -243,6 +243,63 @@ fn clicks_and_moves_batched_into_one_frame_are_not_lost() {
 }
 
 #[test]
+fn dragging_a_split_divider_leaves_the_selection_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo DIVIDER_KEEPS_ME");
+    row_of(&mut h, "DIVIDER_KEEPS_ME");
+    {
+        let ctx = h.ctx.clone();
+        let app = h.state_mut().as_mut().unwrap();
+        app.action(Action::Split(Direction::Right), &ctx);
+    }
+    for _ in 0..10 {
+        h.step();
+    }
+    let app = h.state_mut().as_mut().unwrap();
+    assert_eq!(app.terminals.len(), 2, "split opened a second terminal");
+    // The left pane is the original terminal.
+    let (id, rect) = app
+        .terminals
+        .iter()
+        .map(|(id, s)| (id.clone(), s.pane_rect().unwrap()))
+        .min_by(|x, y| x.1.left().total_cmp(&y.1.left()))
+        .unwrap();
+    let row = app.terminals[&id]
+        .text()
+        .lines()
+        .position(|l| l.starts_with("DIVIDER_KEEPS_ME"))
+        .expect("output in the left pane");
+    let cell = |h: &mut H<'_>, col: usize, fx: f32| {
+        let r = h.state_mut().as_ref().unwrap().terminals[&id]
+            .cell_rect(col, row)
+            .unwrap();
+        Pos2::new(r.left() + r.width() * fx, r.center().y)
+    };
+    let selected = |h: &mut H<'_>| h.state_mut().as_ref().unwrap().terminals[&id].selection();
+    let (a, b) = (cell(&mut h, 0, 0.2), cell(&mut h, 15, 0.8));
+    drag(&mut h, a, b);
+    assert_eq!(selected(&mut h).as_deref(), Some("DIVIDER_KEEPS_ME"));
+    // Inside the left terminal's rect, but within the divider's 3-point grab area.
+    // Dragging it left resizes the panes, which drops the selection in Alacritty,
+    // so drag along the divider instead: only the press itself is under test.
+    let grip = Pos2::new(rect.right() - 1.5, rect.center().y);
+    pause(&mut h);
+    drag(&mut h, grip, grip + Vec2::new(0., 40.));
+    assert_eq!(selected(&mut h).as_deref(), Some("DIVIDER_KEEPS_ME"));
+    // A quick click on the grab area (press and release in one frame) too.
+    pause(&mut h);
+    queue(&mut h, grip, true);
+    queue(&mut h, grip, false);
+    h.step();
+    assert_eq!(selected(&mut h).as_deref(), Some("DIVIDER_KEEPS_ME"));
+    // A click just inside the grid, clear of the divider, still clears it.
+    pause(&mut h);
+    let inside = cell(&mut h, 3, 0.5);
+    click(&mut h, inside);
+    assert_eq!(selected(&mut h), None);
+}
+
+#[test]
 fn dragging_past_the_top_scrolls_back_and_keeps_selecting() {
     let d = tempfile::tempdir().unwrap();
     let mut h = run(d.path(), "seq 1 300; echo END_OF_SEQ");

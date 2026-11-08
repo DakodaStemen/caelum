@@ -519,6 +519,10 @@ impl Session {
         lock(&self.shell).clear_marks();
         self.search_origin = None;
     }
+    /// The pane area the terminal was drawn in last frame (grid plus padding).
+    pub fn pane_rect(&self) -> Option<Rect> {
+        Some(self.metrics?.rect)
+    }
     /// Where the cell at screen `col`/`row` was drawn in the last frame.
     pub fn cell_rect(&self, col: usize, row: usize) -> Option<Rect> {
         let m = self.metrics?;
@@ -1215,12 +1219,8 @@ fn handle_selection(
             i.stable_dt,
         )
     });
-    // A press is ours when it lands on the grid and no other widget or layer
-    // (a divider, a menu, a dialog) is on top there.
-    let ours = |pos: Pos2| {
-        m.rect.contains(pos)
-            && (response.is_pointer_button_down_on() || response.contains_pointer())
-    };
+    let ours =
+        |pos: Pos2| m.rect.contains(pos) && owns_press(response, egui::PointerButton::Primary);
     let mut selected = None;
     for event in events {
         match event {
@@ -1261,6 +1261,16 @@ fn handle_selection(
         }
     }
     selected
+}
+
+/// Whether egui gave this pane the press: the button is held on it, or was already
+/// released on it in the same frame as a click or the end of a drag. Unlike
+/// `contains_pointer`, this is false for a press on a widget on top of the pane,
+/// such as a split divider's grab area, a menu or a dialog.
+fn owns_press(response: &egui::Response, button: egui::PointerButton) -> bool {
+    response.is_pointer_button_down_on()
+        || response.clicked_by(button)
+        || response.drag_stopped_by(button)
 }
 
 /// Ends the selection gesture; returns the selected text, if any.
@@ -1416,22 +1426,22 @@ fn report_mouse(ui: &egui::Ui, s: &mut Session, response: &egui::Response, m: &M
                 pressed,
                 modifiers,
             } => {
-                let Some(button) = button_code(button) else {
+                let Some(code) = button_code(button) else {
                     continue;
                 };
                 if pressed {
-                    if !response.hovered() || !m.rect.contains(pos) {
+                    if !m.rect.contains(pos) || !owns_press(response, button) {
                         continue;
                     }
-                    s.mouse.reported = Some(button);
-                } else if s.mouse.reported != Some(button) {
+                    s.mouse.reported = Some(code);
+                } else if s.mouse.reported != Some(code) {
                     continue;
                 } else {
                     s.mouse.reported = None;
                 }
                 let (col, row) = m.screen_cell(pos);
                 s.mouse.last_motion = Some((col, row));
-                let code = button + modifier_bits(modifiers);
+                let code = code + modifier_bits(modifiers);
                 if let Some(bytes) = mouse_report(code, col, row, pressed, mode) {
                     s.write(bytes);
                 }
