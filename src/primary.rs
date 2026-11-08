@@ -69,12 +69,14 @@ impl Primary {
                     .clipboard(LinuxClipboardKind::Primary)
                     .text(text);
             }
-            Inner::None => {}
+            Inner::None => {
+                let _ = text;
+            }
         }
     }
 
     pub fn get(&mut self) -> Option<String> {
-        let text = match &mut self.inner {
+        let text: Option<String> = match &mut self.inner {
             #[cfg(target_os = "linux")]
             Inner::Wayland(clipboard) => clipboard.load_primary().ok(),
             #[cfg(target_os = "linux")]

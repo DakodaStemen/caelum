@@ -285,9 +285,17 @@ fn find_window(pid: u32) -> Result<Option<Window>> {
     }
     Ok(None)
 }
+/// The tests share one X display, pointer and keyboard focus, so they take turns
+/// (cargo runs tests in parallel by default).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static DISPLAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    DISPLAY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 #[ignore = "requires an X11 desktop or Xvfb; cargo test --test desktop -- --ignored"]
 fn native_keyboard_splits_files_and_restart() -> Result<()> {
+    let _display = one_at_a_time();
     let dir = tempfile::tempdir()?;
     let profile = dir.path().join("profile");
     fs::create_dir(&profile)?;
@@ -446,6 +454,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
 #[test]
 #[ignore = "requires an X11 desktop or Xvfb and xclip; cargo test --test desktop -- --ignored"]
 fn native_mouse_selection_primary_and_paste() -> Result<()> {
+    let _display = one_at_a_time();
     const WORD: &str = "CAELUM_DRAG_OK";
     let dir = tempfile::tempdir()?;
     let profile = dir.path().join("profile");
