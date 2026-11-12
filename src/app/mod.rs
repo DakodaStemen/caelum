@@ -65,6 +65,9 @@ enum Action {
     ClearScrollback,
     PrevPrompt,
     NextPrompt,
+    /// Move focus to the neighbouring pane in this direction.
+    Focus(Direction),
+    CopyLastOutput,
 }
 /// A close awaiting the unsaved-changes check. The target is captured by id when the
 /// close is requested, so switching tabs or workspaces while "Save Changes?" is open
@@ -255,6 +258,8 @@ pub struct App {
     look_rx: Option<std::sync::mpsc::Receiver<SystemLook>>,
     look_checked: Instant,
     was_focused: bool,
+    /// Panes whose long command finished while out of sight; their tab shows a dot.
+    finished_unseen: HashSet<String>,
     /// Draw the headerbar's window controls and handle move/resize ourselves.
     csd: bool,
     /// Resolved from `look` or the windowing system each frame.
@@ -286,6 +291,12 @@ pub struct App {
     smoke: Option<Smoke>,
     recovery_conflict: bool,
     pending_open: Option<PathBuf>,
+    /// A file or directory Ctrl+clicked in terminal output, opened after the frame's layout.
+    pending_ref: Option<terminal::FileRef>,
+    /// A widget to give keyboard focus to on the next frame.
+    ctx_focus: Option<egui::Id>,
+    /// Editor panes waiting to scroll to a line (and column), by pane id.
+    goto: HashMap<String, (usize, Option<usize>)>,
     applied_font: String,
     font_rx: Option<std::sync::mpsc::Receiver<settings::MonoFaces>>,
     last_dialog: Option<String>,
@@ -387,6 +398,7 @@ impl App {
             look_rx: None,
             look_checked: Instant::now(),
             was_focused: true,
+            finished_unseen: HashSet::new(),
             csd,
             system_dark: true,
             ui_font: None,
@@ -416,6 +428,9 @@ impl App {
             }),
             recovery_conflict: false,
             pending_open: None,
+            pending_ref: None,
+            goto: HashMap::new(),
+            ctx_focus: None,
             applied_font: "__unset__".into(),
             font_rx: None,
             last_dialog: None,
@@ -508,6 +523,24 @@ impl App {
                 .map(|p| p.id().to_string())
                 .unwrap_or_default();
         }
+    }
+    /// Moves focus to the pane beside the focused one in `dir`, leaving zoom first.
+    /// Nothing happens when there is no pane that way (no wrap-around).
+    fn focus_toward(&mut self, dir: Direction) {
+        self.ensure_focus();
+        let Some(area) = self.pane_area else { return };
+        let area = model::PaneRect::new(area.left(), area.top(), area.width(), area.height());
+        let rects = self.tab().layout.leaf_rects(area, panes::GAP);
+        let Some(next) = dir.neighbour(&rects, &self.focused) else {
+            return;
+        };
+        self.zoom = None;
+        if let Some(Pane::Editor { id, .. }) = self.tab().layout.find(&next) {
+            // Keys go to the editor's text, not to the pane that had the keyboard.
+            let text_id = editor::text_id(id);
+            self.ctx_focus = Some(text_id);
+        }
+        self.focused = next;
     }
     fn request_close_workspace(&mut self) {
         self.pending = Some(PendingClose::Workspace(self.workspace().id.clone()));
@@ -633,6 +666,7 @@ impl App {
                 | Action::Palette
                 | Action::Open
                 | Action::Connect
+                | Action::Focus(_)
         );
         if reset_focus {
             ctx.memory_mut(|m| m.stop_text_input());
@@ -764,6 +798,21 @@ impl App {
                     s.clear_scrollback();
                 }
             }
+            Action::Focus(dir) => self.focus_toward(dir),
+            Action::CopyLastOutput => {
+                // Needs OSC 133 shell integration; says so when there is nothing to copy.
+                if let Some(s) = self.terminals.get_mut(&self.focused) {
+                    match s.last_output() {
+                        Some(text) => {
+                            s.copy_to_clipboard(ctx, text);
+                            if s.take_copied() {
+                                self.message = "Copied to clipboard".into();
+                            }
+                        }
+                        None => self.message = "No command output to copy yet".into(),
+                    }
+                }
+            }
             Action::PrevPrompt | Action::NextPrompt => {
                 // Needs OSC 133 shell integration; silently a no-op otherwise.
                 if let Some(s) = self.terminals.get_mut(&self.focused) {
@@ -806,6 +855,11 @@ impl App {
             ("About Caelum".into(), Action::About),
             ("Previous Prompt".into(), Action::PrevPrompt),
             ("Next Prompt".into(), Action::NextPrompt),
+            ("Focus Pane Left".into(), Action::Focus(Direction::Left)),
+            ("Focus Pane Right".into(), Action::Focus(Direction::Right)),
+            ("Focus Pane Up".into(), Action::Focus(Direction::Up)),
+            ("Focus Pane Down".into(), Action::Focus(Direction::Down)),
+            ("Copy Last Command Output".into(), Action::CopyLastOutput),
         ];
         a.push(("Theme: Follow System".into(), Action::Theme(String::new())));
         for (id, t) in &self.presets {
@@ -1027,7 +1081,9 @@ impl App {
             if picked == Some(1) || submit {
                 let value = self.dialog_input.trim().to_string();
                 match title.as_str() {
-                    "Open File" => self.open_file(PathBuf::from(value)),
+                    "Open File" => {
+                        self.open_file(PathBuf::from(value));
+                    }
                     "Rename Tab" => {
                         if !value.is_empty() {
                             self.tab_mut().name = value;
@@ -1060,8 +1116,41 @@ impl App {
         }
         if self.pending.is_some() {
             let dirty = self.dirty_in_pending();
-            if dirty.is_empty() {
+            let busy = if dirty.is_empty() {
+                self.busy_in_pending()
+            } else {
+                0
+            };
+            if dirty.is_empty() && busy == 0 {
                 self.finish_close(ctx);
+            } else if dirty.is_empty() {
+                let theme = self.theme();
+                let body = if busy == 1 {
+                    "A command is still running in this terminal. Closing it will stop the command."
+                        .to_string()
+                } else {
+                    format!(
+                        "Commands are still running in {busy} terminals. Closing will stop them."
+                    )
+                };
+                let picked = adw::alert(
+                    ctx,
+                    "busy-dialog",
+                    "Stop Running Command?",
+                    &body,
+                    &[
+                        ("Cancel", adw::Kind::Normal),
+                        ("Close", adw::Kind::Destructive),
+                    ],
+                    0,
+                    &theme,
+                    |_| {},
+                );
+                match picked {
+                    Some(0) => self.pending = None,
+                    Some(1) => self.finish_close(ctx),
+                    _ => {}
+                }
             } else {
                 let theme = self.theme();
                 let body = if dirty.len() == 1 {
@@ -1096,19 +1185,22 @@ impl App {
                             self.save_document(id);
                         }
                     }
-                    Some(1) => {
-                        for id in dirty {
-                            // A prior save may still be queued on the IO thread; cancel it
-                            // so discarding never writes. A save already running finishes
-                            // (see `DocumentIo::discard`).
-                            self.docio.discard(&id);
-                            self.documents.remove(&id);
-                        }
-                        self.finish_close(ctx);
-                    }
+                    // Discarding only drops the edits. The close stays pending, so the next
+                    // frame runs the busy-terminal check before anything is stopped.
+                    Some(1) => self.discard_documents(dirty),
                     _ => {}
                 }
             }
+        }
+    }
+    /// Drops the unsaved documents `ids` without closing anything.
+    fn discard_documents(&mut self, ids: Vec<String>) {
+        for id in ids {
+            // A prior save may still be queued on the IO thread; cancel it so
+            // discarding never writes. A save already running finishes (see
+            // `DocumentIo::discard`).
+            self.docio.discard(&id);
+            self.documents.remove(&id);
         }
     }
     fn dirty_in_pending(&self) -> Vec<String> {
@@ -1121,6 +1213,46 @@ impl App {
             .filter(|(id, doc)| closing.contains(*id) && doc.dirty())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+    /// How many terminals the pending close would kill while they run something.
+    fn busy_in_pending(&self) -> usize {
+        let Some(pending) = &self.pending else {
+            return 0;
+        };
+        busy_among(&closing_panes(&self.state, pending), |id| {
+            self.terminals.get(id).is_some_and(Session::is_busy)
+        })
+    }
+    /// A long command finishing in a pane the user is not looking at (another pane or
+    /// tab, or the window is in the background) shows the toast and marks its tab until
+    /// the pane is next seen.
+    fn announce_finished(&mut self, ctx: &egui::Context) {
+        let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let threshold = self.state.preferences.long_command_secs;
+        for (id, session) in self.terminals.iter_mut() {
+            let Some(done) = session.take_finished() else {
+                continue;
+            };
+            if (window_focused && *id == self.focused) || self.smoke.is_some() {
+                continue;
+            }
+            if let Some(notice) = finished_notice(done, threshold) {
+                self.message = notice;
+                self.finished_unseen.insert(id.clone());
+            }
+        }
+        if window_focused {
+            self.finished_unseen.remove(&self.focused);
+        }
+    }
+    /// Whether a tab holds a pane whose long command finished unseen.
+    fn tab_unseen(&self, tab: &Tab) -> bool {
+        if self.finished_unseen.is_empty() {
+            return false;
+        }
+        let mut leaves = vec![];
+        tab.layout.leaves(&mut leaves);
+        leaves.iter().any(|p| self.finished_unseen.contains(p.id()))
     }
     fn finish_close(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending.take() else {
@@ -1152,6 +1284,7 @@ impl App {
             }
         }
         self.terminals.retain(|id, _| ids.contains(id));
+        self.finished_unseen.retain(|id| ids.contains(id));
         self.documents.retain(|id, _| ids.contains(id));
         self.docio.retain(|id| ids.contains(id));
         self.files.retain(|id, _| ids.contains(id));
@@ -1384,11 +1517,18 @@ impl App {
         }
         self.poll_look(ctx);
         self.shortcuts(ctx);
+        if let Some(id) = self.ctx_focus.take() {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
         self.apply_font(ctx);
         let theme = self.theme();
+        // Every session, drawn or not, sees the current clipboard-write preference
+        // before it is polled (a hidden tab must not honour a switched-off setting).
         for session in self.terminals.values_mut() {
+            session.set_osc52_write(self.state.preferences.osc52_write);
             session.poll(&theme);
         }
+        self.announce_finished(ctx);
         if theme.validate().is_ok() {
             theme.apply(ctx, self.ui_font_size());
         }
@@ -1420,6 +1560,9 @@ impl App {
         }
         if let Some(path) = self.pending_open.take() {
             self.open_file(path);
+        }
+        if let Some(target) = self.pending_ref.take() {
+            self.open_ref(target);
         }
         self.overlays(ctx);
         self.about_dialog(ctx, &theme);
@@ -1546,6 +1689,11 @@ fn shortcut_table() -> Vec<(&'static str, Action)> {
         ("select_all", Action::SelectAll),
         ("prev_prompt", Action::PrevPrompt),
         ("next_prompt", Action::NextPrompt),
+        ("focus_left", Action::Focus(Direction::Left)),
+        ("focus_right", Action::Focus(Direction::Right)),
+        ("focus_up", Action::Focus(Direction::Up)),
+        ("focus_down", Action::Focus(Direction::Down)),
+        ("copy_last_output", Action::CopyLastOutput),
     ]
 }
 
@@ -1586,6 +1734,31 @@ fn closing_panes(state: &State, pending: &PendingClose) -> HashSet<String> {
         layout.leaves(&mut leaves);
     }
     leaves.into_iter().map(|p| p.id().to_string()).collect()
+}
+/// How many of the `closing` panes are `busy`; idle shells at a prompt close silently.
+fn busy_among(closing: &HashSet<String>, busy: impl Fn(&str) -> bool) -> usize {
+    closing.iter().filter(|id| busy(id)).count()
+}
+/// "18s", "2m 5s", "1h 2m": a command's run time for the finished notice.
+fn format_elapsed(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+/// The notice for a command that finished while the user was elsewhere, if it ran
+/// long enough (`threshold` seconds; 0 turns it off).
+fn finished_notice(f: terminal::Finished, threshold: u64) -> Option<String> {
+    let secs = f.elapsed.as_secs();
+    if threshold == 0 || secs < threshold {
+        return None;
+    }
+    let time = format_elapsed(secs);
+    Some(match f.code {
+        Some(code) if code != 0 => format!("Command failed (exit {code}) after {time}"),
+        _ => format!("Command finished in {time}"),
+    })
 }
 fn find_tab<'a>(state: &'a State, workspace: &str, tab: &str) -> Option<&'a Tab> {
     state
@@ -1678,6 +1851,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_command_notice_follows_the_threshold_and_exit_status() {
+        use std::time::Duration as D;
+        let done = |secs, code| terminal::Finished {
+            elapsed: D::from_secs(secs),
+            code,
+        };
+        assert_eq!(finished_notice(done(9, Some(0)), 10), None);
+        assert_eq!(
+            finished_notice(done(18, Some(0)), 10).as_deref(),
+            Some("Command finished in 18s")
+        );
+        assert_eq!(
+            finished_notice(done(12, Some(1)), 10).as_deref(),
+            Some("Command failed (exit 1) after 12s")
+        );
+        assert_eq!(
+            finished_notice(done(10, None), 10).as_deref(),
+            Some("Command finished in 10s")
+        );
+        assert_eq!(
+            finished_notice(done(999, Some(0)), 0),
+            None,
+            "0 turns it off"
+        );
+        assert_eq!(
+            finished_notice(done(3, Some(0)), 2).as_deref(),
+            Some("Command finished in 3s")
+        );
+        assert_eq!(format_elapsed(125), "2m 5s");
+        assert_eq!(format_elapsed(3720), "1h 2m");
+    }
+    #[test]
+    fn only_busy_terminals_need_a_close_confirmation() {
+        let closing: HashSet<String> = ["idle", "busy", "files"].map(String::from).into();
+        assert_eq!(busy_among(&closing, |id| id == "busy"), 1);
+        assert_eq!(busy_among(&closing, |_| false), 0);
+        assert_eq!(busy_among(&closing, |id| id != "files"), 2);
+        assert_eq!(busy_among(&HashSet::new(), |_| true), 0);
+    }
+    #[test]
     fn every_configurable_action_is_dispatched() {
         let wired: Vec<&str> = shortcut_table().into_iter().map(|(n, _)| n).collect();
         for (name, _) in config::ACTIONS {
@@ -1757,6 +1970,40 @@ mod tests {
         assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
         assert!(has_tab(&app, &b));
         assert!(app.documents[&editor].dirty());
+    }
+    /// "Discard" in the unsaved-edits dialog used to close straight away, killing a
+    /// running command in the same close. It must fall through to the busy check.
+    #[cfg(unix)]
+    #[test]
+    fn discarding_edits_still_asks_before_stopping_a_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _ctx, _b, editor) = app_with_dirty_background_tab(dir.path());
+        let mut leaves = vec![];
+        app.workspace().tabs[0].layout.leaves(&mut leaves);
+        let terminal = leaves
+            .iter()
+            .find(|p| matches!(p, Pane::Terminal { .. }))
+            .map(|p| p.id().to_string())
+            .expect("tab A has a terminal");
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let session =
+            caelum_rs::terminal::Session::spawn(dir.path(), Some(&argv), egui::Context::default())
+                .unwrap();
+        // The shell integration reports a command in progress.
+        session.shell.lock().unwrap().running = true;
+        app.terminals.insert(terminal, session);
+        app.pending = Some(PendingClose::Window);
+        // Step 1 of the close flow: unsaved edits come first, and busy is not asked yet.
+        assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
+        assert_eq!(app.busy_in_pending(), 1);
+        // The user picks Discard.
+        app.discard_documents(vec![editor]);
+        assert!(app.dirty_in_pending().is_empty());
+        assert!(
+            app.pending.is_some(),
+            "Discard must not complete the close: the running command was never confirmed"
+        );
+        assert_eq!(app.busy_in_pending(), 1, "next step asks about the command");
     }
     #[test]
     fn switching_tabs_during_save_changes_does_not_redirect_the_close() {

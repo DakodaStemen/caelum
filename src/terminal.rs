@@ -1,7 +1,7 @@
 //! PTY ownership, terminal emulation and input translation. The UI never blocks on PTY I/O.
 use crate::{
     model::Preferences,
-    osc::{OscEvent, OscScanner},
+    osc::{OscEvent, OscGuard, OscScanner},
     theme::Theme,
 };
 use alacritty_terminal::{
@@ -9,7 +9,7 @@ use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
-    term::{Config, Term, TermMode},
+    term::{ClipboardType, Config, Osc52, Term, TermMode},
     vte::ansi::{self, Color, NamedColor},
 };
 #[cfg_attr(not(unix), allow(unused_imports))]
@@ -26,7 +26,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 /// Terminal events forwarded from the parser thread to the UI thread.
 ///
@@ -40,23 +40,42 @@ use std::{
 pub struct Events {
     tx: SyncSender<Event>,
     title: Arc<Mutex<Option<String>>>,
+    /// Whether programs may set the clipboard (OSC 52); read on the PTY thread, so a
+    /// refused write is dropped before it is queued.
+    osc52: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<ClipWrite>>>,
 }
+/// The newest OSC 52 write waiting for the UI: the text, or the size of one refused
+/// for being too large.
+type ClipWrite = Result<String, usize>;
 /// UI-side end of [`Events`].
 struct EventQueue {
     rx: Receiver<Event>,
     title: Arc<Mutex<Option<String>>>,
+    osc52: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<ClipWrite>>>,
 }
 const EVENT_QUEUE: usize = 1024;
 impl Events {
     fn new() -> (Self, EventQueue) {
         let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE);
         let title = Arc::new(Mutex::new(None));
+        // Off until the owner says otherwise: nothing is written before the preference is known.
+        let osc52 = Arc::new(AtomicBool::new(false));
+        let clipboard = Arc::new(Mutex::new(None));
         (
             Self {
                 tx,
                 title: title.clone(),
+                osc52: osc52.clone(),
+                clipboard: clipboard.clone(),
             },
-            EventQueue { rx, title },
+            EventQueue {
+                rx,
+                title,
+                osc52,
+                clipboard,
+            },
         )
     }
 }
@@ -68,10 +87,34 @@ impl EventListener for Events {
             Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) => {
                 let _ = self.tx.try_send(event);
             }
-            // Everything else (wakeups, bells, clipboard requests, ...) is ignored by the UI.
+            // OSC 52 writes only. Reads (`ClipboardLoad`) are never forwarded, so a
+            // program cannot see the clipboard. A refused or oversized write never
+            // reaches the queue, and only the newest accepted one is kept, so a flood
+            // of them holds at most one payload.
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                match osc52_accepts(self.osc52.load(Ordering::Relaxed), &text) {
+                    Ok(true) => *lock(&self.clipboard) = Some(Ok(text)),
+                    Ok(false) => {}
+                    Err(n) => *lock(&self.clipboard) = Some(Err(n)),
+                }
+            }
+            // Everything else (wakeups, bells, reads, the PRIMARY selection, ...) is ignored.
             _ => {}
         }
     }
+}
+/// Largest OSC 52 clipboard write that is honoured.
+pub const OSC52_MAX_BYTES: usize = 1024 * 1024;
+/// Whether a program's OSC 52 write of `text` may reach the clipboard: the setting
+/// is on, the text is not empty and it is within [`OSC52_MAX_BYTES`].
+fn osc52_accepts(enabled: bool, text: &str) -> Result<bool, usize> {
+    if !enabled || text.is_empty() {
+        return Ok(false);
+    }
+    if text.len() > OSC52_MAX_BYTES {
+        return Err(text.len());
+    }
+    Ok(true)
 }
 const DEFAULT_TITLE: &str = "Terminal";
 const MAX_TITLE_CHARS: usize = 100;
@@ -133,11 +176,84 @@ pub struct ShellState {
     /// True between OSC 133;C and OSC 133;D.
     pub running: bool,
     last_history: usize,
+    /// When the running command's output began (OSC 133;C).
+    started: Option<Instant>,
+    /// Absolute line where the running command's output began.
+    output_start: Option<i64>,
+    /// A prompt was drawn (OSC 133;A) and no command has been submitted since.
+    at_prompt: bool,
+    /// The running command's start was inferred from the user pressing Enter at the
+    /// prompt, not reported by the shell (OSC 133;C). A real C replaces it.
+    inferred: bool,
+    /// Absolute line span `start..end` of the last finished command's output, and, when
+    /// its last line had no trailing newline, the last column that output filled (the
+    /// next prompt is drawn after it on that same line and must not be copied).
+    output: Option<(i64, i64, Option<usize>)>,
+    /// A command that just finished, until [`Session::take_finished`] collects it.
+    finished: Option<Finished>,
+}
+/// A command that ran from OSC 133;C to OSC 133;D.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Finished {
+    pub elapsed: Duration,
+    /// Exit status, if the shell reported one.
+    pub code: Option<i32>,
 }
 impl ShellState {
     fn clear_marks(&mut self) {
         self.marks.clear();
+        // Output spans are absolute line numbers too.
+        self.output_start = None;
+        self.output = None;
     }
+    /// The user submitted a line at the prompt: for a shell that sends OSC 133;A/D but
+    /// never 133;C (bash before 4.4 has no PS0), this is the only command-start signal.
+    /// Ignored outside a prompt (a running command, a TUI, the alt screen); a real
+    /// 133;C arriving later overrides it. `cursor` is the absolute cursor line and
+    /// `alt_screen` whether the alternate screen is active, both at submission, so a
+    /// command line the terminal wrapped puts the output after its last row.
+    /// Known limits of the inferred start (no 133;C): it is taken when Enter is written,
+    /// so a command line that wraps, or was submitted with the cursor off its last row,
+    /// can leave the tail of that line in the copied output; and PS2 continuation lines
+    /// of a multi-line command can be copied too. An empty Enter is detected at 133;D
+    /// (empty inferred span) and leaves the previous output alone.
+    fn submit(&mut self, cursor: i64, alt_screen: bool) {
+        if !self.at_prompt || self.running || alt_screen {
+            return;
+        }
+        self.at_prompt = false;
+        self.running = true;
+        self.inferred = true;
+        self.started = Some(Instant::now());
+        self.output_start = Some(cursor + 1);
+    }
+}
+/// Whether bytes typed or pasted by the user submit the line being edited: a bare CR
+/// or LF (Enter, Ctrl+J, an unbracketed multi-line paste) outside a bracketed paste,
+/// whose newlines are text for the editor. `ESC CR` (Alt+Enter) is not Enter.
+fn submits_line(bytes: &[u8]) -> bool {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(START) {
+            let body = i + START.len();
+            match bytes[body..].windows(END.len()).position(|w| w == END) {
+                Some(at) => i = body + at + END.len(),
+                None => return false,
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\r' | b'\n') && (i == 0 || bytes[i - 1] != 0x1b) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+/// Absolute index of the cursor's line (0 = oldest scrollback line).
+fn cursor_abs(term: &Term<Events>) -> i64 {
+    term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0)
 }
 fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
     match event {
@@ -152,13 +268,88 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
             if shell.marks.last() != Some(&abs) {
                 shell.marks.push(abs);
             }
+            shell.at_prompt = true;
         }
-        OscEvent::OutputStart => shell.running = true,
+        OscEvent::OutputStart => {
+            shell.running = true;
+            shell.inferred = false;
+            shell.at_prompt = false;
+            shell.started = Some(Instant::now());
+            // Output starts on the line below the command the user typed.
+            shell.output_start =
+                (!term.mode().contains(TermMode::ALT_SCREEN)).then(|| cursor_abs(term));
+        }
         OscEvent::CommandEnd(code) => {
+            let was_running = shell.running;
+            let inferred = shell.inferred;
+            // An inferred start with no output is most likely an empty Enter: keep the
+            // previous output. Its finished record stays (a silent slow command must
+            // still reach the long-command notice; an instant one is under the threshold).
             shell.running = false;
+            shell.inferred = false;
+            shell.at_prompt = false;
             shell.last_exit = code;
+            if let Some(start) = shell.output_start.take()
+                && !term.mode().contains(TermMode::ALT_SCREEN)
+            {
+                // The cursor sits at the start of the line after the output, unless the
+                // output did not end in a newline; then its last line is the cursor's.
+                // Output that exactly fills a row leaves the cursor on that row's last
+                // column with a wrap pending (`input_needs_wrap`): the last character is
+                // then *at* the cursor column, not before it.
+                let cursor = cursor_abs(term);
+                let column = term.grid().cursor.point.column.0;
+                let (end, last_col) = if term.grid().cursor.input_needs_wrap {
+                    (cursor + 1, Some(column))
+                } else if column == 0 {
+                    (cursor, None)
+                } else {
+                    (cursor + 1, Some(column - 1))
+                };
+                if !(inferred && end <= start) {
+                    shell.output = (end > start).then_some((start, end, last_col));
+                }
+            }
+            if let Some(started) = shell.started.take()
+                && was_running
+            {
+                shell.finished = Some(Finished {
+                    elapsed: started.elapsed(),
+                    code,
+                });
+            }
         }
     }
+}
+/// Where the shell integration scripts live and how to start `shell` with them, or
+/// `None` when the shell is unknown or the scripts cannot be written (the terminal
+/// then simply starts without integration).
+fn shell_injection(shell: &str) -> Option<crate::shell_integration::Injection> {
+    let root = crate::shell_integration::dir_in(&crate::platform::default_profile_dir());
+    crate::shell_integration::install(&root).ok()?;
+    crate::shell_integration::plan(shell, &root, &|k| std::env::var(k).ok())
+}
+/// Text of the absolute line span `start..end` (end exclusive), if it is still on the
+/// grid. With `last_col`, the last line is cut after that column.
+fn output_text(
+    term: &Term<Events>,
+    start: i64,
+    end: i64,
+    last_col: Option<usize>,
+) -> Option<String> {
+    let history = term.grid().history_size() as i64;
+    let (first, last) = (start - history, end - 1 - history);
+    if end <= start || first < -history || last >= term.screen_lines() as i64 {
+        return None;
+    }
+    let text = term.bounds_to_string(
+        Point::new(Line(first as i32), Column(0)),
+        Point::new(
+            Line(last as i32),
+            last_col.map_or(term.last_column(), |c| Column(c).min(term.last_column())),
+        ),
+    );
+    Some(text.trim_end_matches('\n').to_string())
 }
 /// Absolute indexes drift once Alacritty starts discarding old scrollback, so marks
 /// are dropped when history is truncated or full instead of pointing at wrong lines.
@@ -196,6 +387,16 @@ pub struct Session {
     focus_reported: Option<bool>,
     /// Text was copied to the clipboard since the app last asked (for the toast).
     copied: bool,
+    /// Output arrived while the view was scrolled back (for the scroll-to-bottom pill).
+    unseen_output: bool,
+    /// Last history size and display offset seen, to tell new output from scrolling.
+    last_history: usize,
+    /// Directories may be opened from a Ctrl+click (a file browser pane exists).
+    pub dir_links: bool,
+    /// Background lookup of path text hovered with Ctrl held.
+    probe: PathProbe,
+    /// Launched as `ssh`/`codex`/`claude` rather than a shell.
+    runs_program: bool,
     wake: egui::Context,
     /// Test hook: when set, the cleanup thread waits for a message before doing any
     /// work, so a test can prove `drop` returns while cleanup has not yet run.
@@ -204,6 +405,19 @@ pub struct Session {
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
+        Self::spawn_with(cwd, argv, ctx, true, true)
+    }
+    /// Starts a session. With `integrate`, the user's shell (when `argv` is `None`) is
+    /// launched so it emits OSC 7 / OSC 133 without any dotfile edits; see
+    /// [`crate::shell_integration`]. `osc52` is the clipboard-write preference in force
+    /// from the first byte of output; keep it current with [`Session::set_osc52_write`].
+    pub fn spawn_with(
+        cwd: &Path,
+        argv: Option<&[String]>,
+        ctx: egui::Context,
+        integrate: bool,
+        osc52: bool,
+    ) -> Result<Self> {
         let cwd = if cwd.is_dir() {
             cwd.to_path_buf()
         } else {
@@ -224,9 +438,22 @@ impl Session {
             c
         } else {
             let mut c = CommandBuilder::new(&shell);
-            c.args(crate::platform::shell_args(&shell));
+            let injection = integrate.then(|| shell_injection(&shell)).flatten();
+            match injection.as_ref().and_then(|i| i.args.as_ref()) {
+                Some(args) => c.args(args),
+                None => c.args(crate::platform::shell_args(&shell)),
+            };
+            if let Some(i) = injection {
+                for (k, v) in i.env {
+                    c.env(k, v);
+                }
+            }
             c
         };
+        // These panes are the program itself, not a shell: closing one stops real work.
+        let runs_program = argv
+            .and_then(|a| a.first())
+            .is_some_and(|p| matches!(p.as_str(), "ssh" | "codex" | "claude"));
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -264,6 +491,7 @@ impl Session {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let (listener, events) = Events::new();
+        events.osc52.store(osc52, Ordering::Relaxed);
         let term = Arc::new(Mutex::new(Term::new(term_config(), &size, listener)));
         let stop = Arc::new(AtomicBool::new(false));
         let read_stop = stop.clone();
@@ -306,6 +534,11 @@ impl Session {
             metrics: None,
             focus_reported: None,
             copied: false,
+            unseen_output: false,
+            last_history: 0,
+            dir_links: false,
+            probe: PathProbe::new(ctx.clone()),
+            runs_program,
             wake: ctx,
             #[cfg(test)]
             cleanup_gate: None,
@@ -344,7 +577,18 @@ impl Session {
     /// Writes a paste to the PTY now, bracketed if the program enabled it.
     pub fn paste(&mut self, text: &str) {
         let bracketed = self.bracketed_paste();
-        self.write(paste_bytes(text, bracketed));
+        self.write_input(paste_bytes(text, bracketed));
+    }
+    /// Writes what the user typed or pasted. Unlike [`Session::write`] (also used for
+    /// terminal replies and mouse reports) this notices Enter at a shell prompt, which
+    /// marks the command start for shells that never send OSC 133;C.
+    pub fn write_input(&mut self, bytes: Vec<u8>) {
+        if submits_line(&bytes) {
+            let term = lock(&self.term);
+            let alt = term.mode().contains(TermMode::ALT_SCREEN);
+            lock(&self.shell).submit(cursor_abs(&term), alt);
+        }
+        self.write(bytes);
     }
     /// Pastes like [`Session::paste`], unless [`needs_confirm`] says the user should
     /// see it first; then it is held until [`Session::take_pending_paste`].
@@ -364,6 +608,40 @@ impl Session {
             ctx.copy_text(text);
             self.copied = true;
         }
+    }
+    /// The text of the last finished command's output (OSC 133 C to D), if the shell
+    /// integration reported one and it is still in the scrollback.
+    pub fn last_output(&self) -> Option<String> {
+        let term = lock(&self.term);
+        let (start, end, last_col) = lock(&self.shell).output?;
+        output_text(&term, start, end, last_col).filter(|t| !t.is_empty())
+    }
+    /// The command that finished since the last call, if any.
+    pub fn take_finished(&mut self) -> Option<Finished> {
+        lock(&self.shell).finished.take()
+    }
+    /// Whether closing this pane would stop something the user is running: a command
+    /// the shell integration reports, a foreground job other than the shell itself,
+    /// or an `ssh`/`codex`/`claude` session. An idle shell at a prompt is not busy.
+    pub fn is_busy(&self) -> bool {
+        if self.exited {
+            return false;
+        }
+        if self.runs_program || lock(&self.shell).running {
+            return true;
+        }
+        #[cfg(unix)]
+        if let (Some(master), Some(pid)) = (&self.master, self.pid())
+            && let Some(fg) = master.process_group_leader()
+        {
+            return fg > 0 && fg as u32 != pid;
+        }
+        false
+    }
+    /// Whether programs in this pane may set the clipboard (OSC 52). Takes effect for
+    /// output the reader has not yet parsed; call it for every session before polling.
+    pub fn set_osc52_write(&self, on: bool) {
+        self.events.osc52.store(on, Ordering::Relaxed);
     }
     /// Whether text was copied since the last call.
     pub fn take_copied(&mut self) -> bool {
@@ -404,9 +682,26 @@ impl Session {
                     })
                     .into_bytes(),
                 ),
-                // Clipboard escape sequences are deliberately not granted automatic clipboard access.
                 _ => {}
             }
+        }
+        // OSC 52 is write-only: the clipboard can be set but never read back. The
+        // preference is re-checked here, so a write queued just before the user turned
+        // it off is dropped too.
+        let pending = lock(&self.events.clipboard).take();
+        match pending {
+            Some(Ok(text)) if self.events.osc52.load(Ordering::Relaxed) => {
+                let ctx = self.wake.clone();
+                self.copy_to_clipboard(&ctx, text);
+            }
+            Some(Err(n)) if self.events.osc52.load(Ordering::Relaxed) => {
+                self.error = Some(format!(
+                    "Ignored a {} KiB clipboard write (limit {} KiB)",
+                    n / 1024,
+                    OSC52_MAX_BYTES / 1024
+                ));
+            }
+            _ => {}
         }
         if !self.exited
             && let Some(child) = &mut self.child
@@ -428,6 +723,34 @@ impl Session {
         {
             self.cwd = cwd;
         }
+    }
+    /// Notes output that arrived while the view is scrolled back, and forgets it
+    /// once the view is at the bottom again.
+    fn track_unseen_output(&mut self) {
+        let (history, offset) = {
+            let term = lock(&self.term);
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        if offset == 0 {
+            self.unseen_output = false;
+        } else if history != self.last_history {
+            self.unseen_output = true;
+        }
+        self.last_history = history;
+    }
+    /// Whether the view is scrolled back from the live bottom of the terminal.
+    pub fn scrolled_back(&self) -> bool {
+        lock(&self.term).grid().display_offset() > 0
+    }
+    /// Whether output arrived while the view was scrolled back.
+    pub fn has_unseen_output(&self) -> bool {
+        self.unseen_output
+    }
+    /// Where the "scroll to bottom" pill is drawn (only while scrolled back), once
+    /// the pane has been drawn.
+    pub fn scroll_pill_rect(&self) -> Option<Rect> {
+        let m = self.metrics.as_ref()?;
+        self.scrolled_back().then(|| pill_rect(m.rect))
     }
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let size = Size {
@@ -561,6 +884,7 @@ fn read_loop(
 ) {
     let mut parser: ansi::Processor = ansi::Processor::new();
     let mut scanner = OscScanner::default();
+    let mut guard = OscGuard::new();
     let mut bytes = [0; 16384];
     while !stop.load(Ordering::Relaxed) {
         match reader.read(&mut bytes) {
@@ -572,11 +896,11 @@ fn read_loop(
                     let mut shell = lock(&shell);
                     let mut done = 0;
                     for (end, event) in events {
-                        parser.advance(&mut *t, &bytes[done..end]);
+                        parser.advance(&mut *t, &guard.filter(&bytes[done..end]));
                         done = end;
                         apply_osc(&t, &mut shell, event);
                     }
-                    parser.advance(&mut *t, &bytes[done..n]);
+                    parser.advance(&mut *t, &guard.filter(&bytes[done..n]));
                     reconcile_marks(&t, &mut shell);
                 }
                 ctx.request_repaint();
@@ -1042,6 +1366,8 @@ struct Mouse {
 fn term_config() -> Config {
     Config {
         semantic_escape_chars: ",│`|\"' ()[]{}<>\t".into(),
+        // Programs may set the clipboard but never read it back.
+        osc52: Osc52::OnlyCopy,
         ..Config::default()
     }
 }
@@ -1111,6 +1437,8 @@ pub struct Shown {
     pub selected: Option<String>,
     /// A middle click asked to paste the PRIMARY selection.
     pub paste_primary: bool,
+    /// A Ctrl+click on a local file or directory named in the output.
+    pub open_file: Option<FileRef>,
 }
 
 pub fn show(
@@ -1145,7 +1473,8 @@ pub fn show(
     }
     shown.selected = handle_selection(ui, s, &response, &m, pointer);
     shown.paste_primary = !pointer.forwards_to_program() && response.middle_clicked();
-    let link = handle_links(ui, s, &response, &m, pointer);
+    let (link, open_file) = handle_links(ui, s, &response, &m, pointer);
+    shown.open_file = open_file;
     handle_scroll(ui, s, &response, &m, pointer);
     if focused && !blocked && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
         handle_events(ui, s, prefs);
@@ -1158,6 +1487,7 @@ pub fn show(
     );
     paint_exit_badge(s, theme, prefs, &painter, m.rect);
     paint_scroll_indicator(ui, s, theme, &painter, &response, m.rect);
+    scroll_pill(ui, s, theme, m.rect);
     if ui.input(|i| !i.raw.hovered_files.is_empty()) && response.contains_pointer() {
         painter.rect_stroke(
             m.rect.shrink(1.),
@@ -1189,7 +1519,9 @@ fn layout(
     ui.painter_at(rect)
         .rect_filled(rect, 0., theme.term("background"));
     s.resize((area.width() / cw) as usize, (area.height() / ch) as usize);
+    s.set_osc52_write(prefs.osc52_write);
     s.poll(theme);
+    s.track_unseen_output();
     let m = Metrics {
         rect,
         area,
@@ -1513,32 +1845,198 @@ fn link_at(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<String> {
         .map(|link| link.uri().to_string())
 }
 
-/// A link under the pointer: an OSC 8 hyperlink, or a URL written as plain text
-/// together with the cells it covers (to underline it).
+/// A local file or directory named in terminal text, as `path`, `path:line` or
+/// `path:line:col` (compiler errors, `rg`, tracebacks), resolved against the
+/// session's working directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRef {
+    pub path: PathBuf,
+    /// 1-based line and column to scroll to, when the text gave them.
+    pub line: Option<usize>,
+    pub col: Option<usize>,
+    pub is_dir: bool,
+}
+
+/// A link under the pointer: an OSC 8 hyperlink, a URL written as plain text, or a
+/// path to an existing local file, together with the cells it covers (to underline it).
 struct Link {
     uri: String,
     span: Option<(Point, Point)>,
+    file: Option<FileRef>,
 }
 
-fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<Link> {
+/// `paths` is `Some` only when the user asked for file links (Ctrl held); without it
+/// no path text is ever looked up, so plain hovering never costs a filesystem call.
+fn link_under(
+    term: &Term<Events>,
+    m: &Metrics,
+    pos: Pos2,
+    paths: Option<&PathScan>,
+) -> Option<Link> {
     if let Some(uri) = link_at(term, m, pos) {
-        return Some(Link { uri, span: None });
+        return Some(Link {
+            uri,
+            span: None,
+            file: None,
+        });
     }
-    let (uri, start, end) = url_at(term, m.grid_point(term, pos))?;
+    let point = m.grid_point(term, pos);
+    if let Some((uri, start, end)) = url_at(term, point) {
+        return Some(Link {
+            uri,
+            span: Some((start, end)),
+            file: None,
+        });
+    }
+    let (file, start, end) = path_at(term, point, paths?)?;
     Some(Link {
-        uri,
+        uri: file.path.display().to_string(),
         span: Some((start, end)),
+        file: Some(file),
     })
 }
 
-/// The web URL written in the text at `point` (following wrapped lines), with its
-/// first and last cells.
-fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
+/// What a background lookup of path text is keyed by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProbeKey {
+    cwd: PathBuf,
+    home: PathBuf,
+    text: String,
+    dirs: bool,
+}
+/// `(path, is_dir)` of an existing file, or `None`.
+type Probed = Option<(PathBuf, bool)>;
+type Resolver = Arc<dyn Fn(&ProbeKey) -> Probed + Send + Sync>;
+/// Result of asking the probe about a path.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Ready(Probed),
+    /// Not known yet; the lookup runs on a worker thread and repaints when done.
+    Pending,
+}
+const PROBE_TTL: Duration = Duration::from_secs(3);
+const PROBE_MAX_INFLIGHT: usize = 4;
+const PROBE_MAX_CACHED: usize = 256;
+#[derive(Default)]
+struct ProbeState {
+    done: std::collections::HashMap<ProbeKey, (Instant, Probed)>,
+    inflight: std::collections::HashSet<ProbeKey>,
+}
+/// Answers "does this path text name an existing file?" without ever touching the
+/// filesystem on the calling (UI) thread: lookups run on short-lived worker threads
+/// (at most [`PROBE_MAX_INFLIGHT`], so a stalled NFS/FUSE mount can hold only a few
+/// and the window never waits for it), and results are cached for a few seconds, per
+/// (directory, text), so hovering the same token costs one lookup.
+#[derive(Clone)]
+struct PathProbe {
+    resolver: Resolver,
+    state: Arc<Mutex<ProbeState>>,
+    wake: egui::Context,
+}
+impl PathProbe {
+    fn new(wake: egui::Context) -> Self {
+        Self::with_resolver(
+            wake,
+            Arc::new(|k: &ProbeKey| {
+                let files = FileLookup {
+                    cwd: &k.cwd,
+                    home: k.home.clone(),
+                    dirs: k.dirs,
+                };
+                resolve_file_ref(&k.text, None, None, &files).map(|f| (f.path, f.is_dir))
+            }),
+        )
+    }
+    fn with_resolver(wake: egui::Context, resolver: Resolver) -> Self {
+        Self {
+            resolver,
+            state: Arc::default(),
+            wake,
+        }
+    }
+    /// Never blocks on the resolver. An expired cached answer is returned while a
+    /// refresh runs, so a link does not flicker off every few seconds.
+    fn lookup(&self, key: &ProbeKey) -> Probe {
+        let mut st = lock(&self.state);
+        let cached = st.done.get(key).cloned();
+        if let Some((at, r)) = &cached
+            && at.elapsed() < PROBE_TTL
+        {
+            return Probe::Ready(r.clone());
+        }
+        let stale = cached.map(|(_, r)| Probe::Ready(r));
+        if st.inflight.contains(key) || st.inflight.len() >= PROBE_MAX_INFLIGHT {
+            return stale.unwrap_or(Probe::Pending);
+        }
+        st.inflight.insert(key.clone());
+        drop(st);
+        let (resolver, state, wake, k) = (
+            self.resolver.clone(),
+            self.state.clone(),
+            self.wake.clone(),
+            key.clone(),
+        );
+        let spawned = thread::Builder::new()
+            .name("link-probe".into())
+            .spawn(move || {
+                let result = resolver(&k);
+                let mut st = lock(&state);
+                st.inflight.remove(&k);
+                if st.done.len() >= PROBE_MAX_CACHED {
+                    st.done.clear();
+                }
+                st.done.insert(k, (Instant::now(), result));
+                drop(st);
+                wake.request_repaint();
+            });
+        if spawned.is_err() {
+            lock(&self.state).inflight.remove(key);
+        }
+        stale.unwrap_or(Probe::Pending)
+    }
+}
+/// Everything needed to turn path text under the pointer into a [`FileRef`].
+struct PathScan<'a> {
+    probe: &'a PathProbe,
+    cwd: &'a Path,
+    home: PathBuf,
+    dirs: bool,
+}
+impl PathScan<'_> {
+    fn resolve(&self, text: &str, line: Option<usize>, col: Option<usize>) -> Option<FileRef> {
+        let key = ProbeKey {
+            cwd: self.cwd.to_path_buf(),
+            home: self.home.clone(),
+            text: text.to_string(),
+            dirs: self.dirs,
+        };
+        let Probe::Ready(Some((path, is_dir))) = self.probe.lookup(&key) else {
+            return None;
+        };
+        Some(FileRef {
+            path,
+            line: line.map(|n| n.max(1)),
+            col: col.map(|n| n.max(1)),
+            is_dir,
+        })
+    }
+}
+
+/// What paths in terminal text are resolved against.
+struct FileLookup<'a> {
+    cwd: &'a Path,
+    home: PathBuf,
+    /// Whether a directory is worth linking (a file browser pane can show it).
+    dirs: bool,
+}
+
+/// The cells of the (soft-wrapped) text around `point`, without wide-character
+/// spacers, bounded so scanning a wrapped line every frame stays cheap.
+fn text_cells(term: &Term<Events>, point: Point) -> Vec<(char, Point)> {
     use alacritty_terminal::term::cell::Flags;
     let grid = term.grid();
     let last = term.last_column();
     let wraps = |line: Line| grid[Point::new(line, last)].flags.contains(Flags::WRAPLINE);
-    // Bounded so a screen of one wrapped line stays cheap to scan every frame.
     let (mut top, mut bottom) = (point.line, point.line);
     while top > term.topmost_line() && wraps(top - 1) && point.line - top < 16 {
         top -= 1;
@@ -1559,6 +2057,13 @@ fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
             }
         }
     }
+    cells
+}
+
+/// The web URL written in the text at `point` (following wrapped lines), with its
+/// first and last cells.
+fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
+    let cells = text_cells(term, point);
     let at = cells.iter().rposition(|(_, p)| *p <= point)?;
     let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
     let (from, to) = find_urls(&chars)
@@ -1569,6 +2074,176 @@ fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
         cells[from].1,
         cells[to - 1].1,
     ))
+}
+
+/// The existing local file written in the text at `point`, with its first and last cells.
+fn path_at(term: &Term<Events>, point: Point, paths: &PathScan) -> Option<(FileRef, Point, Point)> {
+    let cells = text_cells(term, point);
+    let at = cells.iter().rposition(|(_, p)| *p <= point)?;
+    let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
+    // Only the token under the pointer is looked at (and statted), not the line.
+    let found = find_path_tokens(&chars)
+        .into_iter()
+        .find(|t| (t.from..t.to).contains(&at))?;
+    let file = paths.resolve(&found.text, found.line, found.col)?;
+    Some((file, cells[found.from].1, cells[found.to - 1].1))
+}
+
+/// A candidate path in a run of text: its character range, the path text and any
+/// line and column that followed it.
+#[derive(Debug, PartialEq, Eq)]
+struct PathToken {
+    from: usize,
+    to: usize,
+    text: String,
+    line: Option<usize>,
+    col: Option<usize>,
+}
+
+/// Characters that end a path token: space, quotes, brackets and box drawing.
+fn ends_path(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | ','
+                | ';'
+                | '│'
+        )
+}
+
+/// Splits `text` into tokens that might name a file. The existence check, which
+/// needs the disk and a working directory, is [`resolve_file_ref`]'s job.
+fn find_path_tokens(text: &[char]) -> Vec<PathToken> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if ends_path(text[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len() && !ends_path(text[i]) {
+            i += 1;
+        }
+        let mut end = i;
+        // Prose punctuation after the path is not part of it.
+        while end > start && matches!(text[end - 1], '.' | ':' | '!' | '?' | '*' | '=') {
+            end -= 1;
+        }
+        let token: String = text[start..end].iter().collect();
+        let Some((path, mut line, col, used)) = split_line_col(&token) else {
+            continue;
+        };
+        let end = start + token[..used].chars().count();
+        if token.starts_with("http://") || token.starts_with("https://") {
+            continue;
+        }
+        if !looks_like_path(&path, line.is_some()) {
+            continue;
+        }
+        // Python tracebacks: `File "x.py", line 12`.
+        if line.is_none() && start > 0 && text[start - 1] == '"' {
+            let rest: String = text[i..text.len().min(i + 24)].iter().collect();
+            if let Some(n) = rest.strip_prefix("\", line ") {
+                let digits: String = n.chars().take_while(char::is_ascii_digit).collect();
+                line = digits.parse().ok();
+            }
+        }
+        found.push(PathToken {
+            from: start,
+            to: end,
+            text: path,
+            line,
+            col,
+        });
+    }
+    found
+}
+
+/// `path`, `path:12` and `path:12:5` split into the path and its 1-based numbers,
+/// and the length in bytes of the part of `token` they came from. Text after the
+/// numbers (`path:12:text`, as `rg` prints) is not part of the link.
+fn split_line_col(token: &str) -> Option<(String, Option<usize>, Option<usize>, usize)> {
+    let number = |rest: &str| -> Option<(usize, usize)> {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let ends = rest[digits..].is_empty() || rest[digits..].starts_with(':');
+        (digits > 0 && digits <= 9 && ends).then(|| (rest[..digits].parse().unwrap_or(0), digits))
+    };
+    for (i, _) in token.match_indices(':') {
+        // A Windows drive letter (`C:\x`, `C:/x`) is part of the path.
+        if i == 1 && matches!(token.as_bytes().get(2), Some(b'\\' | b'/')) {
+            continue;
+        }
+        let Some((line, n)) = number(&token[i + 1..]) else {
+            continue;
+        };
+        if i == 0 {
+            return None;
+        }
+        let mut used = i + 1 + n;
+        let mut col = None;
+        if let Some(rest) = token[used..].strip_prefix(':')
+            && let Some((c, n)) = number(rest)
+        {
+            col = Some(c);
+            used += 1 + n;
+        }
+        return Some((token[..i].to_string(), Some(line), col, used));
+    }
+    (!token.is_empty()).then(|| (token.to_string(), None, None, token.len()))
+}
+
+/// Cheap filter before touching the disk: something with a separator, a dot, a
+/// home prefix or an explicit line number, and not just dots.
+fn looks_like_path(path: &str, has_line: bool) -> bool {
+    if path.chars().all(|c| c == '.') || path.contains('\0') {
+        return false;
+    }
+    has_line || path.starts_with('~') || path.contains(['/', '\\', '.'])
+}
+
+/// Resolves path text against the session's directory; `None` unless it exists
+/// (and, for a directory, `files.dirs` allows it).
+fn resolve_file_ref(
+    text: &str,
+    line: Option<usize>,
+    col: Option<usize>,
+    files: &FileLookup,
+) -> Option<FileRef> {
+    let path = if text == "~" {
+        files.home.clone()
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        files.home.join(rest)
+    } else {
+        let p = PathBuf::from(text);
+        if p.is_absolute() {
+            p
+        } else {
+            files.cwd.join(p)
+        }
+    };
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.is_dir() && !files.dirs {
+        return None;
+    }
+    Some(FileRef {
+        path,
+        line: line.map(|n| n.max(1)),
+        col: col.map(|n| n.max(1)),
+        is_dir: meta.is_dir(),
+    })
 }
 
 /// Character ranges of the `http://` and `https://` URLs in `text`. Trailing
@@ -1627,22 +2302,34 @@ fn find_urls(text: &[char]) -> Vec<(usize, usize)> {
 }
 
 /// OSC 8 link text can differ from its target, so the real URI is always revealed
-/// on hover before a Ctrl+click opens it. Plain-text URLs are underlined on hover
-/// and open the same way. Returns the cells of a hovered plain-text URL.
+/// on hover before a Ctrl+click opens it. Plain-text URLs and paths to existing
+/// local files are underlined on hover and open the same way. Returns the cells of
+/// a hovered plain-text link and the file a Ctrl+click asked to open.
 fn handle_links(
     ui: &egui::Ui,
     s: &Session,
     response: &egui::Response,
     m: &Metrics,
     p: PointerMode,
-) -> Option<(Point, Point)> {
+) -> (Option<(Point, Point)>, Option<FileRef>) {
     let mut span = None;
+    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+    // File links are only looked for while Ctrl is held (the key that opens them).
+    let paths = ctrl.then(|| PathScan {
+        probe: &s.probe,
+        cwd: &s.cwd,
+        home: crate::model::home(),
+        dirs: s.dir_links,
+    });
     if let Some(pos) = response.hover_pos()
         && s.mouse.gesture.is_none()
     {
-        let link = link_under(&lock(&s.term), m, pos);
+        let link = link_under(&lock(&s.term), m, pos, paths.as_ref());
         if let Some(link) = link {
-            let tip = if openable_link(&link.uri) {
+            let tip = if link.file.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                "Ctrl+click to open".to_string()
+            } else if openable_link(&link.uri) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 if link.span.is_some() {
                     "Ctrl+click to open".to_string()
@@ -1661,16 +2348,19 @@ fn handle_links(
             ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
     }
-    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+    let mut open = None;
     if response.clicked()
         && ctrl
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some(link) = link_under(&lock(&s.term), m, pos)
-        && openable_link(&link.uri)
+        && let Some(link) = link_under(&lock(&s.term), m, pos, paths.as_ref())
     {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+        if link.file.is_some() {
+            open = link.file;
+        } else if openable_link(&link.uri) {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+        }
     }
-    span
+    (span, open)
 }
 
 /// Wheel and touchpad scrolling: reported to a program that asked for mouse
@@ -1754,7 +2444,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
                     } else {
                         text
                     };
-                    s.write(text.into_bytes());
+                    s.write_input(text.into_bytes());
                     lock(&s.term).scroll_display(Scroll::Bottom);
                 }
             }
@@ -1791,7 +2481,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
                 modifiers,
                 ..
             } => handle_key(s, key, modifiers, mode),
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write_input(text.into_bytes()),
             _ => {}
         }
     }
@@ -1814,7 +2504,7 @@ fn handle_key(s: &mut Session, key: Key, modifiers: Modifiers, mode: TermMode) {
     if !(modifiers.ctrl && modifiers.shift)
         && let Some(bytes) = key_bytes(key, modifiers, mode)
     {
-        s.write(bytes);
+        s.write_input(bytes);
         lock(&s.term).scroll_display(Scroll::Bottom);
     }
 }
@@ -2039,6 +2729,7 @@ fn paint_grid(
             m.cell_pos(point.column.0, row),
             selected,
             found,
+            prefs.min_contrast,
         );
     }
     // The focused pane of a focused window shows a solid (blinking) cursor; any
@@ -2102,6 +2793,7 @@ fn paint_cell(
     pos: Pos2,
     selected: bool,
     found: bool,
+    min_contrast: f32,
 ) {
     use alacritty_terminal::term::cell::Flags;
     let (cw, ch) = (m.cw, m.ch);
@@ -2135,6 +2827,11 @@ fn paint_cell(
         .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN)
     {
         return;
+    }
+    if cell.c != ' ' {
+        // Text a program colored nearly the same as its background (dark blue on
+        // black, say) is moved just far enough to be legible.
+        fg = crate::theme::ensure_contrast(fg, bg, min_contrast);
     }
     if cell.flags.contains(Flags::DIM) {
         fg = fg.gamma_multiply(0.66);
@@ -2251,6 +2948,75 @@ fn paint_scroll_indicator(
     painter.rect_filled(thumb, 2., theme.term("foreground").gamma_multiply(alpha));
 }
 
+const PILL_SIZE: Vec2 = Vec2::new(124., 24.);
+/// Bottom-right of a pane, clear of the scroll indicator.
+fn pill_rect(pane: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            pane.right() - 16. - PILL_SIZE.x,
+            pane.bottom() - 12. - PILL_SIZE.y,
+        ),
+        PILL_SIZE,
+    )
+}
+
+/// A floating "Jump to bottom" pill, shown only while the view is scrolled back; a
+/// click returns to the live output. It takes an accent outline when output has
+/// arrived since the view left the bottom.
+fn scroll_pill(ui: &egui::Ui, s: &mut Session, theme: &Theme, rect: Rect) {
+    if !s.scrolled_back() {
+        return;
+    }
+    let area = pill_rect(rect);
+    let response = ui.interact(area, ui.id().with("scroll-pill"), Sense::click());
+    let new_output = s.unseen_output;
+    let accent = theme.ui("accent");
+    let fg = theme.term("foreground");
+    let painter = ui.painter_at(rect);
+    let fill = crate::theme::mix(
+        theme.term("background"),
+        fg,
+        if response.hovered() { 0.20 } else { 0.12 },
+    );
+    painter.rect_filled(area, 12., fill);
+    let edge = if new_output {
+        accent
+    } else {
+        fg.gamma_multiply(0.3)
+    };
+    painter.rect_stroke(
+        area,
+        12.,
+        Stroke::new(if new_output { 1.5_f32 } else { 1. }, edge),
+        egui::StrokeKind::Inside,
+    );
+    let ink = if new_output {
+        accent
+    } else {
+        fg.gamma_multiply(0.85)
+    };
+    // A down chevron, then the label.
+    let c = Pos2::new(area.left() + 16., area.center().y);
+    let stroke = Stroke::new(1.6_f32, ink);
+    painter.line_segment([c + Vec2::new(-4., -2.), c + Vec2::new(0., 2.)], stroke);
+    painter.line_segment([c + Vec2::new(0., 2.), c + Vec2::new(4., -2.)], stroke);
+    painter.text(
+        Pos2::new(area.left() + 28., area.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Jump to bottom",
+        FontId::proportional(11.),
+        ink,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        lock(&s.term).scroll_display(Scroll::Bottom);
+        s.unseen_output = false;
+        ui.ctx().request_repaint();
+    }
+}
+
 /// Small "exit N" badge in the corner after a command reported a non-zero status.
 fn paint_exit_badge(
     s: &Session,
@@ -2295,9 +3061,11 @@ fn context_menu(
         return;
     }
     if response.secondary_clicked() {
+        // The menu only offers URLs, so path text is not looked up at all.
         s.mouse.menu_link = response
             .interact_pointer_pos()
-            .and_then(|pos| link_under(&lock(&s.term), m, pos))
+            .and_then(|pos| link_under(&lock(&s.term), m, pos, None))
+            .filter(|link| link.file.is_none())
             .map(|link| link.uri);
     }
     let mut open = false;
@@ -2336,6 +3104,16 @@ fn context_menu(
             }
         }
         ui.separator();
+        let has_output = lock(&s.shell).output.is_some();
+        if ui
+            .add_enabled(has_output, egui::Button::new("Copy Last Command Output"))
+            .clicked()
+        {
+            if let Some(text) = s.last_output() {
+                s.copy_to_clipboard(ui.ctx(), text);
+            }
+            ui.close();
+        }
         let (history, offset) = {
             let term = lock(&s.term);
             (term.grid().history_size(), term.grid().display_offset())
@@ -2363,8 +3141,469 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg_attr(not(unix), allow(unused_imports))]
-    use std::time::Instant;
+    /// Runs `bytes` through the same scanner/parser/apply path as the reader thread.
+    fn feed(
+        term: &mut Term<Events>,
+        shell: &mut ShellState,
+        parser: &mut ansi::Processor,
+        scanner: &mut OscScanner,
+        bytes: &[u8],
+    ) {
+        let mut done = 0;
+        for (end, event) in scanner.scan(bytes) {
+            parser.advance(term, &bytes[done..end]);
+            done = end;
+            apply_osc(term, shell, event);
+        }
+        parser.advance(term, &bytes[done..]);
+        reconcile_marks(term, shell);
+    }
+    fn shell_term(rows: usize) -> (Term<Events>, ShellState) {
+        let (events, _queue) = Events::new();
+        (
+            Term::new(term_config(), &Size { cols: 20, rows }, events),
+            ShellState::default(),
+        )
+    }
+    #[test]
+    fn last_output_is_the_text_between_osc_133_c_and_d() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut go = |term: &mut Term<Events>, shell: &mut ShellState, s: &str| {
+            feed(term, shell, &mut parser, &mut scanner, s.as_bytes());
+        };
+        go(&mut term, &mut shell, "\x1b]133;A\x07$ echo hi\r\n");
+        go(&mut term, &mut shell, "\x1b]133;C\x07hi\r\nthere\r\n");
+        go(&mut term, &mut shell, "\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi\nthere"));
+        // The next command replaces it; output without a final newline keeps its last line.
+        go(&mut term, &mut shell, "ls\r\n\x1b]133;C\x07a b\r\npartial");
+        go(
+            &mut term,
+            &mut shell,
+            "\x1b]133;D;1\x07\x1b]133;A\x07\r\n$ ",
+        );
+        let (s, e, c) = shell.output.unwrap();
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("a b\npartial"));
+        assert_eq!(shell.last_exit, Some(1));
+    }
+    /// Output that fills the row exactly (cursor parked with a wrap pending) must keep
+    /// its last character; the 20-column grid makes 20 and 40 the exact-width cases.
+    #[test]
+    fn last_output_keeps_the_last_char_when_it_fills_the_line() {
+        for n in [1usize, 3, 19, 20, 21, 39, 40, 41, 59, 60] {
+            let (mut term, mut shell) = shell_term(5);
+            let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+            let out: String = (0..n).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            let text =
+                format!("\x1b]133;A\x07$ x\r\n\x1b]133;C\x07{out}\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+            feed(
+                &mut term,
+                &mut shell,
+                &mut parser,
+                &mut scanner,
+                text.as_bytes(),
+            );
+            let (s, e, c) = shell.output.expect("span recorded");
+            assert_eq!(
+                output_text(&term, s, e, c).as_deref(),
+                Some(out.as_str()),
+                "{n} chars"
+            );
+        }
+    }
+    #[test]
+    fn last_output_without_a_trailing_newline_excludes_the_next_prompt() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut go = |term: &mut Term<Events>, shell: &mut ShellState, s: &str| {
+            feed(term, shell, &mut parser, &mut scanner, s.as_bytes());
+        };
+        go(&mut term, &mut shell, "\x1b]133;A\x07$ printf foo\r\n");
+        go(&mut term, &mut shell, "\x1b]133;C\x07foo");
+        // The prompt is drawn right after the output, on the same line.
+        go(&mut term, &mut shell, "\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("foo"));
+    }
+    /// A real interactive bash (CAELUM_TEST_BASH, else the system one) running Caelum's
+    /// own integration script with the prompt `PROMPT> `, or `None` without a bash.
+    #[cfg(unix)]
+    fn real_bash_session() -> Option<(tempfile::TempDir, Session)> {
+        let over = std::env::var("CAELUM_TEST_BASH").ok();
+        let bash = over
+            .as_deref()
+            .into_iter()
+            .chain(["/bin/bash", "/usr/bin/bash"])
+            .find(|p| Path::new(p).is_file())?;
+        let dir = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("shell/caelum.bash");
+        let rc = dir.path().join("rc");
+        std::fs::write(&rc, format!("PS1='PROMPT> '\n. '{}'\n", script.display())).unwrap();
+        let argv: Vec<String> = [
+            "/usr/bin/env".to_string(),
+            "CAELUM_RS=1".into(),
+            "HISTFILE=/dev/null".into(),
+            bash.to_string(),
+            "--noprofile".into(),
+            "--rcfile".into(),
+            rc.display().to_string(),
+            "-i".into(),
+        ]
+        .to_vec();
+        let s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
+        Some((dir, s))
+    }
+    #[cfg(unix)]
+    fn wait_for(s: &mut Session, what: &str, f: &dyn Fn(&Session) -> bool) {
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !f(s) {
+            s.poll(&theme);
+            assert!(Instant::now() < end, "timed out: {what}: {:?}", s.text());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    /// The same, end to end: a real bash running `printf foo` with Caelum's own
+    /// integration script, read back through the session API. On bash < 4.4 (no PS0, so
+    /// no 133;C) the output start comes from the Enter the user typed.
+    #[cfg(unix)]
+    #[test]
+    fn real_shell_printf_without_newline_copies_only_its_output() {
+        let Some((_dir, mut s)) = real_bash_session() else {
+            return;
+        };
+        wait_for(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
+        s.write_input(b"printf foo\r".to_vec());
+        wait_for(&mut s, "output", &|s| s.last_output().is_some());
+        wait_for(&mut s, "next prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 2
+        });
+        assert_eq!(s.last_output().as_deref(), Some("foo"));
+        assert!(s.take_finished().is_some());
+        // An empty Enter right after leaves nothing running and reports no long command.
+        s.write_input(b"\r".to_vec());
+        wait_for(&mut s, "third prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 3
+        });
+        assert!(!lock(&s.shell).running);
+        assert!(
+            s.take_finished()
+                .is_some_and(|f| f.elapsed < Duration::from_secs(1))
+        );
+    }
+    /// The long-command timer works on any bash, including 3.2 without 133;C: the
+    /// finished command's elapsed time covers its whole run, and its exit code arrives.
+    #[cfg(unix)]
+    #[test]
+    fn real_shell_times_a_slow_command() {
+        let Some((_dir, mut s)) = real_bash_session() else {
+            return;
+        };
+        wait_for(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
+        s.write_input(b"sleep 1.2; (exit 3)\r".to_vec());
+        wait_for(&mut s, "running", &|s| lock(&s.shell).running);
+        assert!(s.is_busy());
+        wait_for(&mut s, "second prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 2
+        });
+        let done = s.take_finished().expect("finished command");
+        assert!(done.elapsed >= Duration::from_millis(1100), "{done:?}");
+        assert!(done.elapsed < Duration::from_secs(5), "{done:?}");
+        assert_eq!(done.code, Some(3));
+        assert!(!s.is_busy());
+    }
+    /// A shell that sends OSC 133;A and D but never C: the detector's view of Enter.
+    fn submit_term(rows: usize, text: &str) -> (Term<Events>, ShellState) {
+        let (mut term, mut shell) = shell_term(rows);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            text.as_bytes(),
+        );
+        (term, shell)
+    }
+    fn press_enter(term: &Term<Events>, shell: &mut ShellState) {
+        shell.submit(cursor_abs(term), term.mode().contains(TermMode::ALT_SCREEN));
+    }
+    #[test]
+    fn empty_enter_keeps_last_output() {
+        let (mut term, mut shell) = submit_term(8, "\x1b]133;A\x07$ echo hi");
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let kept = shell.output;
+        assert!(kept.is_some());
+        shell.finished = None;
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, kept, "empty Enter wiped last output");
+    }
+    #[test]
+    fn empty_enter_keeps_output_without_133_c_and_next_command_updates_it() {
+        let (mut term, mut shell) = submit_term(10, "\x1b]133;A\x07$ echo hi");
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nhi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let kept = shell.output;
+        let (s, e, c) = kept.expect("span");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi"));
+        shell.finished = None;
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, kept);
+        // A real command afterwards still replaces the output.
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nyo\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let (s, e, c) = shell.output.expect("span");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("yo"));
+        assert!(shell.finished.is_some());
+    }
+    #[test]
+    fn enter_at_a_prompt_marks_the_command_start_without_133_c() {
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ echo hi");
+        assert!(shell.at_prompt && !shell.running);
+        press_enter(&term, &mut shell);
+        assert!(shell.running && shell.inferred && shell.started.is_some());
+        // Output begins on the line after the command line, as the shell wrote it.
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nhi\r\nthere\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi\nthere"));
+        let done = shell.finished.take().expect("a finished command");
+        assert_eq!(done.code, Some(0));
+        assert!(!shell.running && shell.at_prompt);
+    }
+    #[test]
+    fn a_wrapped_command_line_starts_output_after_its_last_row() {
+        // 20 columns: this input wraps over three rows; the cursor sits on the third.
+        let cmd = "x".repeat(45);
+        let (mut term, mut shell) = submit_term(8, &format!("\x1b]133;A\x07$ {cmd}"));
+        press_enter(&term, &mut shell);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nout\r\n\x1b]133;D;0\x07",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("out"));
+    }
+    #[test]
+    fn empty_enter_gives_an_empty_span_that_d_closes() {
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ ");
+        press_enter(&term, &mut shell);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, None);
+        assert!(!shell.running && shell.output_start.is_none());
+        // It finished within microseconds, far below any long-command threshold.
+        assert!(
+            shell
+                .finished
+                .is_some_and(|f| f.elapsed < Duration::from_secs(1))
+        );
+        assert!(shell.at_prompt);
+    }
+    #[test]
+    fn enter_is_ignored_on_the_alt_screen_and_while_a_command_runs() {
+        // A TUI on the alternate screen: Enter belongs to the program.
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ vim\x1b[?1049h");
+        press_enter(&term, &mut shell);
+        assert!(!shell.running && shell.output_start.is_none() && shell.at_prompt);
+        // A command is running (real 133;C): Enter is input to it, not a new command.
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ cat\r\n\x1b]133;C\x07");
+        let (start, begun) = (shell.output_start, shell.started);
+        press_enter(&term, &mut shell);
+        assert!(!shell.inferred);
+        assert_eq!((shell.output_start, shell.started), (start, begun));
+        // Before any prompt was seen, or after the first Enter, a second one is ignored.
+        let (term, mut shell) = submit_term(5, "plain text");
+        press_enter(&term, &mut shell);
+        assert!(!shell.running);
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ a");
+        press_enter(&term, &mut shell);
+        let first = shell.output_start;
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nline\r\n",
+        );
+        press_enter(&term, &mut shell);
+        assert_eq!(shell.output_start, first);
+    }
+    #[test]
+    fn a_real_133_c_overrides_the_inferred_start() {
+        let (mut term, mut shell) = submit_term(8, "\x1b]133;A\x07$ f() {");
+        press_enter(&term, &mut shell);
+        // A continuation prompt line, then the shell's real command-start mark.
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n> echo a; }\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("out"));
+        assert!(!shell.inferred);
+    }
+    #[test]
+    fn only_unbracketed_newlines_submit_a_line() {
+        assert!(submits_line(b"\r"));
+        assert!(submits_line(b"\n"));
+        assert!(submits_line(b"ls\r"));
+        assert!(!submits_line(b"ls"));
+        assert!(!submits_line(b"\x1b\r"), "Alt+Enter");
+        assert!(!submits_line(b"\x03"));
+        // Bracketed paste: newlines are text for the editor, even many of them.
+        assert!(!submits_line(&paste_bytes("a\nb\nc", true)));
+        assert!(!submits_line(b"\x1b[200~a\rb"), "unterminated paste");
+        assert!(submits_line(b"\x1b[200~a\nb\x1b[201~\r"));
+        // Unbracketed multi-line paste submits, and only counts once at a prompt.
+        let bytes = paste_bytes("one\ntwo\nthree\n", false);
+        assert!(submits_line(&bytes));
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ ");
+        for _ in bytes.iter().filter(|b| **b == b'\r') {
+            press_enter(&term, &mut shell);
+        }
+        assert_eq!(shell.output_start, Some(cursor_abs(&term) + 1));
+    }
+    #[test]
+    fn last_output_spans_scrollback_and_is_dropped_when_marks_are() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut text = String::from("\x1b]133;C\x07");
+        for i in 0..30 {
+            text.push_str(&format!("line {i}\r\n"));
+        }
+        text.push_str("\x1b]133;D;0\x07$ ");
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            text.as_bytes(),
+        );
+        let (s, e, c) = shell.output.unwrap();
+        assert_eq!(e - s, 30);
+        let out = output_text(&term, s, e, c).unwrap();
+        assert!(
+            out.starts_with("line 0\n") && out.ends_with("line 29"),
+            "{out}"
+        );
+        shell.clear_marks();
+        assert_eq!(
+            shell.output, None,
+            "positions are invalid after a reflow or clear"
+        );
+    }
+    #[test]
+    fn empty_output_and_alternate_screen_record_no_span() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"$ true\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+        );
+        assert_eq!(shell.output, None);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b[?1049h\x1b]133;C\x07x\r\n\x1b]133;D;0\x07\x1b[?1049l",
+        );
+        assert_eq!(shell.output, None);
+    }
+    #[test]
+    fn a_finished_command_reports_how_long_it_ran_once() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;C\x07",
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;D;7\x07",
+        );
+        let f = shell.finished.take().expect("a finished command");
+        assert_eq!(f.code, Some(7));
+        assert!(f.elapsed >= Duration::from_millis(30));
+        assert!(shell.finished.is_none());
+        // A D without a C (the very first prompt) is not a command.
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;D;0\x07",
+        );
+        assert!(shell.finished.is_none());
+    }
     #[test]
     fn multiline_paste_needs_confirmation_only_without_bracketed_paste() {
         // Single line, any mode: never asks.
@@ -2599,8 +3838,6 @@ mod tests {
 mod regressions {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
-    #[cfg_attr(not(unix), allow(unused_imports))]
-    use std::time::Instant;
 
     fn term_with(cols: usize, rows: usize, output: &str) -> Term<Events> {
         let (events, _queue) = Events::new();
@@ -2886,7 +4123,6 @@ mod regressions {
 #[cfg(all(test, unix))]
 mod input_queue_tests {
     use super::*;
-    use std::time::Instant;
     #[cfg(unix)]
     #[test]
     fn burst_of_small_key_events_is_retained_under_backpressure() {
@@ -2954,5 +4190,358 @@ mod lock_shell_tests {
             );
         }
         assert_eq!(crate::platform::resolve_shell(Some("/bin/sh")), "/bin/sh");
+    }
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+    fn token(text: &str) -> Vec<(String, Option<usize>, Option<usize>)> {
+        find_path_tokens(&chars(text))
+            .into_iter()
+            .map(|t| (t.text, t.line, t.col))
+            .collect()
+    }
+    fn t(
+        path: &str,
+        line: Option<usize>,
+        col: Option<usize>,
+    ) -> (String, Option<usize>, Option<usize>) {
+        (path.to_string(), line, col)
+    }
+
+    #[test]
+    fn path_tokens_carry_line_and_column() {
+        assert_eq!(token("src/main.rs"), [t("src/main.rs", None, None)]);
+        assert_eq!(token("src/main.rs:42"), [t("src/main.rs", Some(42), None)]);
+        assert_eq!(
+            token("src/main.rs:42:7"),
+            [t("src/main.rs", Some(42), Some(7))]
+        );
+        // Compiler output.
+        assert_eq!(
+            token("  --> src/lib.rs:10:5"),
+            [t("src/lib.rs", Some(10), Some(5))]
+        );
+        // `rg` and `grep -n` print `file:line:text`; the text is not part of the path.
+        assert_eq!(
+            token("src/a.rs:3:fn main() {"),
+            [t("src/a.rs", Some(3), None)]
+        );
+        // Trailing prose punctuation and wrapping brackets are not part of it.
+        assert_eq!(token("see ./a/b.txt."), [t("./a/b.txt", None, None)]);
+        assert_eq!(token("(src/x.rs:9)"), [t("src/x.rs", Some(9), None)]);
+        assert_eq!(token("src/x.rs:9:5:"), [t("src/x.rs", Some(9), Some(5))]);
+        assert_eq!(token("'~/notes.md'"), [t("~/notes.md", None, None)]);
+        // Python tracebacks name the line after the quoted path.
+        assert_eq!(
+            token("  File \"/app/run.py\", line 27, in <module>"),
+            [t("/app/run.py", Some(27), None)]
+        );
+        // A bare name only counts with a line number, a dot or a separator.
+        assert_eq!(token("Makefile:3"), [t("Makefile", Some(3), None)]);
+        assert!(token("hello world error E0432: nope").is_empty());
+        assert!(token("... .. :").is_empty());
+        // URLs are the URL code's business.
+        assert!(token("https://example.com/a.html:80").is_empty());
+    }
+
+    #[test]
+    fn path_token_ranges_cover_only_the_path() {
+        let text = chars("at src/a.rs:3:9 ok");
+        let tokens = find_path_tokens(&text);
+        assert_eq!(tokens.len(), 1);
+        let got: String = text[tokens[0].from..tokens[0].to].iter().collect();
+        assert_eq!(got, "src/a.rs:3:9");
+    }
+
+    fn key(text: &str) -> ProbeKey {
+        ProbeKey {
+            cwd: "/w".into(),
+            home: "/h".into(),
+            text: text.into(),
+            dirs: false,
+        }
+    }
+
+    /// A resolver stuck for a second (a dead NFS mount) must cost the caller nothing,
+    /// run once per path however often it is asked, and be answered from the cache after.
+    #[test]
+    fn slow_path_lookup_never_blocks_the_caller_and_is_cached() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let probe = PathProbe::with_resolver(
+            egui::Context::default(),
+            Arc::new(move |k: &ProbeKey| {
+                c.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(600));
+                Some((PathBuf::from(&k.text), false))
+            }),
+        );
+        let started = Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(probe.lookup(&key("a.rs")), Probe::Pending);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "1000 frames took {:?} against a 600 ms resolver",
+            started.elapsed()
+        );
+        let end = Instant::now() + Duration::from_secs(5);
+        let got = loop {
+            if let Probe::Ready(r) = probe.lookup(&key("a.rs")) {
+                break r;
+            }
+            assert!(Instant::now() < end, "lookup never finished");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(got, Some((PathBuf::from("a.rs"), false)));
+        assert_eq!(probe.lookup(&key("a.rs")), Probe::Ready(got));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one filesystem call per path"
+        );
+    }
+
+    /// Many different hovered tokens cannot pile up threads behind a stalled mount.
+    #[test]
+    fn stalled_lookups_are_capped() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let probe = PathProbe::with_resolver(
+            egui::Context::default(),
+            Arc::new(move |_: &ProbeKey| {
+                c.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(500));
+                None
+            }),
+        );
+        for i in 0..50 {
+            assert_eq!(probe.lookup(&key(&format!("f{i}"))), Probe::Pending);
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert!(calls.load(Ordering::SeqCst) <= PROBE_MAX_INFLIGHT);
+    }
+
+    /// The pane's link scan finds a real file only through the probe, with Ctrl-style
+    /// opt-in: without a `PathScan`, no path is looked at.
+    #[test]
+    fn path_links_need_the_scan_and_resolve_through_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "x").unwrap();
+        let probe = PathProbe::new(egui::Context::default());
+        let scan = PathScan {
+            probe: &probe,
+            cwd: dir.path(),
+            home: dir.path().to_path_buf(),
+            dirs: false,
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        let file = loop {
+            if let Some(f) = scan.resolve("main.rs", Some(4), None) {
+                break f;
+            }
+            assert!(Instant::now() < end, "never resolved");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            (file.path, file.line, file.is_dir),
+            (dir.path().join("main.rs"), Some(4), false)
+        );
+        assert!(scan.resolve("absent.rs", None, None).is_none());
+    }
+
+    #[test]
+    fn file_refs_resolve_against_the_working_directory_and_must_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("notes.md"), "x").unwrap();
+        let lookup = |dirs| FileLookup {
+            cwd: dir.path(),
+            home: home.path().to_path_buf(),
+            dirs,
+        };
+        let f = resolve_file_ref("src/main.rs", Some(12), Some(3), &lookup(false)).unwrap();
+        assert_eq!(f.path, dir.path().join("src/main.rs"));
+        assert_eq!((f.line, f.col, f.is_dir), (Some(12), Some(3), false));
+        // Absolute paths and `~` need no working directory.
+        let abs = dir.path().join("src/main.rs");
+        let f = resolve_file_ref(abs.to_str().unwrap(), None, None, &lookup(false)).unwrap();
+        assert_eq!(f.path, abs);
+        let f = resolve_file_ref("~/notes.md", None, None, &lookup(false)).unwrap();
+        assert_eq!(f.path, home.path().join("notes.md"));
+        // Line 0 is read as line 1.
+        assert_eq!(
+            resolve_file_ref("src/main.rs", Some(0), None, &lookup(false))
+                .unwrap()
+                .line,
+            Some(1)
+        );
+        // Missing files are not links.
+        assert!(resolve_file_ref("src/missing.rs", Some(1), None, &lookup(true)).is_none());
+        // Directories only when something can show them.
+        assert!(resolve_file_ref("src", None, None, &lookup(false)).is_none());
+        let d = resolve_file_ref("src", None, None, &lookup(true)).unwrap();
+        assert!(d.is_dir);
+        // `..` resolves from the working directory too.
+        let sub = FileLookup {
+            cwd: &dir.path().join("src"),
+            home: home.path().to_path_buf(),
+            dirs: false,
+        };
+        assert!(resolve_file_ref("../src/main.rs", None, None, &sub).is_some());
+    }
+
+    #[test]
+    fn osc52_cap_and_toggle() {
+        assert_eq!(osc52_accepts(true, "hello"), Ok(true));
+        assert_eq!(osc52_accepts(false, "hello"), Ok(false));
+        assert_eq!(osc52_accepts(true, ""), Ok(false));
+        let at_cap = "x".repeat(OSC52_MAX_BYTES);
+        assert_eq!(osc52_accepts(true, &at_cap), Ok(true));
+        let over = "x".repeat(OSC52_MAX_BYTES + 1);
+        assert_eq!(osc52_accepts(true, &over), Err(OSC52_MAX_BYTES + 1));
+        // A disabled toggle ignores even oversized text quietly.
+        assert_eq!(osc52_accepts(false, &over), Ok(false));
+    }
+
+    #[test]
+    fn only_enabled_clipboard_writes_are_kept_and_only_the_newest() {
+        let (events, queue) = Events::new();
+        let store = |t: &str| Event::ClipboardStore(ClipboardType::Clipboard, t.into());
+        // Disabled (the initial state): nothing is kept, however big.
+        events.send_event(store("nope"));
+        events.send_event(store(&"x".repeat(OSC52_MAX_BYTES + 1)));
+        assert!(lock(&queue.clipboard).is_none());
+        queue.osc52.store(true, Ordering::Relaxed);
+        events.send_event(store("first"));
+        events.send_event(Event::ClipboardStore(
+            ClipboardType::Selection,
+            "primary".into(),
+        ));
+        events.send_event(Event::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|text| text.to_string()),
+        ));
+        events.send_event(store("second"));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("second".into())));
+        // Nothing went through the bounded event channel at all.
+        assert!(queue.rx.try_iter().next().is_none());
+        // Oversized: only the size is kept, not the payload.
+        let big = "y".repeat(OSC52_MAX_BYTES + 1);
+        events.send_event(store(&big));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Err(big.len())));
+    }
+
+    #[test]
+    fn a_flood_of_clipboard_writes_holds_one_payload() {
+        let (events, queue) = Events::new();
+        queue.osc52.store(true, Ordering::Relaxed);
+        for i in 0..5000 {
+            events.send_event(Event::ClipboardStore(
+                ClipboardType::Clipboard,
+                format!("write {i}"),
+            ));
+        }
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("write 4999".into())));
+        assert!(queue.rx.try_iter().next().is_none());
+    }
+
+    /// A 6 MiB OSC 52 through the same guard + parser the reader thread uses is refused
+    /// as too big, and a small one right after it still lands.
+    #[test]
+    fn oversized_osc52_is_bounded_before_decoding_and_refused() {
+        let (events, queue) = Events::new();
+        queue.osc52.store(true, Ordering::Relaxed);
+        let mut term = Term::new(term_config(), &Size { cols: 20, rows: 5 }, events);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut guard = OscGuard::new();
+        let mut stream = b"\x1b]52;c;".to_vec();
+        stream.extend(std::iter::repeat_n(b'A', 6 * 1024 * 1024));
+        stream.extend(b"\x07");
+        for chunk in stream.chunks(16384) {
+            parser.advance(&mut term, &guard.filter(chunk));
+        }
+        match lock(&queue.clipboard).take() {
+            Some(Err(n)) => assert!(n > OSC52_MAX_BYTES && n < 6 * 1024 * 1024, "{n}"),
+            other => panic!("expected a refused oversize write, got {other:?}"),
+        }
+        parser.advance(&mut term, &guard.filter(b"\x1b]52;c;aGVsbG8=\x07"));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("hello".into())));
+    }
+
+    /// The preference is read when output is parsed, not when a pane is drawn: a tab
+    /// that is never drawn must stop honouring a setting that was switched off.
+    #[cfg(unix)]
+    #[test]
+    fn background_session_honours_osc52_switched_off_before_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "sleep 1; printf '\\033]52;c;aGVsbG8=\\007'; sleep 2",
+        ]
+        .map(String::from)
+        .into();
+        let mut s = Session::spawn_with(
+            dir.path(),
+            Some(&argv),
+            egui::Context::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        s.set_osc52_write(false); // the user turned it off; this tab was never drawn
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < end {
+            s.poll(&theme);
+            assert!(!s.take_copied(), "clipboard written despite the setting");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_osc52(text_b64: &str, enabled: bool) -> (bool, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            &format!("printf '\\033]52;c;{text_b64}\\007'; sleep 2"),
+        ]
+        .map(String::from)
+        .into();
+        let ctx = egui::Context::default();
+        let mut s =
+            Session::spawn_with(dir.path(), Some(&argv), ctx.clone(), false, enabled).unwrap();
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(if enabled { 8 } else { 1 });
+        let mut copied = false;
+        while std::time::Instant::now() < end && !copied {
+            s.poll(&theme);
+            copied = s.take_copied();
+            thread::sleep(Duration::from_millis(10));
+        }
+        (copied, s.error.take())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc52_write_reaches_the_clipboard_and_toasts() {
+        let (copied, error) = run_osc52("aGVsbG8=", true);
+        assert!(copied, "OSC 52 write was not forwarded: {error:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc52_write_is_ignored_when_turned_off() {
+        assert!(!run_osc52("aGVsbG8=", false).0);
     }
 }

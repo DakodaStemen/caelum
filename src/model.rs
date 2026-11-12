@@ -185,6 +185,35 @@ impl Direction {
     pub fn before(self) -> bool {
         matches!(self, Self::Left | Self::Up)
     }
+    /// The pane nearest `from` in this direction among `rects` (as from
+    /// [`Pane::leaf_rects`]): it must lie entirely beyond the edge and overlap
+    /// `from` across the other axis. The closest edge wins, then the larger overlap.
+    pub fn neighbour(self, rects: &[(String, PaneRect)], from: &str) -> Option<String> {
+        let cur = rects.iter().find(|(id, _)| id == from)?.1;
+        let (c_lo, c_hi) = (cur.x, cur.x + cur.w);
+        let (r_lo, r_hi) = (cur.y, cur.y + cur.h);
+        // Panes are a whole pixel or two apart (the divider), never a bit off.
+        const SLOP: f32 = 2.;
+        let mut best: Option<(f32, f32, &String)> = None;
+        for (id, r) in rects.iter().filter(|(id, _)| id != from) {
+            let (x_lo, x_hi, y_lo, y_hi) = (r.x, r.x + r.w, r.y, r.y + r.h);
+            let (gap, overlap) = match self {
+                Self::Right => (x_lo - c_hi, y_hi.min(r_hi) - y_lo.max(r_lo)),
+                Self::Left => (c_lo - x_hi, y_hi.min(r_hi) - y_lo.max(r_lo)),
+                Self::Down => (y_lo - r_hi, x_hi.min(c_hi) - x_lo.max(c_lo)),
+                Self::Up => (r_lo - y_hi, x_hi.min(c_hi) - x_lo.max(c_lo)),
+            };
+            if gap < -SLOP || overlap <= 0. {
+                continue;
+            }
+            let better =
+                best.is_none_or(|(g, o, _)| gap < g - SLOP || (gap <= g + SLOP && overlap > o));
+            if better {
+                best = Some((gap, overlap, id));
+            }
+        }
+        best.map(|(_, _, id)| id.clone())
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Left => "Split left",
@@ -612,8 +641,20 @@ pub struct Preferences {
     /// that key would keep existing users on "off". Turning it off again is saved.
     #[serde(rename = "copyOnSelectV2")]
     pub copy_on_select: bool,
+    /// Let programs set the clipboard with OSC 52 (write only; reading stays blocked).
+    pub osc52_write: bool,
+    /// Text is nudged lighter or darker when its contrast against the cell
+    /// background (WCAG ratio) would fall below this; 1.0 turns it off.
+    pub min_contrast: f32,
+    /// Start the shell with Caelum's OSC 7 / OSC 133 integration, no dotfile edits needed.
+    pub shell_integration: bool,
+    /// Seconds a command must run before finishing in the background raises a notice;
+    /// 0 turns the notice off.
+    pub long_command_secs: u64,
     pub custom_themes: Vec<crate::theme::Theme>,
 }
+/// Default [`Preferences::min_contrast`]: only near-invisible text is touched.
+pub const DEFAULT_MIN_CONTRAST: f32 = 1.5;
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -627,6 +668,10 @@ impl Default for Preferences {
             sidebar: false,
             confirm_multiline_paste: true,
             copy_on_select: true,
+            osc52_write: true,
+            min_contrast: DEFAULT_MIN_CONTRAST,
+            shell_integration: true,
+            long_command_secs: 10,
             custom_themes: vec![],
         }
     }
@@ -1523,6 +1568,65 @@ mod migration_tests {
         let back: Preferences =
             serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.copy_on_select);
+    }
+
+    /// `A | (B over C)`: one tall pane on the left, two stacked on the right.
+    fn l_shaped() -> (Pane, String, String, String) {
+        let mut layout = Pane::terminal(PathBuf::from("/"));
+        let a = layout.id().to_string();
+        let b = Pane::terminal(PathBuf::from("/"));
+        let b_id = b.id().to_string();
+        assert!(layout.split_toward(&a, b, Direction::Right));
+        let c = Pane::terminal(PathBuf::from("/"));
+        let c_id = c.id().to_string();
+        assert!(layout.split_toward(&b_id, c, Direction::Down));
+        (layout, a, b_id, c_id)
+    }
+
+    #[test]
+    fn directional_focus_picks_the_spatial_neighbour() {
+        let (layout, a, b, c) = l_shaped();
+        let rects = layout.leaf_rects(PaneRect::new(0., 0., 1001., 601.), 1.);
+        assert_eq!(Direction::Right.neighbour(&rects, &a), Some(b.clone()));
+        assert_eq!(Direction::Left.neighbour(&rects, &b), Some(a.clone()));
+        assert_eq!(Direction::Left.neighbour(&rects, &c), Some(a.clone()));
+        assert_eq!(Direction::Down.neighbour(&rects, &b), Some(c.clone()));
+        assert_eq!(Direction::Up.neighbour(&rects, &c), Some(b.clone()));
+        // Nothing beyond the edge, and no wrap-around.
+        assert_eq!(Direction::Left.neighbour(&rects, &a), None);
+        assert_eq!(Direction::Up.neighbour(&rects, &a), None);
+        assert_eq!(Direction::Down.neighbour(&rects, &a), None);
+        assert_eq!(Direction::Right.neighbour(&rects, &b), None);
+        assert_eq!(Direction::Up.neighbour(&rects, &b), None);
+        // An unknown pane has no neighbours.
+        assert_eq!(Direction::Right.neighbour(&rects, "nope"), None);
+    }
+
+    #[test]
+    fn directional_focus_prefers_the_larger_overlap_among_equals() {
+        let (layout, a, b, c) = l_shaped();
+        // Push the divider so the right panes are unequal and `a` overlaps `c` more.
+        let mut layout = layout;
+        if let Pane::Split { second, .. } = &mut layout
+            && let Pane::Split { ratio, .. } = &mut **second
+        {
+            *ratio = 0.2;
+        }
+        let rects = layout.leaf_rects(PaneRect::new(0., 0., 1001., 601.), 1.);
+        // Both b and c touch a's right edge; c spans far more of its height.
+        assert_eq!(Direction::Right.neighbour(&rects, &a), Some(c));
+        let _ = b;
+    }
+
+    #[test]
+    fn osc52_and_contrast_preferences_default_and_survive_old_profiles() {
+        let p = Preferences::default();
+        assert!(p.osc52_write);
+        assert_eq!(p.min_contrast, DEFAULT_MIN_CONTRAST);
+        let old: Preferences =
+            serde_json::from_value(serde_json::json!({"fontSize": 13.0})).unwrap();
+        assert!(old.osc52_write);
+        assert_eq!(old.min_contrast, DEFAULT_MIN_CONTRAST);
     }
 
     #[test]

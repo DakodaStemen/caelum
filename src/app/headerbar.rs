@@ -337,7 +337,7 @@ impl App {
             .workspace()
             .tabs
             .iter()
-            .map(|t| (t.id.clone(), self.tab_label(t)))
+            .map(|t| (t.id.clone(), self.tab_label(t), self.tab_unseen(t)))
             .collect();
         let active_id = self.workspace().active_tab.clone();
         let area = Rect::from_min_max(
@@ -356,7 +356,7 @@ impl App {
             self.tab_scroll -= if delta.x != 0. { delta.x } else { delta.y };
         }
         let key = (active_id.clone(), tabs.len(), area.width() as i32);
-        if let Some(i) = tabs.iter().position(|(id, _)| *id == active_id)
+        if let Some(i) = tabs.iter().position(|(id, _, _)| *id == active_id)
             && self.tab_scroll_key != key
         {
             self.tab_scroll_key = key;
@@ -393,7 +393,7 @@ impl App {
                 );
             }
         }
-        for (i, (id, name)) in tabs.into_iter().enumerate() {
+        for (i, (id, name, unseen)) in tabs.into_iter().enumerate() {
             let rect = rects[i];
             if !rect.intersects(area) {
                 continue;
@@ -430,6 +430,14 @@ impl App {
                 response
             };
             ui.painter().galley(pos.round_to_pixels(ppp), galley, text);
+            if unseen {
+                // A command finished in this tab while you were elsewhere.
+                ui.painter().circle_filled(
+                    Pos2::new(rect.left() + 12., rect.center().y),
+                    3.5,
+                    theme.ui("accent"),
+                );
+            }
             let mut close = response.middle_clicked();
             if active || hovered[i] {
                 let button = Rect::from_center_size(

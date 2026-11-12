@@ -8,6 +8,13 @@
 # Setting it stops following the desktop's light/dark style and accent.
 # theme = "graphite"
 
+# Caelum starts your shell with its prompt/cwd integration automatically (bash, zsh,
+# fish); no dotfile edits needed. Set to false to start shells untouched.
+# shell_integration = true
+# Announce a command that finishes after this many seconds while you are in another
+# pane, tab or window. 0 turns it off.
+# long_command_seconds = 10
+
 [font]
 # Fontconfig family name. Leave unset for the system monospace font.
 # family = "JetBrains Mono"
@@ -18,10 +25,17 @@
 # style = "block"      # block | bar | underline
 # blink = false
 
+[terminal]
+# min_contrast = 1.5   # 1 to 21: text fainter than this against its background is
+#                      # nudged lighter/darker; 1 turns it off
+# osc52_write = true   # let programs set the clipboard with OSC 52 (never read it)
+
 # Shortcuts are "ctrl+shift+key" style and need ctrl or alt. Actions:
 #   command_palette toggle_sidebar new_tab split_right split_below split_left
 #   split_up balance_panes zoom_pane close_pane open_file save_file search
-#   next_tab prev_tab copy paste prev_prompt next_prompt
+#   next_tab prev_tab copy paste prev_prompt next_prompt focus_left focus_right
+#   focus_up focus_down copy_last_output
 [keybindings]
 # new_tab = "ctrl+shift+t"
 # prev_prompt = "ctrl+shift+up"
+# focus_left = "ctrl+alt+left"

@@ -58,7 +58,7 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 
 | Area | What works today |
 | --- | --- |
-| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, mouse selection (drag, word, line, block), copy/paste with PRIMARY selection, bracketed paste, scrollback search, OSC 8 and plain-text links, mouse reporting for TUIs, file drag-and-drop |
+| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, mouse selection (drag, word, line, block), copy/paste with PRIMARY selection, bracketed paste, scrollback search, OSC 8 and plain-text links, Ctrl+click on file paths (`file:line:col`) to open them in the editor, a "Jump to bottom" pill while scrolled back, write-only OSC 52 clipboard, a minimum text contrast, mouse reporting for TUIs, file drag-and-drop |
 | Layout | Workspaces, tabs, splits in four directions that rebalance and never shrink a pane below a minimum size, pane zoom |
 | Editor | UTF-8 editing with syntax highlighting, external-change checks, atomic saves, recovery snapshots |
 | Themes | Follows the desktop's light/dark style and accent (Adwaita palette) by default; thirteen bundled themes, custom color editor with live preview, JSON import/export |
@@ -79,6 +79,7 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 | Ctrl+Shift+R | Balance panes (equal sizes) |
 | Ctrl+Shift+Enter | Zoom / restore pane |
 | Ctrl+Shift+W | Close pane |
+| Ctrl+Alt+Arrow | Focus the neighbouring pane in that direction (leaves zoom; Alt+Arrow stays with the shell's word movement) |
 | Ctrl+Shift+C / V | Copy selection / paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+A | Select all terminal text |
 | Ctrl+Shift+F | Search terminal output and scrollback |
@@ -100,7 +101,8 @@ command palette.
 | Shift+click | Extend the selection |
 | Ctrl+drag | Select a rectangular block |
 | Middle-click | Paste the last selection (Linux PRIMARY selection) |
-| Ctrl+click | Open an http(s) link (OSC 8 or plain text) |
+| Ctrl+click | Open an http(s) link (OSC 8 or plain text), or a local file path in the editor pane (`path:line[:col]` from compilers, `rg` and tracebacks scrolls to that line; a folder opens in the file browser pane when one is open) |
+| Jump to bottom | A small pill at the bottom right appears only while scrolled back; click it to return to the live output. Its outline takes the accent colour when new output arrived meanwhile |
 | Wheel | Scroll the scrollback; in `less`, `man` and other full-screen programs, scroll their text |
 | Drop files | Type their shell-quoted paths |
 
@@ -109,6 +111,25 @@ Selecting text copies it to the PRIMARY selection and, with **Copy on Select**
 "Copied to clipboard" toast. When a program such as `vim`, `tmux`
 or `htop` turns on mouse reporting, clicks, drags and the wheel go to that
 program; hold Shift to select text instead.
+
+Programs can put text on the clipboard with the OSC 52 escape sequence (write
+only: they can never read the clipboard back, and anything over 1 MiB is
+refused). It shows the same "Copied to clipboard" toast; turn it off with
+**Programs Can Copy** in Preferences or `[terminal] osc52_write = false`. Text a
+program colors almost the same as its background is lightened or darkened just
+enough to read (minimum contrast ratio 1.5; `[terminal] min_contrast` in
+`config.toml`, 1 turns it off).
+### Shell integration (automatic)
+
+Caelum starts bash, zsh and fish with its prompt/cwd integration already loaded; no
+dotfile edits (it sources your own startup files first and never touches them). That
+powers: new panes opening in the shell's directory, **Ctrl+Shift+Up/Down** to jump
+between prompts, a toast (and a dot on the tab) when a command that ran 10 s or longer
+finishes while you are in another pane, tab or window, **Copy Last Command Output**
+(right-click menu, command palette, `ctrl+shift+o`), and a confirmation only when you
+close a pane, tab or window with a command still running (idle shells close silently).
+Opt out with `shell_integration = false` in `config.toml`; tune the notice with
+`long_command_seconds` (0 turns it off). Details: [docs/shell-integration.md](docs/shell-integration.md).
 
 On GNOME Wayland, which has no server-side window decorations, the headerbar is the
 title bar: it carries the window buttons from your `button-layout`, drag it to move
