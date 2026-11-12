@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New app icon, centred and rendered natively per size (bolder small-size master for 16–32 px): hicolor PNGs 16–512 plus scalable SVG, Windows `.ico`, macOS `.icns` (Apple grid), runtime window icon, README and About dialog. `scripts/install.sh` installs every size and refreshes icon/desktop caches; deb/AppImage/pacman desktop entries gain `StartupWMClass`, the RPM ships the desktop file and icons, and the Windows exe embeds the icon (built on Windows).
 - Terminal mouse: drag selection is anchored where the button went down and follows
   cell halves; triple-click selects a line, double/triple-click then drag extends by
   words/lines, Shift+click extends, Ctrl+drag selects a block, and dragging past the

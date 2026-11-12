@@ -61,11 +61,25 @@ description = "A native workspace terminal built in Rust."
 authors = ["DakodaStemen"]
 license-file = "LICENSE"
 category = "DeveloperTool"
-icons = ["assets/brand/icon.png"]
+icons = [
+  "assets/app-icons/linux/hicolor/16x16/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/22x22/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/24x24/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/32x32/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/48x48/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/64x64/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/128x128/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/256x256/apps/caelum-rs.png",
+  "assets/app-icons/linux/hicolor/512x512/apps/caelum-rs.png",
+  "assets/app-icons/windows/caelum-rs.ico",
+  "assets/app-icons/macos/caelum-rs.icns",
+]
 formats = ["all"]
 
 [package.metadata.packager.deb]
 package-name = "caelum-rs"
+# Adds StartupWMClass so docks match the window (app_id) to the launcher; shared by AppImage/pacman.
+desktop-template = "packaging/caelum-rs.desktop.hbs"
 
 [package.metadata.packager.wix]
 # MSI: unsigned unless a signing certificate is configured (see PACKAGING.md).
@@ -77,4 +91,19 @@ window-size = { width = 660, height = 400 }
 assets = [
   { source = "target/release/caelum-rs", dest = "/usr/bin/caelum-rs", mode = "755" },
   { source = "LICENSE", dest = "/usr/share/licenses/caelum-rs/LICENSE", mode = "644", doc = true },
+  { source = "packaging/io.github.DakodaStemen.CaelumRust.desktop", dest = "/usr/share/applications/io.github.DakodaStemen.CaelumRust.desktop", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/16x16/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/16x16/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/22x22/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/22x22/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/24x24/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/24x24/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/32x32/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/32x32/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/48x48/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/48x48/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/64x64/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/64x64/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/128x128/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/128x128/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/256x256/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/256x256/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/512x512/apps/caelum-rs.png", dest = "/usr/share/icons/hicolor/512x512/apps/caelum-rs.png", mode = "644" },
+  { source = "assets/app-icons/linux/hicolor/scalable/apps/caelum-rs.svg", dest = "/usr/share/icons/hicolor/scalable/apps/caelum-rs.svg", mode = "644" },
 ]
+
+# Embeds the application icon in caelum-rs.exe; only compiled when building on Windows.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
