@@ -744,8 +744,10 @@ impl App {
                     .terminals
                     .get(&self.focused)
                     .and_then(Session::selection)
+                    .filter(|t| !t.is_empty())
                 {
                     ctx.copy_text(text);
+                    self.message = "Copied to clipboard".into();
                 }
             }
             Action::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
