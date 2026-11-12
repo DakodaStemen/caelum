@@ -178,3 +178,193 @@ fn zsh_urlencode_masks_high_bytes() {
         .arg(high_bytes_arg()));
     assert_eq!(out, HIGH_BYTES_ENCODED, "{}", String::from_utf8_lossy(&out));
 }
+
+// ---- Automatic injection, through a real PTY (ignored: needs the shells installed) ----
+
+use caelum_rs::shell_integration::{dir_in, install, plan};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::io::{Read, Write};
+
+struct Run {
+    output: String,
+    root: std::path::PathBuf,
+}
+
+/// Starts `shell` through the same plan Caelum uses, with a scratch HOME holding the
+/// given dotfiles, types `input`, and returns everything the PTY produced.
+fn inject(shell: &str, dotfiles: &[(&str, String)], input: &str) -> Option<Run> {
+    let path = find(shell)?;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let root = dir_in(&tmp.path().join("data"));
+    install(&root).unwrap();
+    for (rel, text) in dotfiles {
+        let file = home.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text.replace("@ROOT@", root.to_str().unwrap())).unwrap();
+    }
+    std::fs::create_dir_all(&home).unwrap();
+    let inherited = |k: &str| std::env::var(k).ok().filter(|_| k == "XDG_DATA_DIRS");
+    let injection = plan(path.to_str().unwrap(), &root, &inherited).expect("known shell");
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(&path);
+    match &injection.args {
+        Some(args) => cmd.args(args),
+        None => cmd.args(["-l"]),
+    };
+    for k in ["ENV", "ZDOTDIR", "HISTFILE", "XDG_CONFIG_HOME"] {
+        cmd.env_remove(k);
+    }
+    cmd.env("HOME", &home);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("CAELUM_RS", "1");
+    cmd.cwd(&home);
+    for (k, v) in &injection.env {
+        cmd.env(k, v);
+    }
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..n]);
+            let _ = tx.send(all.clone());
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    writer.write_all(input.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut output = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(all) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            output = all;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            while let Ok(all) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                output = all;
+            }
+            break;
+        }
+    }
+    let _ = child.kill();
+    Some(Run {
+        output: String::from_utf8_lossy(&output).into_owned(),
+        root,
+    })
+}
+
+/// The shell started with injection, read the user's own rc, emitted OSC 7 and OSC 133,
+/// loaded the integration once, and did not leak the hand-off variables.
+fn check(run: &Run, rc_marker: &str) {
+    let out = &run.output;
+    if std::env::var_os("CAELUM_TEST_VERBOSE").is_some() {
+        eprintln!("{out:?}");
+    }
+    assert!(out.contains(rc_marker), "user rc not sourced:\n{out:?}");
+    assert!(out.contains("\x1b]133;A\x07"), "no OSC 133;A:\n{out:?}");
+    assert!(out.contains("\x1b]133;C\x07"), "no OSC 133;C:\n{out:?}");
+    assert!(out.contains("\x1b]133;D;0\x07"), "no OSC 133;D:\n{out:?}");
+    assert!(out.contains("\x1b]7;file://"), "no OSC 7:\n{out:?}");
+    // One prompt per command plus the first: each prompt emits exactly one A, so a
+    // duplicated hook (manual source plus injection) would double the A marks.
+    assert_eq!(
+        out.matches("\x1b]133;A\x07").count(),
+        out.matches("\x1b]133;C\x07").count(),
+        "integration loaded twice:\n{out:?}"
+    );
+    assert!(
+        out.contains("LEAK=[]"),
+        "hand-off variables leaked:\n{out:?}"
+    );
+    assert!(
+        !out.contains(run.root.to_str().unwrap()),
+        "injection dir leaked into the environment:\n{out:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs bash; run with --ignored"]
+fn bash_injection_sources_user_rc_and_emits_marks() {
+    for manual in [false, true] {
+        let rc = if manual {
+            "export MYRC=bashrc_ok\nsource @ROOT@/caelum.bash\n"
+        } else {
+            "export MYRC=bashrc_ok\n"
+        };
+        let Some(run) = inject(
+            "bash",
+            &[
+                (".bash_profile", ". ~/.bashrc\n".into()),
+                (".bashrc", format!("PS1='$ '\n{rc}")),
+            ],
+            "echo RC=$MYRC; cd /; echo LEAK=[$ENV$CAELUM_BASH_INJECT$CAELUM_BASH_ENV]\ntrue\nexit\n",
+        ) else {
+            return;
+        };
+        check(&run, "RC=bashrc_ok");
+    }
+}
+
+#[test]
+#[ignore = "needs zsh; run with --ignored"]
+fn zsh_injection_sources_user_rc_and_emits_marks() {
+    for manual in [false, true] {
+        let rc = if manual {
+            "export MYRC=zshrc_ok\nsource @ROOT@/caelum.zsh\n"
+        } else {
+            "export MYRC=zshrc_ok\n"
+        };
+        let Some(run) = inject(
+            "zsh",
+            &[
+                (
+                    ".zshenv",
+                    // Test hook for a relocated zsh whose modules are not in the
+                    // compiled-in module path.
+                    "export MYENV=zshenv_ok\n[ -n \"$CAELUM_TEST_ZSH_MODULES\" ] && module_path=($CAELUM_TEST_ZSH_MODULES $module_path)\n"
+                        .into(),
+                ),
+                (".zshrc", format!("PROMPT='$ '\n{rc}")),
+            ],
+            "echo RC=$MYRC$MYENV; cd /; echo \"LEAK=[$ZDOTDIR$CAELUM_ZDOTDIR]\"\ntrue\nexit\n",
+        ) else {
+            return;
+        };
+        check(&run, "RC=zshrc_okzshenv_ok");
+    }
+}
+
+#[test]
+#[ignore = "needs fish; run with --ignored"]
+fn fish_injection_sources_user_config_and_emits_marks() {
+    for manual in [false, true] {
+        let rc = if manual {
+            "set -gx MYRC fish_ok\nsource @ROOT@/caelum.fish\n"
+        } else {
+            "set -gx MYRC fish_ok\n"
+        };
+        let Some(run) = inject(
+            "fish",
+            &[(".config/fish/config.fish", rc.into())],
+            "echo RC=$MYRC; cd /; echo LEAK=[] XDG=$XDG_DATA_DIRS\ntrue\nexit\n",
+        ) else {
+            return;
+        };
+        check(&run, "RC=fish_ok");
+    }
+}

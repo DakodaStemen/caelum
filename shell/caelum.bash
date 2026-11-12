@@ -1,6 +1,9 @@
-# Caelum shell integration (OSC 7 cwd + OSC 133 prompt marks). Source from ~/.bashrc:
+# Caelum shell integration (OSC 7 cwd + OSC 133 prompt marks).
+# Caelum loads this automatically; sourcing it by hand (from ~/.bashrc) is harmless:
 #   [ -n "$CAELUM_RS" ] && source /path/to/caelum.bash
 [ -n "$CAELUM_RS" ] || return 0
+# Already loaded (by hand or by Caelum's automatic injection): do nothing twice.
+declare -F __caelum_precmd >/dev/null 2>&1 && return 0
 # Percent-encode every byte outside [A-Za-z0-9/._~-] so control bytes (BEL, ESC),
 # '%', spaces and non-ASCII bytes in a directory name cannot end or inject sequences.
 __caelum_urlencode() {

@@ -1,5 +1,8 @@
-# Caelum shell integration. Source from ~/.zshrc:  [[ -n $CAELUM_RS ]] && source /path/to/caelum.zsh
+# Caelum shell integration. Caelum loads this automatically; sourcing it by hand is harmless:
+#   [[ -n $CAELUM_RS ]] && source /path/to/caelum.zsh
 [[ -n $CAELUM_RS ]] || return 0
+# Already loaded (by hand or by Caelum's automatic injection): do nothing twice.
+(( $+functions[__caelum_precmd] )) && return 0
 # Percent-encode every byte outside [A-Za-z0-9/._~-] so control bytes (BEL, ESC),
 # '%', spaces and non-ASCII bytes in a directory name cannot end or inject sequences.
 __caelum_urlencode() {

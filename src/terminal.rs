@@ -9,7 +9,7 @@ use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
-    term::{Config, Term, TermMode},
+    term::{ClipboardType, Config, Osc52, Term, TermMode},
     vte::ansi::{self, Color, NamedColor},
 };
 #[cfg_attr(not(unix), allow(unused_imports))]
@@ -26,7 +26,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 /// Terminal events forwarded from the parser thread to the UI thread.
 ///
@@ -68,10 +68,28 @@ impl EventListener for Events {
             Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) => {
                 let _ = self.tx.try_send(event);
             }
-            // Everything else (wakeups, bells, clipboard requests, ...) is ignored by the UI.
+            // OSC 52 writes only; the UI decides whether to honour them. Reads
+            // (`ClipboardLoad`) are never forwarded, so a program cannot see the clipboard.
+            Event::ClipboardStore(ClipboardType::Clipboard, _) => {
+                let _ = self.tx.try_send(event);
+            }
+            // Everything else (wakeups, bells, reads, the PRIMARY selection, ...) is ignored.
             _ => {}
         }
     }
+}
+/// Largest OSC 52 clipboard write that is honoured.
+pub const OSC52_MAX_BYTES: usize = 1024 * 1024;
+/// Whether a program's OSC 52 write of `text` may reach the clipboard: the setting
+/// is on, the text is not empty and it is within [`OSC52_MAX_BYTES`].
+fn osc52_accepts(enabled: bool, text: &str) -> Result<bool, usize> {
+    if !enabled || text.is_empty() {
+        return Ok(false);
+    }
+    if text.len() > OSC52_MAX_BYTES {
+        return Err(text.len());
+    }
+    Ok(true)
 }
 const DEFAULT_TITLE: &str = "Terminal";
 const MAX_TITLE_CHARS: usize = 100;
@@ -133,11 +151,33 @@ pub struct ShellState {
     /// True between OSC 133;C and OSC 133;D.
     pub running: bool,
     last_history: usize,
+    /// When the running command's output began (OSC 133;C).
+    started: Option<Instant>,
+    /// Absolute line where the running command's output began.
+    output_start: Option<i64>,
+    /// Absolute line span `start..end` of the last finished command's output.
+    output: Option<(i64, i64)>,
+    /// A command that just finished, until [`Session::take_finished`] collects it.
+    finished: Option<Finished>,
+}
+/// A command that ran from OSC 133;C to OSC 133;D.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Finished {
+    pub elapsed: Duration,
+    /// Exit status, if the shell reported one.
+    pub code: Option<i32>,
 }
 impl ShellState {
     fn clear_marks(&mut self) {
         self.marks.clear();
+        // Output spans are absolute line numbers too.
+        self.output_start = None;
+        self.output = None;
     }
+}
+/// Absolute index of the cursor's line (0 = oldest scrollback line).
+fn cursor_abs(term: &Term<Events>) -> i64 {
+    term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0)
 }
 fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
     match event {
@@ -153,12 +193,61 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
                 shell.marks.push(abs);
             }
         }
-        OscEvent::OutputStart => shell.running = true,
+        OscEvent::OutputStart => {
+            shell.running = true;
+            shell.started = Some(Instant::now());
+            // Output starts on the line below the command the user typed.
+            shell.output_start =
+                (!term.mode().contains(TermMode::ALT_SCREEN)).then(|| cursor_abs(term));
+        }
         OscEvent::CommandEnd(code) => {
+            let was_running = shell.running;
             shell.running = false;
             shell.last_exit = code;
+            if let Some(start) = shell.output_start.take()
+                && !term.mode().contains(TermMode::ALT_SCREEN)
+            {
+                // The cursor sits at the start of the line after the output, unless the
+                // output did not end in a newline; then its last line is the cursor's.
+                let cursor = cursor_abs(term);
+                let end = if term.grid().cursor.point.column.0 == 0 {
+                    cursor
+                } else {
+                    cursor + 1
+                };
+                shell.output = (end > start).then_some((start, end));
+            }
+            if let Some(started) = shell.started.take()
+                && was_running
+            {
+                shell.finished = Some(Finished {
+                    elapsed: started.elapsed(),
+                    code,
+                });
+            }
         }
     }
+}
+/// Where the shell integration scripts live and how to start `shell` with them, or
+/// `None` when the shell is unknown or the scripts cannot be written (the terminal
+/// then simply starts without integration).
+fn shell_injection(shell: &str) -> Option<crate::shell_integration::Injection> {
+    let root = crate::shell_integration::dir_in(&crate::platform::default_profile_dir());
+    crate::shell_integration::install(&root).ok()?;
+    crate::shell_integration::plan(shell, &root, &|k| std::env::var(k).ok())
+}
+/// Text of the absolute line span `start..end` (end exclusive), if it is still on the grid.
+fn output_text(term: &Term<Events>, start: i64, end: i64) -> Option<String> {
+    let history = term.grid().history_size() as i64;
+    let (first, last) = (start - history, end - 1 - history);
+    if end <= start || first < -history || last >= term.screen_lines() as i64 {
+        return None;
+    }
+    let text = term.bounds_to_string(
+        Point::new(Line(first as i32), Column(0)),
+        Point::new(Line(last as i32), term.last_column()),
+    );
+    Some(text.trim_end_matches('\n').to_string())
 }
 /// Absolute indexes drift once Alacritty starts discarding old scrollback, so marks
 /// are dropped when history is truncated or full instead of pointing at wrong lines.
@@ -196,6 +285,16 @@ pub struct Session {
     focus_reported: Option<bool>,
     /// Text was copied to the clipboard since the app last asked (for the toast).
     copied: bool,
+    /// Programs may set the clipboard with OSC 52 (kept in step with the preference).
+    pub osc52_write: bool,
+    /// Output arrived while the view was scrolled back (for the scroll-to-bottom pill).
+    unseen_output: bool,
+    /// Last history size and display offset seen, to tell new output from scrolling.
+    last_history: usize,
+    /// Directories may be opened from a Ctrl+click (a file browser pane exists).
+    pub dir_links: bool,
+    /// Launched as `ssh`/`codex`/`claude` rather than a shell.
+    runs_program: bool,
     wake: egui::Context,
     /// Test hook: when set, the cleanup thread waits for a message before doing any
     /// work, so a test can prove `drop` returns while cleanup has not yet run.
@@ -204,6 +303,17 @@ pub struct Session {
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
+        Self::spawn_with(cwd, argv, ctx, true)
+    }
+    /// Starts a session. With `integrate`, the user's shell (when `argv` is `None`) is
+    /// launched so it emits OSC 7 / OSC 133 without any dotfile edits; see
+    /// [`crate::shell_integration`].
+    pub fn spawn_with(
+        cwd: &Path,
+        argv: Option<&[String]>,
+        ctx: egui::Context,
+        integrate: bool,
+    ) -> Result<Self> {
         let cwd = if cwd.is_dir() {
             cwd.to_path_buf()
         } else {
@@ -224,9 +334,22 @@ impl Session {
             c
         } else {
             let mut c = CommandBuilder::new(&shell);
-            c.args(crate::platform::shell_args(&shell));
+            let injection = integrate.then(|| shell_injection(&shell)).flatten();
+            match injection.as_ref().and_then(|i| i.args.as_ref()) {
+                Some(args) => c.args(args),
+                None => c.args(crate::platform::shell_args(&shell)),
+            };
+            if let Some(i) = injection {
+                for (k, v) in i.env {
+                    c.env(k, v);
+                }
+            }
             c
         };
+        // These panes are the program itself, not a shell: closing one stops real work.
+        let runs_program = argv
+            .and_then(|a| a.first())
+            .is_some_and(|p| matches!(p.as_str(), "ssh" | "codex" | "claude"));
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -306,6 +429,11 @@ impl Session {
             metrics: None,
             focus_reported: None,
             copied: false,
+            osc52_write: true,
+            unseen_output: false,
+            last_history: 0,
+            dir_links: false,
+            runs_program,
             wake: ctx,
             #[cfg(test)]
             cleanup_gate: None,
@@ -365,6 +493,35 @@ impl Session {
             self.copied = true;
         }
     }
+    /// The text of the last finished command's output (OSC 133 C to D), if the shell
+    /// integration reported one and it is still in the scrollback.
+    pub fn last_output(&self) -> Option<String> {
+        let term = lock(&self.term);
+        let (start, end) = lock(&self.shell).output?;
+        output_text(&term, start, end).filter(|t| !t.is_empty())
+    }
+    /// The command that finished since the last call, if any.
+    pub fn take_finished(&mut self) -> Option<Finished> {
+        lock(&self.shell).finished.take()
+    }
+    /// Whether closing this pane would stop something the user is running: a command
+    /// the shell integration reports, a foreground job other than the shell itself,
+    /// or an `ssh`/`codex`/`claude` session. An idle shell at a prompt is not busy.
+    pub fn is_busy(&self) -> bool {
+        if self.exited {
+            return false;
+        }
+        if self.runs_program || lock(&self.shell).running {
+            return true;
+        }
+        #[cfg(unix)]
+        if let (Some(master), Some(pid)) = (&self.master, self.pid())
+            && let Some(fg) = master.process_group_leader()
+        {
+            return fg > 0 && fg as u32 != pid;
+        }
+        false
+    }
     /// Whether text was copied since the last call.
     pub fn take_copied(&mut self) -> bool {
         std::mem::take(&mut self.copied)
@@ -404,7 +561,21 @@ impl Session {
                     })
                     .into_bytes(),
                 ),
-                // Clipboard escape sequences are deliberately not granted automatic clipboard access.
+                // OSC 52 is write-only: the clipboard can be set but never read back.
+                Event::ClipboardStore(_, text) => match osc52_accepts(self.osc52_write, &text) {
+                    Ok(true) => {
+                        let ctx = self.wake.clone();
+                        self.copy_to_clipboard(&ctx, text);
+                    }
+                    Ok(false) => {}
+                    Err(n) => {
+                        self.error = Some(format!(
+                            "Ignored a {} KiB clipboard write (limit {} KiB)",
+                            n / 1024,
+                            OSC52_MAX_BYTES / 1024
+                        ));
+                    }
+                },
                 _ => {}
             }
         }
@@ -428,6 +599,34 @@ impl Session {
         {
             self.cwd = cwd;
         }
+    }
+    /// Notes output that arrived while the view is scrolled back, and forgets it
+    /// once the view is at the bottom again.
+    fn track_unseen_output(&mut self) {
+        let (history, offset) = {
+            let term = lock(&self.term);
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        if offset == 0 {
+            self.unseen_output = false;
+        } else if history != self.last_history {
+            self.unseen_output = true;
+        }
+        self.last_history = history;
+    }
+    /// Whether the view is scrolled back from the live bottom of the terminal.
+    pub fn scrolled_back(&self) -> bool {
+        lock(&self.term).grid().display_offset() > 0
+    }
+    /// Whether output arrived while the view was scrolled back.
+    pub fn has_unseen_output(&self) -> bool {
+        self.unseen_output
+    }
+    /// Where the "scroll to bottom" pill is drawn (only while scrolled back), once
+    /// the pane has been drawn.
+    pub fn scroll_pill_rect(&self) -> Option<Rect> {
+        let m = self.metrics.as_ref()?;
+        self.scrolled_back().then(|| pill_rect(m.rect))
     }
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let size = Size {
@@ -1042,6 +1241,8 @@ struct Mouse {
 fn term_config() -> Config {
     Config {
         semantic_escape_chars: ",│`|\"' ()[]{}<>\t".into(),
+        // Programs may set the clipboard but never read it back.
+        osc52: Osc52::OnlyCopy,
         ..Config::default()
     }
 }
@@ -1111,6 +1312,8 @@ pub struct Shown {
     pub selected: Option<String>,
     /// A middle click asked to paste the PRIMARY selection.
     pub paste_primary: bool,
+    /// A Ctrl+click on a local file or directory named in the output.
+    pub open_file: Option<FileRef>,
 }
 
 pub fn show(
@@ -1145,7 +1348,8 @@ pub fn show(
     }
     shown.selected = handle_selection(ui, s, &response, &m, pointer);
     shown.paste_primary = !pointer.forwards_to_program() && response.middle_clicked();
-    let link = handle_links(ui, s, &response, &m, pointer);
+    let (link, open_file) = handle_links(ui, s, &response, &m, pointer);
+    shown.open_file = open_file;
     handle_scroll(ui, s, &response, &m, pointer);
     if focused && !blocked && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
         handle_events(ui, s, prefs);
@@ -1158,6 +1362,7 @@ pub fn show(
     );
     paint_exit_badge(s, theme, prefs, &painter, m.rect);
     paint_scroll_indicator(ui, s, theme, &painter, &response, m.rect);
+    scroll_pill(ui, s, theme, m.rect);
     if ui.input(|i| !i.raw.hovered_files.is_empty()) && response.contains_pointer() {
         painter.rect_stroke(
             m.rect.shrink(1.),
@@ -1189,7 +1394,9 @@ fn layout(
     ui.painter_at(rect)
         .rect_filled(rect, 0., theme.term("background"));
     s.resize((area.width() / cw) as usize, (area.height() / ch) as usize);
+    s.osc52_write = prefs.osc52_write;
     s.poll(theme);
+    s.track_unseen_output();
     let m = Metrics {
         rect,
         area,
@@ -1513,32 +1720,65 @@ fn link_at(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<String> {
         .map(|link| link.uri().to_string())
 }
 
-/// A link under the pointer: an OSC 8 hyperlink, or a URL written as plain text
-/// together with the cells it covers (to underline it).
+/// A local file or directory named in terminal text, as `path`, `path:line` or
+/// `path:line:col` (compiler errors, `rg`, tracebacks), resolved against the
+/// session's working directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRef {
+    pub path: PathBuf,
+    /// 1-based line and column to scroll to, when the text gave them.
+    pub line: Option<usize>,
+    pub col: Option<usize>,
+    pub is_dir: bool,
+}
+
+/// A link under the pointer: an OSC 8 hyperlink, a URL written as plain text, or a
+/// path to an existing local file, together with the cells it covers (to underline it).
 struct Link {
     uri: String,
     span: Option<(Point, Point)>,
+    file: Option<FileRef>,
 }
 
-fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2) -> Option<Link> {
+fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2, files: &FileLookup) -> Option<Link> {
     if let Some(uri) = link_at(term, m, pos) {
-        return Some(Link { uri, span: None });
+        return Some(Link {
+            uri,
+            span: None,
+            file: None,
+        });
     }
-    let (uri, start, end) = url_at(term, m.grid_point(term, pos))?;
+    let point = m.grid_point(term, pos);
+    if let Some((uri, start, end)) = url_at(term, point) {
+        return Some(Link {
+            uri,
+            span: Some((start, end)),
+            file: None,
+        });
+    }
+    let (file, start, end) = path_at(term, point, files)?;
     Some(Link {
-        uri,
+        uri: file.path.display().to_string(),
         span: Some((start, end)),
+        file: Some(file),
     })
 }
 
-/// The web URL written in the text at `point` (following wrapped lines), with its
-/// first and last cells.
-fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
+/// What paths in terminal text are resolved against.
+struct FileLookup<'a> {
+    cwd: &'a Path,
+    home: PathBuf,
+    /// Whether a directory is worth linking (a file browser pane can show it).
+    dirs: bool,
+}
+
+/// The cells of the (soft-wrapped) text around `point`, without wide-character
+/// spacers, bounded so scanning a wrapped line every frame stays cheap.
+fn text_cells(term: &Term<Events>, point: Point) -> Vec<(char, Point)> {
     use alacritty_terminal::term::cell::Flags;
     let grid = term.grid();
     let last = term.last_column();
     let wraps = |line: Line| grid[Point::new(line, last)].flags.contains(Flags::WRAPLINE);
-    // Bounded so a screen of one wrapped line stays cheap to scan every frame.
     let (mut top, mut bottom) = (point.line, point.line);
     while top > term.topmost_line() && wraps(top - 1) && point.line - top < 16 {
         top -= 1;
@@ -1559,6 +1799,13 @@ fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
             }
         }
     }
+    cells
+}
+
+/// The web URL written in the text at `point` (following wrapped lines), with its
+/// first and last cells.
+fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
+    let cells = text_cells(term, point);
     let at = cells.iter().rposition(|(_, p)| *p <= point)?;
     let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
     let (from, to) = find_urls(&chars)
@@ -1569,6 +1816,180 @@ fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
         cells[from].1,
         cells[to - 1].1,
     ))
+}
+
+/// The existing local file written in the text at `point`, with its first and last cells.
+fn path_at(
+    term: &Term<Events>,
+    point: Point,
+    files: &FileLookup,
+) -> Option<(FileRef, Point, Point)> {
+    let cells = text_cells(term, point);
+    let at = cells.iter().rposition(|(_, p)| *p <= point)?;
+    let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
+    // Only the token under the pointer is looked at (and statted), not the line.
+    let found = find_path_tokens(&chars)
+        .into_iter()
+        .find(|t| (t.from..t.to).contains(&at))?;
+    let file = resolve_file_ref(&found.text, found.line, found.col, files)?;
+    Some((file, cells[found.from].1, cells[found.to - 1].1))
+}
+
+/// A candidate path in a run of text: its character range, the path text and any
+/// line and column that followed it.
+#[derive(Debug, PartialEq, Eq)]
+struct PathToken {
+    from: usize,
+    to: usize,
+    text: String,
+    line: Option<usize>,
+    col: Option<usize>,
+}
+
+/// Characters that end a path token: space, quotes, brackets and box drawing.
+fn ends_path(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | ','
+                | ';'
+                | '│'
+        )
+}
+
+/// Splits `text` into tokens that might name a file. The existence check, which
+/// needs the disk and a working directory, is [`resolve_file_ref`]'s job.
+fn find_path_tokens(text: &[char]) -> Vec<PathToken> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if ends_path(text[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len() && !ends_path(text[i]) {
+            i += 1;
+        }
+        let mut end = i;
+        // Prose punctuation after the path is not part of it.
+        while end > start && matches!(text[end - 1], '.' | ':' | '!' | '?' | '*' | '=') {
+            end -= 1;
+        }
+        let token: String = text[start..end].iter().collect();
+        let Some((path, mut line, col, used)) = split_line_col(&token) else {
+            continue;
+        };
+        let end = start + token[..used].chars().count();
+        if token.starts_with("http://") || token.starts_with("https://") {
+            continue;
+        }
+        if !looks_like_path(&path, line.is_some()) {
+            continue;
+        }
+        // Python tracebacks: `File "x.py", line 12`.
+        if line.is_none() && start > 0 && text[start - 1] == '"' {
+            let rest: String = text[i..text.len().min(i + 24)].iter().collect();
+            if let Some(n) = rest.strip_prefix("\", line ") {
+                let digits: String = n.chars().take_while(char::is_ascii_digit).collect();
+                line = digits.parse().ok();
+            }
+        }
+        found.push(PathToken {
+            from: start,
+            to: end,
+            text: path,
+            line,
+            col,
+        });
+    }
+    found
+}
+
+/// `path`, `path:12` and `path:12:5` split into the path and its 1-based numbers,
+/// and the length in bytes of the part of `token` they came from. Text after the
+/// numbers (`path:12:text`, as `rg` prints) is not part of the link.
+fn split_line_col(token: &str) -> Option<(String, Option<usize>, Option<usize>, usize)> {
+    let number = |rest: &str| -> Option<(usize, usize)> {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let ends = rest[digits..].is_empty() || rest[digits..].starts_with(':');
+        (digits > 0 && digits <= 9 && ends).then(|| (rest[..digits].parse().unwrap_or(0), digits))
+    };
+    for (i, _) in token.match_indices(':') {
+        // A Windows drive letter (`C:\x`, `C:/x`) is part of the path.
+        if i == 1 && matches!(token.as_bytes().get(2), Some(b'\\' | b'/')) {
+            continue;
+        }
+        let Some((line, n)) = number(&token[i + 1..]) else {
+            continue;
+        };
+        if i == 0 {
+            return None;
+        }
+        let mut used = i + 1 + n;
+        let mut col = None;
+        if let Some(rest) = token[used..].strip_prefix(':')
+            && let Some((c, n)) = number(rest)
+        {
+            col = Some(c);
+            used += 1 + n;
+        }
+        return Some((token[..i].to_string(), Some(line), col, used));
+    }
+    (!token.is_empty()).then(|| (token.to_string(), None, None, token.len()))
+}
+
+/// Cheap filter before touching the disk: something with a separator, a dot, a
+/// home prefix or an explicit line number, and not just dots.
+fn looks_like_path(path: &str, has_line: bool) -> bool {
+    if path.chars().all(|c| c == '.') || path.contains('\0') {
+        return false;
+    }
+    has_line || path.starts_with('~') || path.contains(['/', '\\', '.'])
+}
+
+/// Resolves path text against the session's directory; `None` unless it exists
+/// (and, for a directory, `files.dirs` allows it).
+fn resolve_file_ref(
+    text: &str,
+    line: Option<usize>,
+    col: Option<usize>,
+    files: &FileLookup,
+) -> Option<FileRef> {
+    let path = if text == "~" {
+        files.home.clone()
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        files.home.join(rest)
+    } else {
+        let p = PathBuf::from(text);
+        if p.is_absolute() {
+            p
+        } else {
+            files.cwd.join(p)
+        }
+    };
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.is_dir() && !files.dirs {
+        return None;
+    }
+    Some(FileRef {
+        path,
+        line: line.map(|n| n.max(1)),
+        col: col.map(|n| n.max(1)),
+        is_dir: meta.is_dir(),
+    })
 }
 
 /// Character ranges of the `http://` and `https://` URLs in `text`. Trailing
@@ -1627,22 +2048,31 @@ fn find_urls(text: &[char]) -> Vec<(usize, usize)> {
 }
 
 /// OSC 8 link text can differ from its target, so the real URI is always revealed
-/// on hover before a Ctrl+click opens it. Plain-text URLs are underlined on hover
-/// and open the same way. Returns the cells of a hovered plain-text URL.
+/// on hover before a Ctrl+click opens it. Plain-text URLs and paths to existing
+/// local files are underlined on hover and open the same way. Returns the cells of
+/// a hovered plain-text link and the file a Ctrl+click asked to open.
 fn handle_links(
     ui: &egui::Ui,
     s: &Session,
     response: &egui::Response,
     m: &Metrics,
     p: PointerMode,
-) -> Option<(Point, Point)> {
+) -> (Option<(Point, Point)>, Option<FileRef>) {
     let mut span = None;
+    let files = FileLookup {
+        cwd: &s.cwd,
+        home: crate::model::home(),
+        dirs: s.dir_links,
+    };
     if let Some(pos) = response.hover_pos()
         && s.mouse.gesture.is_none()
     {
-        let link = link_under(&lock(&s.term), m, pos);
+        let link = link_under(&lock(&s.term), m, pos, &files);
         if let Some(link) = link {
-            let tip = if openable_link(&link.uri) {
+            let tip = if link.file.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                "Ctrl+click to open".to_string()
+            } else if openable_link(&link.uri) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 if link.span.is_some() {
                     "Ctrl+click to open".to_string()
@@ -1661,16 +2091,20 @@ fn handle_links(
             ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
     }
+    let mut open = None;
     let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     if response.clicked()
         && ctrl
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some(link) = link_under(&lock(&s.term), m, pos)
-        && openable_link(&link.uri)
+        && let Some(link) = link_under(&lock(&s.term), m, pos, &files)
     {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+        if link.file.is_some() {
+            open = link.file;
+        } else if openable_link(&link.uri) {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+        }
     }
-    span
+    (span, open)
 }
 
 /// Wheel and touchpad scrolling: reported to a program that asked for mouse
@@ -2039,6 +2473,7 @@ fn paint_grid(
             m.cell_pos(point.column.0, row),
             selected,
             found,
+            prefs.min_contrast,
         );
     }
     // The focused pane of a focused window shows a solid (blinking) cursor; any
@@ -2102,6 +2537,7 @@ fn paint_cell(
     pos: Pos2,
     selected: bool,
     found: bool,
+    min_contrast: f32,
 ) {
     use alacritty_terminal::term::cell::Flags;
     let (cw, ch) = (m.cw, m.ch);
@@ -2135,6 +2571,11 @@ fn paint_cell(
         .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN)
     {
         return;
+    }
+    if cell.c != ' ' {
+        // Text a program colored nearly the same as its background (dark blue on
+        // black, say) is moved just far enough to be legible.
+        fg = crate::theme::ensure_contrast(fg, bg, min_contrast);
     }
     if cell.flags.contains(Flags::DIM) {
         fg = fg.gamma_multiply(0.66);
@@ -2251,6 +2692,75 @@ fn paint_scroll_indicator(
     painter.rect_filled(thumb, 2., theme.term("foreground").gamma_multiply(alpha));
 }
 
+const PILL_SIZE: Vec2 = Vec2::new(124., 24.);
+/// Bottom-right of a pane, clear of the scroll indicator.
+fn pill_rect(pane: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            pane.right() - 16. - PILL_SIZE.x,
+            pane.bottom() - 12. - PILL_SIZE.y,
+        ),
+        PILL_SIZE,
+    )
+}
+
+/// A floating "Jump to bottom" pill, shown only while the view is scrolled back; a
+/// click returns to the live output. It takes an accent outline when output has
+/// arrived since the view left the bottom.
+fn scroll_pill(ui: &egui::Ui, s: &mut Session, theme: &Theme, rect: Rect) {
+    if !s.scrolled_back() {
+        return;
+    }
+    let area = pill_rect(rect);
+    let response = ui.interact(area, ui.id().with("scroll-pill"), Sense::click());
+    let new_output = s.unseen_output;
+    let accent = theme.ui("accent");
+    let fg = theme.term("foreground");
+    let painter = ui.painter_at(rect);
+    let fill = crate::theme::mix(
+        theme.term("background"),
+        fg,
+        if response.hovered() { 0.20 } else { 0.12 },
+    );
+    painter.rect_filled(area, 12., fill);
+    let edge = if new_output {
+        accent
+    } else {
+        fg.gamma_multiply(0.3)
+    };
+    painter.rect_stroke(
+        area,
+        12.,
+        Stroke::new(if new_output { 1.5_f32 } else { 1. }, edge),
+        egui::StrokeKind::Inside,
+    );
+    let ink = if new_output {
+        accent
+    } else {
+        fg.gamma_multiply(0.85)
+    };
+    // A down chevron, then the label.
+    let c = Pos2::new(area.left() + 16., area.center().y);
+    let stroke = Stroke::new(1.6_f32, ink);
+    painter.line_segment([c + Vec2::new(-4., -2.), c + Vec2::new(0., 2.)], stroke);
+    painter.line_segment([c + Vec2::new(0., 2.), c + Vec2::new(4., -2.)], stroke);
+    painter.text(
+        Pos2::new(area.left() + 28., area.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Jump to bottom",
+        FontId::proportional(11.),
+        ink,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        lock(&s.term).scroll_display(Scroll::Bottom);
+        s.unseen_output = false;
+        ui.ctx().request_repaint();
+    }
+}
+
 /// Small "exit N" badge in the corner after a command reported a non-zero status.
 fn paint_exit_badge(
     s: &Session,
@@ -2295,9 +2805,15 @@ fn context_menu(
         return;
     }
     if response.secondary_clicked() {
+        let files = FileLookup {
+            cwd: &s.cwd,
+            home: crate::model::home(),
+            dirs: false,
+        };
         s.mouse.menu_link = response
             .interact_pointer_pos()
-            .and_then(|pos| link_under(&lock(&s.term), m, pos))
+            .and_then(|pos| link_under(&lock(&s.term), m, pos, &files))
+            .filter(|link| link.file.is_none())
             .map(|link| link.uri);
     }
     let mut open = false;
@@ -2336,6 +2852,16 @@ fn context_menu(
             }
         }
         ui.separator();
+        let has_output = lock(&s.shell).output.is_some();
+        if ui
+            .add_enabled(has_output, egui::Button::new("Copy Last Command Output"))
+            .clicked()
+        {
+            if let Some(text) = s.last_output() {
+                s.copy_to_clipboard(ui.ctx(), text);
+            }
+            ui.close();
+        }
         let (history, offset) = {
             let term = lock(&s.term);
             (term.grid().history_size(), term.grid().display_offset())
@@ -2363,8 +2889,136 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg_attr(not(unix), allow(unused_imports))]
-    use std::time::Instant;
+    /// Runs `bytes` through the same scanner/parser/apply path as the reader thread.
+    fn feed(
+        term: &mut Term<Events>,
+        shell: &mut ShellState,
+        parser: &mut ansi::Processor,
+        scanner: &mut OscScanner,
+        bytes: &[u8],
+    ) {
+        let mut done = 0;
+        for (end, event) in scanner.scan(bytes) {
+            parser.advance(term, &bytes[done..end]);
+            done = end;
+            apply_osc(term, shell, event);
+        }
+        parser.advance(term, &bytes[done..]);
+        reconcile_marks(term, shell);
+    }
+    fn shell_term(rows: usize) -> (Term<Events>, ShellState) {
+        let (events, _queue) = Events::new();
+        (
+            Term::new(term_config(), &Size { cols: 20, rows }, events),
+            ShellState::default(),
+        )
+    }
+    #[test]
+    fn last_output_is_the_text_between_osc_133_c_and_d() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut go = |term: &mut Term<Events>, shell: &mut ShellState, s: &str| {
+            feed(term, shell, &mut parser, &mut scanner, s.as_bytes());
+        };
+        go(&mut term, &mut shell, "\x1b]133;A\x07$ echo hi\r\n");
+        go(&mut term, &mut shell, "\x1b]133;C\x07hi\r\nthere\r\n");
+        go(&mut term, &mut shell, "\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let (s, e) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e).as_deref(), Some("hi\nthere"));
+        // The next command replaces it; output without a final newline keeps its last line.
+        go(&mut term, &mut shell, "ls\r\n\x1b]133;C\x07a b\r\npartial");
+        go(
+            &mut term,
+            &mut shell,
+            "\x1b]133;D;1\x07\x1b]133;A\x07\r\n$ ",
+        );
+        let (s, e) = shell.output.unwrap();
+        assert_eq!(output_text(&term, s, e).as_deref(), Some("a b\npartial"));
+        assert_eq!(shell.last_exit, Some(1));
+    }
+    #[test]
+    fn last_output_spans_scrollback_and_is_dropped_when_marks_are() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut text = String::from("\x1b]133;C\x07");
+        for i in 0..30 {
+            text.push_str(&format!("line {i}\r\n"));
+        }
+        text.push_str("\x1b]133;D;0\x07$ ");
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            text.as_bytes(),
+        );
+        let (s, e) = shell.output.unwrap();
+        assert_eq!(e - s, 30);
+        let out = output_text(&term, s, e).unwrap();
+        assert!(
+            out.starts_with("line 0\n") && out.ends_with("line 29"),
+            "{out}"
+        );
+        shell.clear_marks();
+        assert_eq!(
+            shell.output, None,
+            "positions are invalid after a reflow or clear"
+        );
+    }
+    #[test]
+    fn empty_output_and_alternate_screen_record_no_span() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"$ true\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+        );
+        assert_eq!(shell.output, None);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b[?1049h\x1b]133;C\x07x\r\n\x1b]133;D;0\x07\x1b[?1049l",
+        );
+        assert_eq!(shell.output, None);
+    }
+    #[test]
+    fn a_finished_command_reports_how_long_it_ran_once() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;C\x07",
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;D;7\x07",
+        );
+        let f = shell.finished.take().expect("a finished command");
+        assert_eq!(f.code, Some(7));
+        assert!(f.elapsed >= Duration::from_millis(30));
+        assert!(shell.finished.is_none());
+        // A D without a C (the very first prompt) is not a command.
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\x1b]133;D;0\x07",
+        );
+        assert!(shell.finished.is_none());
+    }
     #[test]
     fn multiline_paste_needs_confirmation_only_without_bracketed_paste() {
         // Single line, any mode: never asks.
@@ -2599,8 +3253,6 @@ mod tests {
 mod regressions {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
-    #[cfg_attr(not(unix), allow(unused_imports))]
-    use std::time::Instant;
 
     fn term_with(cols: usize, rows: usize, output: &str) -> Term<Events> {
         let (events, _queue) = Events::new();
@@ -2886,7 +3538,6 @@ mod regressions {
 #[cfg(all(test, unix))]
 mod input_queue_tests {
     use super::*;
-    use std::time::Instant;
     #[cfg(unix)]
     #[test]
     fn burst_of_small_key_events_is_retained_under_backpressure() {
@@ -2954,5 +3605,182 @@ mod lock_shell_tests {
             );
         }
         assert_eq!(crate::platform::resolve_shell(Some("/bin/sh")), "/bin/sh");
+    }
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+    fn token(text: &str) -> Vec<(String, Option<usize>, Option<usize>)> {
+        find_path_tokens(&chars(text))
+            .into_iter()
+            .map(|t| (t.text, t.line, t.col))
+            .collect()
+    }
+    fn t(
+        path: &str,
+        line: Option<usize>,
+        col: Option<usize>,
+    ) -> (String, Option<usize>, Option<usize>) {
+        (path.to_string(), line, col)
+    }
+
+    #[test]
+    fn path_tokens_carry_line_and_column() {
+        assert_eq!(token("src/main.rs"), [t("src/main.rs", None, None)]);
+        assert_eq!(token("src/main.rs:42"), [t("src/main.rs", Some(42), None)]);
+        assert_eq!(
+            token("src/main.rs:42:7"),
+            [t("src/main.rs", Some(42), Some(7))]
+        );
+        // Compiler output.
+        assert_eq!(
+            token("  --> src/lib.rs:10:5"),
+            [t("src/lib.rs", Some(10), Some(5))]
+        );
+        // `rg` and `grep -n` print `file:line:text`; the text is not part of the path.
+        assert_eq!(
+            token("src/a.rs:3:fn main() {"),
+            [t("src/a.rs", Some(3), None)]
+        );
+        // Trailing prose punctuation and wrapping brackets are not part of it.
+        assert_eq!(token("see ./a/b.txt."), [t("./a/b.txt", None, None)]);
+        assert_eq!(token("(src/x.rs:9)"), [t("src/x.rs", Some(9), None)]);
+        assert_eq!(token("src/x.rs:9:5:"), [t("src/x.rs", Some(9), Some(5))]);
+        assert_eq!(token("'~/notes.md'"), [t("~/notes.md", None, None)]);
+        // Python tracebacks name the line after the quoted path.
+        assert_eq!(
+            token("  File \"/app/run.py\", line 27, in <module>"),
+            [t("/app/run.py", Some(27), None)]
+        );
+        // A bare name only counts with a line number, a dot or a separator.
+        assert_eq!(token("Makefile:3"), [t("Makefile", Some(3), None)]);
+        assert!(token("hello world error E0432: nope").is_empty());
+        assert!(token("... .. :").is_empty());
+        // URLs are the URL code's business.
+        assert!(token("https://example.com/a.html:80").is_empty());
+    }
+
+    #[test]
+    fn path_token_ranges_cover_only_the_path() {
+        let text = chars("at src/a.rs:3:9 ok");
+        let tokens = find_path_tokens(&text);
+        assert_eq!(tokens.len(), 1);
+        let got: String = text[tokens[0].from..tokens[0].to].iter().collect();
+        assert_eq!(got, "src/a.rs:3:9");
+    }
+
+    #[test]
+    fn file_refs_resolve_against_the_working_directory_and_must_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("notes.md"), "x").unwrap();
+        let lookup = |dirs| FileLookup {
+            cwd: dir.path(),
+            home: home.path().to_path_buf(),
+            dirs,
+        };
+        let f = resolve_file_ref("src/main.rs", Some(12), Some(3), &lookup(false)).unwrap();
+        assert_eq!(f.path, dir.path().join("src/main.rs"));
+        assert_eq!((f.line, f.col, f.is_dir), (Some(12), Some(3), false));
+        // Absolute paths and `~` need no working directory.
+        let abs = dir.path().join("src/main.rs");
+        let f = resolve_file_ref(abs.to_str().unwrap(), None, None, &lookup(false)).unwrap();
+        assert_eq!(f.path, abs);
+        let f = resolve_file_ref("~/notes.md", None, None, &lookup(false)).unwrap();
+        assert_eq!(f.path, home.path().join("notes.md"));
+        // Line 0 is read as line 1.
+        assert_eq!(
+            resolve_file_ref("src/main.rs", Some(0), None, &lookup(false))
+                .unwrap()
+                .line,
+            Some(1)
+        );
+        // Missing files are not links.
+        assert!(resolve_file_ref("src/missing.rs", Some(1), None, &lookup(true)).is_none());
+        // Directories only when something can show them.
+        assert!(resolve_file_ref("src", None, None, &lookup(false)).is_none());
+        let d = resolve_file_ref("src", None, None, &lookup(true)).unwrap();
+        assert!(d.is_dir);
+        // `..` resolves from the working directory too.
+        let sub = FileLookup {
+            cwd: &dir.path().join("src"),
+            home: home.path().to_path_buf(),
+            dirs: false,
+        };
+        assert!(resolve_file_ref("../src/main.rs", None, None, &sub).is_some());
+    }
+
+    #[test]
+    fn osc52_cap_and_toggle() {
+        assert_eq!(osc52_accepts(true, "hello"), Ok(true));
+        assert_eq!(osc52_accepts(false, "hello"), Ok(false));
+        assert_eq!(osc52_accepts(true, ""), Ok(false));
+        let at_cap = "x".repeat(OSC52_MAX_BYTES);
+        assert_eq!(osc52_accepts(true, &at_cap), Ok(true));
+        let over = "x".repeat(OSC52_MAX_BYTES + 1);
+        assert_eq!(osc52_accepts(true, &over), Err(OSC52_MAX_BYTES + 1));
+        // A disabled toggle ignores even oversized text quietly.
+        assert_eq!(osc52_accepts(false, &over), Ok(false));
+    }
+
+    #[test]
+    fn only_clipboard_writes_are_forwarded() {
+        let (events, queue) = Events::new();
+        events.send_event(Event::ClipboardStore(ClipboardType::Clipboard, "hi".into()));
+        events.send_event(Event::ClipboardStore(
+            ClipboardType::Selection,
+            "primary".into(),
+        ));
+        events.send_event(Event::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|text| text.to_string()),
+        ));
+        let got: Vec<Event> = queue.rx.try_iter().collect();
+        assert_eq!(got.len(), 1, "reads and PRIMARY writes must be dropped");
+        assert!(matches!(&got[0], Event::ClipboardStore(ClipboardType::Clipboard, t) if t == "hi"));
+    }
+
+    #[cfg(unix)]
+    fn run_osc52(text_b64: &str, enabled: bool) -> (bool, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            &format!("printf '\\033]52;c;{text_b64}\\007'; sleep 2"),
+        ]
+        .map(String::from)
+        .into();
+        let ctx = egui::Context::default();
+        let mut s = Session::spawn(dir.path(), Some(&argv), ctx.clone()).unwrap();
+        s.osc52_write = enabled;
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(if enabled { 8 } else { 1 });
+        let mut copied = false;
+        while std::time::Instant::now() < end && !copied {
+            s.poll(&theme);
+            copied = s.take_copied();
+            thread::sleep(Duration::from_millis(10));
+        }
+        (copied, s.error.take())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc52_write_reaches_the_clipboard_and_toasts() {
+        let (copied, error) = run_osc52("aGVsbG8=", true);
+        assert!(copied, "OSC 52 write was not forwarded: {error:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc52_write_is_ignored_when_turned_off() {
+        assert!(!run_osc52("aGVsbG8=", false).0);
     }
 }

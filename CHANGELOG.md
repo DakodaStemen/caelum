@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Ctrl+click a local file path in terminal output (`path`, `path:line`, `path:line:col`,
+  as printed by compilers, `rg` and Python tracebacks) to open it in Caelum's editor
+  pane scrolled to that line; relative paths resolve against the shell's directory and
+  only existing files are links. Folders open in the file browser pane when one exists.
+  An editor already showing the file is reused.
+- Directional pane focus: Ctrl+Alt+Left/Right/Up/Down (rebindable as `focus_left`,
+  `focus_right`, `focus_up`, `focus_down`; also in the command palette) focuses the
+  neighbouring split pane and leaves zoom. Alt+Arrow is not used: shells bind it to
+  word movement.
+- A floating "Jump to bottom" pill appears at the bottom right of a terminal only
+  while it is scrolled back; clicking it returns to the live output, and its outline
+  takes the accent colour when new output arrived meanwhile.
+- OSC 52 clipboard writes from programs now reach the clipboard (with the "Copied to
+  clipboard" toast), capped at 1 MiB and switchable in Preferences (**Programs Can
+  Copy**, on by default) or `[terminal] osc52_write`. Reading the clipboard stays blocked.
+- Minimum contrast: text that a program colors nearly the same as its background is
+  nudged lighter or darker to reach a contrast ratio of 1.5 (`[terminal] min_contrast`,
+  1 to 21; 1 disables). Bundled themes' own colors are unaffected.
+- Automatic shell integration: bash, zsh and fish start with Caelum's OSC 7 / OSC 133
+  integration loaded, with no dotfile edits (bash via an `ENV` shim that runs the login
+  files, zsh via a `ZDOTDIR` wrapper that restores yours, fish via `vendor_conf.d`).
+  Your own startup files run first and are never modified, a manual `source caelum.*`
+  stays harmless, and the hand-off variables are not inherited by child shells. The
+  scripts are embedded in the binary and written to the profile directory. Turn it off
+  with `shell_integration = false` in `config.toml`.
+- A command that ran 10 s or longer and finishes while its pane is not the focused one
+  (or the window is in the background) shows a toast ("Command finished in 18s",
+  "Command failed (exit 1) after 12s") and puts a dot on its tab until you look at the
+  pane. `long_command_seconds` in `config.toml` changes the threshold; 0 turns it off.
+- "Copy Last Command Output" in the terminal context menu, the command palette and as
+  the rebindable `copy_last_output` shortcut (default Ctrl+Shift+O); needs shell
+  integration.
+- Closing a pane, tab, workspace or window asks first only when a terminal in it is
+  running something (an integrated shell's command, any foreground job, or an
+  ssh/codex/claude session); idle shells at a prompt close silently.
 - Copy on Select is now on by default: finishing a selection copies it to the
   clipboard and shows a "Copied to clipboard" toast (also for Ctrl+Shift+C, Ctrl+Insert
   and the menu Copy). Existing profiles pick up the new default (the preference is

@@ -33,11 +33,26 @@ pub struct CursorConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    /// Minimum WCAG contrast ratio between text and its background (1 to 21);
+    /// fainter text is nudged lighter or darker. 1 turns the nudge off.
+    pub min_contrast: Option<f32>,
+    /// Allow programs to set the clipboard with OSC 52 (write only).
+    pub osc52_write: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Id of a bundled or custom theme.
     pub theme: Option<String>,
     pub font: FontConfig,
     pub cursor: CursorConfig,
+    pub terminal: TerminalConfig,
+    /// `false` starts shells without Caelum's automatic OSC 7 / OSC 133 integration.
+    pub shell_integration: Option<bool>,
+    /// Seconds before a finished background command is announced; 0 disables it.
+    pub long_command_seconds: Option<u64>,
     /// Action name -> shortcut such as `"ctrl+shift+t"`. See [`ACTIONS`].
     pub keybindings: BTreeMap<String, String>,
 }
@@ -64,6 +79,12 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("select_all", "ctrl+shift+a"),
     ("prev_prompt", "ctrl+shift+up"),
     ("next_prompt", "ctrl+shift+down"),
+    // Alt+Arrow is word movement in readline/zsh, so panes use Ctrl+Alt.
+    ("focus_left", "ctrl+alt+left"),
+    ("focus_right", "ctrl+alt+right"),
+    ("focus_up", "ctrl+alt+up"),
+    ("focus_down", "ctrl+alt+down"),
+    ("copy_last_output", "ctrl+shift+o"),
 ];
 
 /// Where the config lives: `--config`/`CAELUM_RS_CONFIG`, else XDG, else `~/.config`.
@@ -109,6 +130,16 @@ impl Config {
         {
             bail!("cursor.style must be block, bar or underline");
         }
+        if let Some(c) = self.terminal.min_contrast
+            && !(1.0..=21.0).contains(&c)
+        {
+            bail!("terminal.min_contrast must be between 1 and 21");
+        }
+        if let Some(s) = self.long_command_seconds
+            && s > 86_400
+        {
+            bail!("long_command_seconds must be at most 86400 (0 turns it off)");
+        }
         Keymap::build(&self.keybindings).map(|_| ())
     }
     /// Overlay the values this file sets onto the profile preferences.
@@ -127,6 +158,18 @@ impl Config {
         }
         if let Some(b) = self.cursor.blink {
             prefs.cursor_blink = b;
+        }
+        if let Some(c) = self.terminal.min_contrast {
+            prefs.min_contrast = c;
+        }
+        if let Some(b) = self.terminal.osc52_write {
+            prefs.osc52_write = b;
+        }
+        if let Some(b) = self.shell_integration {
+            prefs.shell_integration = b;
+        }
+        if let Some(s) = self.long_command_seconds {
+            prefs.long_command_secs = s;
         }
     }
     /// A commented starter file, printed by `--print-config` when nothing is set.
@@ -286,6 +329,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_integration_and_long_command_settings_apply() {
+        let mut p = Preferences::default();
+        assert!(p.shell_integration);
+        assert_eq!(p.long_command_secs, 10);
+        Config::parse("shell_integration = false\nlong_command_seconds = 30\n")
+            .unwrap()
+            .apply(&mut p);
+        assert!(!p.shell_integration);
+        assert_eq!(p.long_command_secs, 30);
+        assert!(Config::parse("long_command_seconds = 999999\n").is_err());
+        let k = Config::parse("[keybindings]\ncopy_last_output = \"ctrl+alt+o\"\n").unwrap();
+        assert!(Keymap::build(&k.keybindings).is_ok());
+    }
+    #[test]
     fn parses_full_file_and_applies() {
         let c = Config::parse(
             r#"
@@ -297,6 +354,9 @@ line_height = 1.3
 [cursor]
 style = "bar"
 blink = true
+[terminal]
+min_contrast = 3.0
+osc52_write = false
 [keybindings]
 new_tab = "ctrl+alt+t"
 "#,
@@ -304,6 +364,8 @@ new_tab = "ctrl+alt+t"
         .unwrap();
         let mut p = Preferences::default();
         c.apply(&mut p);
+        assert_eq!(p.min_contrast, 3.0);
+        assert!(!p.osc52_write);
         assert_eq!(p.terminal_font, "JetBrains Mono");
         assert_eq!(p.font_size, 13.5);
         assert_eq!(p.cursor_style, "bar");
@@ -329,6 +391,9 @@ new_tab = "ctrl+alt+t"
             "[font]\nsize = 2",
             "[font]\nline_height = 9",
             "[cursor]\nstyle = \"blob\"",
+            "[terminal]\nmin_contrast = 0.5",
+            "[terminal]\nmin_contrast = 30",
+            "[keybindings]\nfocus_left = \"ctrl+alt+right\"",
             "[keybindings]\nnope = \"ctrl+x\"",
             "[keybindings]\nnew_tab = \"t\"",
             "[keybindings]\nnew_tab = \"ctrl+shift+nonsense\"",

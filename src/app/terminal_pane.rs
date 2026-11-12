@@ -21,6 +21,12 @@ impl App {
         cwd: &mut PathBuf,
         command: &Option<Vec<String>>,
     ) -> bool {
+        // Directories in output are links only if there is a file browser to show them.
+        let has_files = {
+            let mut leaves = vec![];
+            self.tab().layout.leaves(&mut leaves);
+            leaves.iter().any(|p| matches!(p, Pane::Files { .. }))
+        };
         if !self.terminals.contains_key(id) {
             // Defense in depth: State::validate already drops unsupported commands.
             if !model::allowed_terminal_command(command.as_deref()) {
@@ -36,7 +42,12 @@ impl App {
             } else {
                 command.as_deref()
             };
-            match Session::spawn(cwd, chosen, ctx.clone()) {
+            match Session::spawn_with(
+                cwd,
+                chosen,
+                ctx.clone(),
+                self.state.preferences.shell_integration,
+            ) {
                 Ok(s) => {
                     self.terminals.insert(id.to_string(), s);
                 }
@@ -52,6 +63,7 @@ impl App {
             ctx.request_repaint();
             return false;
         };
+        session.dir_links = has_files;
         let allow_input = selected
             && !self.palette
             && !self.settings
@@ -97,6 +109,10 @@ impl App {
         }
         if session.take_copied() {
             self.message = "Copied to clipboard".into();
+        }
+        if let Some(target) = shown.open_file {
+            // Opened after the frame's layout, which writes the layout back.
+            self.pending_ref = Some(target);
         }
         *cwd = session.cwd.clone();
         if let Some(error) = session.error.take() {
