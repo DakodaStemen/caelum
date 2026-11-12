@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- bash older than 4.4 (macOS `/bin/bash` 3.2): `caelum.bash` no longer arms a `DEBUG`
+  trap or appends to `PROMPT_COMMAND` (that broke prompts ending in `;`/`&`/a comment,
+  lost chained traps and misfired in `bind -x` handlers). Caelum now detects the command
+  start itself from Enter at a prompt, for any shell that sends OSC 133 `A`/`D` without
+  `C`, so Copy Last Command Output and the long-command notice still work.
+- OSC strings other than OSC 52 are cut off at 8 KiB instead of 1.4 MB (a huge OSC 2
+  title plus repeated `CSI 22;0t` grew memory by hundreds of MB); OSC 52 keeps its limit.
 - Review fixes for the friendlier-terminal work: the injected bash starts with the
   same options as a plain `bash -l` (`inherit_errexit` and the history defaults are no
   longer left from POSIX mode); OSC 52 writes are refused on the reader thread when the

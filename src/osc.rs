@@ -115,7 +115,50 @@ impl OscScanner {
 /// `cat` of a hostile file) could make it allocate arbitrarily much; this caps that.
 /// It is above the base64 form of the largest honoured OSC 52 write (1 MiB), so a write
 /// cut off here still decodes to more than the clipboard cap and is refused as too big.
+///
+/// Only OSC 52 (clipboard) may be that long. Every other OSC is capped at
+/// [`MAX_OSC_OTHER_BYTES`]: Alacritty clones an OSC 2 title into a 4096-entry stack on
+/// each `CSI 22;0t`, so a megabyte title there cost hundreds of MB of memory.
 pub const MAX_OSC_BYTES: usize = 1024 * 1024 * 4 / 3 + 8 * 1024;
+
+/// Cap for every OSC string except OSC 52: 8 KiB. That is twice [`MAX_PAYLOAD`] (the
+/// longest OSC 7/133 the scanner honours), so the guard never truncates a string the
+/// scanner would accept, and well above the 2083 bytes terminals promise OSC 8
+/// hyperlink URIs (plus `id=` params) and above any real title, palette or notification
+/// string. A title stack full of capped titles stays under 4096 * 8 KiB = 32 MiB.
+pub const MAX_OSC_OTHER_BYTES: usize = 8 * 1024;
+
+/// How much of the OSC number (the bytes before the first `;`) has been seen. Only the
+/// exact bytes `52;` earn the large cap, as in vte, which matches `params[0] == b"52"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Number {
+    Start,
+    Five,
+    FiftyTwo,
+    /// Past the number, and it is not 52.
+    Other,
+    /// `52;` seen.
+    Clipboard,
+}
+
+impl Number {
+    fn next(self, b: u8) -> Self {
+        match (self, b) {
+            (Self::Start, b'5') => Self::Five,
+            (Self::Five, b'2') => Self::FiftyTwo,
+            (Self::FiftyTwo, b';') => Self::Clipboard,
+            (Self::Clipboard, _) => Self::Clipboard,
+            _ => Self::Other,
+        }
+    }
+    fn cap(self) -> usize {
+        if self == Self::Clipboard {
+            MAX_OSC_BYTES
+        } else {
+            MAX_OSC_OTHER_BYTES
+        }
+    }
+}
 
 /// Bytes that leave vte 0.15's Escape state unchanged: it executes the C0 controls
 /// (except CAN/SUB, which return to Ground), ignores DEL and anything >= 0x80 (it has
@@ -133,13 +176,14 @@ fn esc_stays(b: u8) -> bool {
 enum GuardState {
     Ground,
     Esc,
-    Osc(usize),
+    /// Bytes of the string so far, and what its number says about its cap.
+    Osc(usize, Number),
     /// Over the cap: payload bytes are dropped until the string ends.
     Skip,
 }
 
 /// Byte filter in front of the terminal parser that bounds OSC strings to
-/// [`MAX_OSC_BYTES`]. Longer strings are cancelled (`CAN`) at the cap, which makes the
+/// [`MAX_OSC_OTHER_BYTES`], or [`MAX_OSC_BYTES`] for OSC 52. Longer strings are cancelled (`CAN`) at the cap, which makes the
 /// parser dispatch the truncated string, and the rest is dropped up to the terminator.
 #[derive(Debug)]
 pub struct OscGuard {
@@ -169,18 +213,18 @@ impl OscGuard {
             self.state = match (self.state, b) {
                 (Ground, 0x1b) => Esc,
                 (Ground, _) => Ground,
-                (Esc, b']') => Osc(0),
+                (Esc, b']') => Osc(0, Number::Start),
                 (Esc, b) if esc_stays(b) => Esc,
                 (Esc, _) => Ground,
-                (Osc(_), 0x07 | 0x18 | 0x1a) => Ground,
+                (Osc(..), 0x07 | 0x18 | 0x1a) => Ground,
                 // vte ends the string at ESC and is then in Escape, not only for `\\`.
-                (Osc(_), 0x1b) => Esc,
-                (Osc(n), _) if n >= MAX_OSC_BYTES => {
+                (Osc(..), 0x1b) => Esc,
+                (Osc(n, num), _) if n >= num.cap() => {
                     cancel = true;
                     keep = false;
                     Skip
                 }
-                (Osc(n), _) => Osc(n + 1),
+                (Osc(n, num), b) => Osc(n + 1, num.next(b)),
                 (Skip, 0x07) => {
                     keep = false;
                     Ground
@@ -391,15 +435,25 @@ mod tests {
 
     /// Longest OSC string (bytes between the params' `;`s excluded) vte dispatched.
     #[derive(Default)]
-    struct Longest(usize);
+    struct Longest(usize, usize);
     impl alacritty_terminal::vte::Perform for Longest {
         fn osc_dispatch(&mut self, params: &[&[u8]], _bell: bool) {
-            self.0 = self.0.max(params.iter().map(|p| p.len()).sum());
+            let len = params.iter().map(|p| p.len()).sum();
+            self.0 = self.0.max(len);
+            // Everything but OSC 52 (vte's `params[0] == b"52"`) has the small cap.
+            if params.first() != Some(&&b"52"[..]) {
+                self.1 = self.1.max(len);
+            }
         }
     }
     /// What vte dispatches for `chunks` fed through a fresh guard; returns the longest
     /// dispatched OSC and the bytes the guard forwarded.
     fn through_guard(chunks: &[&[u8]]) -> (usize, Vec<u8>) {
+        let (all, _, fwd) = through_guard_stats(chunks);
+        (all, fwd)
+    }
+    /// As [`through_guard`], plus the longest dispatched OSC that is not OSC 52.
+    fn through_guard_stats(chunks: &[&[u8]]) -> (usize, usize, Vec<u8>) {
         let (mut g, mut parser, mut seen) = (
             OscGuard::new(),
             alacritty_terminal::vte::Parser::new(),
@@ -411,7 +465,7 @@ mod tests {
             parser.advance(&mut seen, &f);
             fwd.extend_from_slice(&f);
         }
-        (seen.0, fwd)
+        (seen.0, seen.1, fwd)
     }
     fn long_osc(prefix: &[u8], len: usize, end: &[u8]) -> Vec<u8> {
         let mut v = prefix.to_vec();
@@ -474,6 +528,81 @@ mod tests {
         let (_, fwd) = through_guard(&[&stream]);
         assert_eq!(fwd, stream);
     }
+    /// The large cap is for OSC 52 only: every other number is bounded to 8 KiB, the
+    /// number may be split across reads, and what follows survives.
+    #[test]
+    fn guard_caps_every_non_clipboard_osc_small() {
+        let body = |n: usize| std::iter::repeat_n(b'A', n);
+        for num in [
+            &b"0"[..],
+            b"1",
+            b"2",
+            b"8",
+            b"7",
+            b"4",
+            b"133",
+            b"",
+            b"5",
+            b"520",
+            b"052",
+            b"52x",
+            b"5 2",
+            b"+52",
+        ] {
+            let mut stream = b"\x1b]".to_vec();
+            stream.extend(num);
+            stream.push(b';');
+            stream.extend(body(1024 * 1024));
+            stream.extend(b"\x07tail");
+            // Whole, and split at every position through the number and its `;`.
+            for split in 0..=num.len() + 4 {
+                let (all, other, fwd) = through_guard_stats(&[&stream[..split], &stream[split..]]);
+                assert!(
+                    other <= MAX_OSC_OTHER_BYTES,
+                    "{num:?} split {split}: {other}"
+                );
+                assert!(all <= MAX_OSC_OTHER_BYTES, "{num:?} split {split}: {all}");
+                assert!(
+                    fwd.len() < MAX_OSC_OTHER_BYTES + 64,
+                    "{num:?}: {}",
+                    fwd.len()
+                );
+                assert!(fwd.ends_with(b"tail"), "{num:?} split {split}");
+            }
+            // Byte-at-a-time reads give the same bytes as one read.
+            let one: Vec<&[u8]> = stream.chunks(1).take(64).collect();
+            let rest = &stream[one.len()..];
+            let mut parts = one;
+            parts.push(rest);
+            assert_eq!(through_guard(&parts), through_guard(&[&stream]), "{num:?}");
+        }
+        // OSC 52 keeps its large cap, split anywhere in "52;" too.
+        let stream = long_osc(b"\x1b]", 1024 * 1024, b"\x07tail");
+        for split in 0..8 {
+            let (all, other, fwd) = through_guard_stats(&[&stream[..split], &stream[split..]]);
+            assert_eq!((all, other), (1024 * 1024 + 3, 0), "split {split}");
+            assert_eq!(fwd, stream, "split {split}");
+        }
+    }
+    /// Reviewer's case: a 1.4 MB OSC 2 title (what `CSI 22;0t` would then clone into
+    /// Alacritty's title stack, once per push) reaches the parser as at most 8 KiB.
+    #[test]
+    fn guard_bounds_a_big_osc_2_title() {
+        let mut stream = b"\x1b]2;".to_vec();
+        stream.extend(std::iter::repeat_n(b'T', 1_400_000));
+        stream.extend(b"\x07\x1b[22;0t");
+        let (all, fwd) = through_guard(&[&stream]);
+        assert!(all <= MAX_OSC_OTHER_BYTES, "dispatched {all} bytes");
+        assert!(fwd.len() < MAX_OSC_OTHER_BYTES + 64);
+        assert!(fwd.ends_with(b"\x1b[22;0t"));
+        // Ordinary long values still pass: an OSC 8 URI of 4 KiB and an OSC 7 path.
+        for num in ["8;id=x;", "7;"] {
+            let mut ok = format!("\x1b]{num}").into_bytes();
+            ok.extend(std::iter::repeat_n(b'u', 4096));
+            ok.extend(b"\x07");
+            assert_eq!(through_guard(&[&ok]).1, ok, "{num}");
+        }
+    }
     /// Not an OSC in vte (escape intermediate / CSI / DCS), so nothing to bound and
     /// nothing may be altered.
     #[test]
@@ -520,6 +649,10 @@ mod tests {
                             stream.push(ALPHA[(next() % ALPHA.len() as u64) as usize]);
                         }
                         stream.push(b']');
+                        // Random OSC number prefix: 52; gets the large cap, others small.
+                        let num: &[u8] = [&b""[..], b"52;", b"5;", b"2;", b"520;", b"052;", b"52"]
+                            [(next() % 7) as usize];
+                        stream.extend(num);
                         let n = MAX_OSC_BYTES as u64 - 50 + next() % 200;
                         stream.extend(std::iter::repeat_n(b'A', n as usize));
                     }
@@ -529,6 +662,12 @@ mod tests {
             }
             let whole = through_guard(&[&stream]);
             assert!(whole.0 <= MAX_OSC_BYTES, "round {round}: {}", whole.0);
+            let stats = through_guard_stats(&[&stream]);
+            assert!(
+                stats.1 <= MAX_OSC_OTHER_BYTES,
+                "round {round}: non-52 OSC of {} bytes",
+                stats.1
+            );
             let mut cuts: Vec<usize> = (0..4)
                 .map(|_| (next() % (stream.len() as u64 + 1)) as usize)
                 .collect();

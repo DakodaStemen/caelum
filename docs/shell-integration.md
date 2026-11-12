@@ -3,7 +3,7 @@
 Caelum sets `CAELUM_RS` in every shell it spawns. Snippets in [`shell/`](../shell) emit:
 
 - **OSC 7** (`file://host/path`) after each prompt, so new panes/tabs open in the shell's current directory (including inside subshells; `/proc` is the fallback without integration). URIs naming a different host (e.g. over SSH) are ignored.
-- **OSC 133** A/C/D prompt and command marks, enabling **Ctrl+Shift+Up / Ctrl+Shift+Down** to jump between prompts in scrollback (rebindable as `prev_prompt` / `next_prompt` in config.toml). Marks are dropped if scrollback is truncated rather than pointing at wrong lines.
+- **OSC 133** A/C/D prompt (`C` only from bash 4.4, see below) and command marks, enabling **Ctrl+Shift+Up / Ctrl+Shift+Down** to jump between prompts in scrollback (rebindable as `prev_prompt` / `next_prompt` in config.toml). Marks are dropped if scrollback is truncated rather than pointing at wrong lines.
 
 ## Automatic setup
 
@@ -40,6 +40,26 @@ shell_integration = false
   still in the scrollback.
 - Closing a pane, tab or window asks for confirmation only while a command is running.
   Without integration Caelum falls back to checking for a foreground job in the PTY.
+
+## bash before 4.4 (macOS `/bin/bash` 3.2)
+
+bash only has `PS0`, the hook that sends the command-start mark (`C`), from 4.4. On
+older bash `caelum.bash` sends OSC 7 and `A`/`D` only; it installs no `DEBUG` trap and
+does not touch the end of `PROMPT_COMMAND`, because a trap armed from there breaks
+`PROMPT_COMMAND` values ending in `;`, `&` or a comment, is restored around `source`
+(losing bash-preexec/iTerm2 chaining), and fires inside `bind -x` handlers such as fzf
+and atuin. [Ghostty takes the same stance](https://ghostty.org/docs/features/shell-integration#shell-integration-injection):
+its automatic integration does not support macOS `/bin/bash`.
+
+Instead Caelum notices the command start itself, for any shell that sends `A` and `D`
+but no `C`: when you press Enter (or paste several lines without bracketed paste) at a
+prompt, the output is taken to begin on the line after the cursor, and the run time
+starts then. A real `C`, when the shell sends one (bash 4.4+, zsh, fish), takes over.
+Enter inside a full-screen program, or while a command is running, is ignored, and
+bracketed-paste newlines are text, not Enter. Limits: a command typed over several
+lines (a `PS2` continuation) or edited with the cursor away from the end of the line
+starts its output a line or two early, and a command started by a prompt hook rather
+than Enter is not seen.
 
 ## Manual setup
 

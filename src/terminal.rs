@@ -180,6 +180,11 @@ pub struct ShellState {
     started: Option<Instant>,
     /// Absolute line where the running command's output began.
     output_start: Option<i64>,
+    /// A prompt was drawn (OSC 133;A) and no command has been submitted since.
+    at_prompt: bool,
+    /// The running command's start was inferred from the user pressing Enter at the
+    /// prompt, not reported by the shell (OSC 133;C). A real C replaces it.
+    inferred: bool,
     /// Absolute line span `start..end` of the last finished command's output, and, when
     /// its last line had no trailing newline, the last column that output filled (the
     /// next prompt is drawn after it on that same line and must not be copied).
@@ -201,6 +206,45 @@ impl ShellState {
         self.output_start = None;
         self.output = None;
     }
+    /// The user submitted a line at the prompt: for a shell that sends OSC 133;A/D but
+    /// never 133;C (bash before 4.4 has no PS0), this is the only command-start signal.
+    /// Ignored outside a prompt (a running command, a TUI, the alt screen); a real
+    /// 133;C arriving later overrides it. `cursor` is the absolute cursor line and
+    /// `alt_screen` whether the alternate screen is active, both at submission, so a
+    /// command line the terminal wrapped puts the output after its last row.
+    fn submit(&mut self, cursor: i64, alt_screen: bool) {
+        if !self.at_prompt || self.running || alt_screen {
+            return;
+        }
+        self.at_prompt = false;
+        self.running = true;
+        self.inferred = true;
+        self.started = Some(Instant::now());
+        self.output_start = Some(cursor + 1);
+    }
+}
+/// Whether bytes typed or pasted by the user submit the line being edited: a bare CR
+/// or LF (Enter, Ctrl+J, an unbracketed multi-line paste) outside a bracketed paste,
+/// whose newlines are text for the editor. `ESC CR` (Alt+Enter) is not Enter.
+fn submits_line(bytes: &[u8]) -> bool {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(START) {
+            let body = i + START.len();
+            match bytes[body..].windows(END.len()).position(|w| w == END) {
+                Some(at) => i = body + at + END.len(),
+                None => return false,
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\r' | b'\n') && (i == 0 || bytes[i - 1] != 0x1b) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 /// Absolute index of the cursor's line (0 = oldest scrollback line).
 fn cursor_abs(term: &Term<Events>) -> i64 {
@@ -219,9 +263,12 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
             if shell.marks.last() != Some(&abs) {
                 shell.marks.push(abs);
             }
+            shell.at_prompt = true;
         }
         OscEvent::OutputStart => {
             shell.running = true;
+            shell.inferred = false;
+            shell.at_prompt = false;
             shell.started = Some(Instant::now());
             // Output starts on the line below the command the user typed.
             shell.output_start =
@@ -230,6 +277,8 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
         OscEvent::CommandEnd(code) => {
             let was_running = shell.running;
             shell.running = false;
+            shell.inferred = false;
+            shell.at_prompt = false;
             shell.last_exit = code;
             if let Some(start) = shell.output_start.take()
                 && !term.mode().contains(TermMode::ALT_SCREEN)
@@ -517,7 +566,18 @@ impl Session {
     /// Writes a paste to the PTY now, bracketed if the program enabled it.
     pub fn paste(&mut self, text: &str) {
         let bracketed = self.bracketed_paste();
-        self.write(paste_bytes(text, bracketed));
+        self.write_input(paste_bytes(text, bracketed));
+    }
+    /// Writes what the user typed or pasted. Unlike [`Session::write`] (also used for
+    /// terminal replies and mouse reports) this notices Enter at a shell prompt, which
+    /// marks the command start for shells that never send OSC 133;C.
+    pub fn write_input(&mut self, bytes: Vec<u8>) {
+        if submits_line(&bytes) {
+            let term = lock(&self.term);
+            let alt = term.mode().contains(TermMode::ALT_SCREEN);
+            lock(&self.shell).submit(cursor_abs(&term), alt);
+        }
+        self.write(bytes);
     }
     /// Pastes like [`Session::paste`], unless [`needs_confirm`] says the user should
     /// see it first; then it is held until [`Session::take_pending_paste`].
@@ -2373,7 +2433,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
                     } else {
                         text
                     };
-                    s.write(text.into_bytes());
+                    s.write_input(text.into_bytes());
                     lock(&s.term).scroll_display(Scroll::Bottom);
                 }
             }
@@ -2410,7 +2470,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
                 modifiers,
                 ..
             } => handle_key(s, key, modifiers, mode),
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write_input(text.into_bytes()),
             _ => {}
         }
     }
@@ -2433,7 +2493,7 @@ fn handle_key(s: &mut Session, key: Key, modifiers: Modifiers, mode: TermMode) {
     if !(modifiers.ctrl && modifiers.shift)
         && let Some(bytes) = key_bytes(key, modifiers, mode)
     {
-        s.write(bytes);
+        s.write_input(bytes);
         lock(&s.term).scroll_display(Scroll::Bottom);
     }
 }
@@ -3156,21 +3216,16 @@ mod tests {
         let (s, e, c) = shell.output.expect("span recorded");
         assert_eq!(output_text(&term, s, e, c).as_deref(), Some("foo"));
     }
-    /// The same, end to end: a real bash running `printf foo` with Caelum's own
-    /// integration script, read back through the session API.
+    /// A real interactive bash (CAELUM_TEST_BASH, else the system one) running Caelum's
+    /// own integration script with the prompt `PROMPT> `, or `None` without a bash.
     #[cfg(unix)]
-    #[test]
-    fn real_shell_printf_without_newline_copies_only_its_output() {
-        // CAELUM_TEST_BASH lets CI/dev pick a specific bash (e.g. a 3.2 build).
+    fn real_bash_session() -> Option<(tempfile::TempDir, Session)> {
         let over = std::env::var("CAELUM_TEST_BASH").ok();
-        let Some(bash) = over
+        let bash = over
             .as_deref()
             .into_iter()
             .chain(["/bin/bash", "/usr/bin/bash"])
-            .find(|p| Path::new(p).is_file())
-        else {
-            return;
-        };
+            .find(|p| Path::new(p).is_file())?;
         let dir = tempfile::tempdir().unwrap();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("shell/caelum.bash");
         let rc = dir.path().join("rc");
@@ -3186,23 +3241,211 @@ mod tests {
             "-i".into(),
         ]
         .to_vec();
-        let mut s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
+        let s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
+        Some((dir, s))
+    }
+    #[cfg(unix)]
+    fn wait_for(s: &mut Session, what: &str, f: &dyn Fn(&Session) -> bool) {
         let theme = crate::theme::presets().remove("starlight").unwrap();
-        let wait = |s: &mut Session, what: &str, f: &dyn Fn(&Session) -> bool| {
-            let end = Instant::now() + Duration::from_secs(10);
-            while !f(s) {
-                s.poll(&theme);
-                assert!(Instant::now() < end, "timed out: {what}: {:?}", s.text());
-                thread::sleep(Duration::from_millis(20));
-            }
+        let end = Instant::now() + Duration::from_secs(10);
+        while !f(s) {
+            s.poll(&theme);
+            assert!(Instant::now() < end, "timed out: {what}: {:?}", s.text());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    /// The same, end to end: a real bash running `printf foo` with Caelum's own
+    /// integration script, read back through the session API. On bash < 4.4 (no PS0, so
+    /// no 133;C) the output start comes from the Enter the user typed.
+    #[cfg(unix)]
+    #[test]
+    fn real_shell_printf_without_newline_copies_only_its_output() {
+        let Some((_dir, mut s)) = real_bash_session() else {
+            return;
         };
-        wait(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
-        s.write(b"printf foo\r".to_vec());
-        wait(&mut s, "output", &|s| s.last_output().is_some());
-        wait(&mut s, "next prompt", &|s| {
+        wait_for(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
+        s.write_input(b"printf foo\r".to_vec());
+        wait_for(&mut s, "output", &|s| s.last_output().is_some());
+        wait_for(&mut s, "next prompt", &|s| {
             s.text().matches("PROMPT>").count() >= 2
         });
         assert_eq!(s.last_output().as_deref(), Some("foo"));
+        assert!(s.take_finished().is_some());
+        // An empty Enter right after leaves nothing running and reports no long command.
+        s.write_input(b"\r".to_vec());
+        wait_for(&mut s, "third prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 3
+        });
+        assert!(!lock(&s.shell).running);
+        assert!(
+            s.take_finished()
+                .is_some_and(|f| f.elapsed < Duration::from_secs(1))
+        );
+    }
+    /// The long-command timer works on any bash, including 3.2 without 133;C: the
+    /// finished command's elapsed time covers its whole run, and its exit code arrives.
+    #[cfg(unix)]
+    #[test]
+    fn real_shell_times_a_slow_command() {
+        let Some((_dir, mut s)) = real_bash_session() else {
+            return;
+        };
+        wait_for(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
+        s.write_input(b"sleep 1.2; (exit 3)\r".to_vec());
+        wait_for(&mut s, "running", &|s| lock(&s.shell).running);
+        assert!(s.is_busy());
+        wait_for(&mut s, "second prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 2
+        });
+        let done = s.take_finished().expect("finished command");
+        assert!(done.elapsed >= Duration::from_millis(1100), "{done:?}");
+        assert!(done.elapsed < Duration::from_secs(5), "{done:?}");
+        assert_eq!(done.code, Some(3));
+        assert!(!s.is_busy());
+    }
+    /// A shell that sends OSC 133;A and D but never C: the detector's view of Enter.
+    fn submit_term(rows: usize, text: &str) -> (Term<Events>, ShellState) {
+        let (mut term, mut shell) = shell_term(rows);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            text.as_bytes(),
+        );
+        (term, shell)
+    }
+    fn press_enter(term: &Term<Events>, shell: &mut ShellState) {
+        shell.submit(cursor_abs(term), term.mode().contains(TermMode::ALT_SCREEN));
+    }
+    #[test]
+    fn enter_at_a_prompt_marks_the_command_start_without_133_c() {
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ echo hi");
+        assert!(shell.at_prompt && !shell.running);
+        press_enter(&term, &mut shell);
+        assert!(shell.running && shell.inferred && shell.started.is_some());
+        // Output begins on the line after the command line, as the shell wrote it.
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nhi\r\nthere\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi\nthere"));
+        let done = shell.finished.take().expect("a finished command");
+        assert_eq!(done.code, Some(0));
+        assert!(!shell.running && shell.at_prompt);
+    }
+    #[test]
+    fn a_wrapped_command_line_starts_output_after_its_last_row() {
+        // 20 columns: this input wraps over three rows; the cursor sits on the third.
+        let cmd = "x".repeat(45);
+        let (mut term, mut shell) = submit_term(8, &format!("\x1b]133;A\x07$ {cmd}"));
+        press_enter(&term, &mut shell);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nout\r\n\x1b]133;D;0\x07",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("out"));
+    }
+    #[test]
+    fn empty_enter_gives_an_empty_span_that_d_closes() {
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ ");
+        press_enter(&term, &mut shell);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, None);
+        assert!(!shell.running && shell.output_start.is_none());
+        // It finished within microseconds, far below any long-command threshold.
+        assert!(
+            shell
+                .finished
+                .is_some_and(|f| f.elapsed < Duration::from_secs(1))
+        );
+        assert!(shell.at_prompt);
+    }
+    #[test]
+    fn enter_is_ignored_on_the_alt_screen_and_while_a_command_runs() {
+        // A TUI on the alternate screen: Enter belongs to the program.
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ vim\x1b[?1049h");
+        press_enter(&term, &mut shell);
+        assert!(!shell.running && shell.output_start.is_none() && shell.at_prompt);
+        // A command is running (real 133;C): Enter is input to it, not a new command.
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ cat\r\n\x1b]133;C\x07");
+        let (start, begun) = (shell.output_start, shell.started);
+        press_enter(&term, &mut shell);
+        assert!(!shell.inferred);
+        assert_eq!((shell.output_start, shell.started), (start, begun));
+        // Before any prompt was seen, or after the first Enter, a second one is ignored.
+        let (term, mut shell) = submit_term(5, "plain text");
+        press_enter(&term, &mut shell);
+        assert!(!shell.running);
+        let (mut term, mut shell) = submit_term(5, "\x1b]133;A\x07$ a");
+        press_enter(&term, &mut shell);
+        let first = shell.output_start;
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nline\r\n",
+        );
+        press_enter(&term, &mut shell);
+        assert_eq!(shell.output_start, first);
+    }
+    #[test]
+    fn a_real_133_c_overrides_the_inferred_start() {
+        let (mut term, mut shell) = submit_term(8, "\x1b]133;A\x07$ f() {");
+        press_enter(&term, &mut shell);
+        // A continuation prompt line, then the shell's real command-start mark.
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n> echo a; }\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+        );
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("out"));
+        assert!(!shell.inferred);
+    }
+    #[test]
+    fn only_unbracketed_newlines_submit_a_line() {
+        assert!(submits_line(b"\r"));
+        assert!(submits_line(b"\n"));
+        assert!(submits_line(b"ls\r"));
+        assert!(!submits_line(b"ls"));
+        assert!(!submits_line(b"\x1b\r"), "Alt+Enter");
+        assert!(!submits_line(b"\x03"));
+        // Bracketed paste: newlines are text for the editor, even many of them.
+        assert!(!submits_line(&paste_bytes("a\nb\nc", true)));
+        assert!(!submits_line(b"\x1b[200~a\rb"), "unterminated paste");
+        assert!(submits_line(b"\x1b[200~a\nb\x1b[201~\r"));
+        // Unbracketed multi-line paste submits, and only counts once at a prompt.
+        let bytes = paste_bytes("one\ntwo\nthree\n", false);
+        assert!(submits_line(&bytes));
+        let (term, mut shell) = submit_term(5, "\x1b]133;A\x07$ ");
+        for _ in bytes.iter().filter(|b| **b == b'\r') {
+            press_enter(&term, &mut shell);
+        }
+        assert_eq!(shell.output_start, Some(cursor_abs(&term) + 1));
     }
     #[test]
     fn last_output_spans_scrollback_and_is_dropped_when_marks_are() {

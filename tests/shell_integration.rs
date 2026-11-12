@@ -270,21 +270,34 @@ fn inject(shell: &str, dotfiles: &[(&str, String)], input: &str) -> Option<Run> 
 
 /// The shell started with injection, read the user's own rc, emitted OSC 7 and OSC 133,
 /// loaded the integration once, and did not leak the hand-off variables.
-fn check(run: &Run, rc_marker: &str) {
+///
+/// `with_c`: the shell sends the command-start mark (133;C). bash before 4.4 has no PS0
+/// and sends none; Caelum then detects the start from Enter, so the script must not.
+fn check(run: &Run, rc_marker: &str, with_c: bool) {
     let out = &run.output;
     if std::env::var_os("CAELUM_TEST_VERBOSE").is_some() {
         eprintln!("{out:?}");
     }
     assert!(out.contains(rc_marker), "user rc not sourced:\n{out:?}");
     assert!(out.contains("\x1b]133;A\x07"), "no OSC 133;A:\n{out:?}");
-    assert!(out.contains("\x1b]133;C\x07"), "no OSC 133;C:\n{out:?}");
+    assert_eq!(
+        out.contains("\x1b]133;C\x07"),
+        with_c,
+        "OSC 133;C present={}, expected {with_c}:\n{out:?}",
+        !with_c
+    );
     assert!(out.contains("\x1b]133;D;0\x07"), "no OSC 133;D:\n{out:?}");
     assert!(out.contains("\x1b]7;file://"), "no OSC 7:\n{out:?}");
     // One prompt per command plus the first: each prompt emits exactly one A, so a
     // duplicated hook (manual source plus injection) would double the A marks.
     assert_eq!(
         out.matches("\x1b]133;A\x07").count(),
-        out.matches("\x1b]133;C\x07").count(),
+        out.matches(if with_c {
+            "\x1b]133;C\x07"
+        } else {
+            "\x1b]133;D;"
+        })
+        .count(),
         "integration loaded twice:\n{out:?}"
     );
     assert!(
@@ -295,6 +308,22 @@ fn check(run: &Run, rc_marker: &str) {
         !out.contains(run.root.to_str().unwrap()),
         "injection dir leaked into the environment:\n{out:?}"
     );
+}
+
+/// bash has `PS0` (and so sends 133;C) from 4.4.
+fn bash_has_ps0() -> bool {
+    let Some(bash) = find("bash") else {
+        return true;
+    };
+    let out = Command::new(bash)
+        .args(["-c", "echo $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"])
+        .output()
+        .expect("run bash");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .unwrap()
+        >= 404
 }
 
 #[test]
@@ -316,7 +345,7 @@ fn bash_injection_sources_user_rc_and_emits_marks() {
         ) else {
             return;
         };
-        check(&run, "RC=bashrc_ok");
+        check(&run, "RC=bashrc_ok", bash_has_ps0());
     }
 }
 
@@ -346,7 +375,7 @@ fn zsh_injection_sources_user_rc_and_emits_marks() {
         ) else {
             return;
         };
-        check(&run, "RC=zshrc_okzshenv_ok");
+        check(&run, "RC=zshrc_okzshenv_ok", true);
     }
 }
 
@@ -366,7 +395,7 @@ fn fish_injection_sources_user_config_and_emits_marks() {
         ) else {
             return;
         };
-        check(&run, "RC=fish_ok");
+        check(&run, "RC=fish_ok", true);
     }
 }
 
