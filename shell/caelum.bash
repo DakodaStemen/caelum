@@ -1,6 +1,9 @@
-# Caelum shell integration (OSC 7 cwd + OSC 133 prompt marks). Source from ~/.bashrc:
+# Caelum shell integration (OSC 7 cwd + OSC 133 prompt marks).
+# Caelum loads this automatically; sourcing it by hand (from ~/.bashrc) is harmless:
 #   [ -n "$CAELUM_RS" ] && source /path/to/caelum.bash
 [ -n "$CAELUM_RS" ] || return 0
+# Already loaded (by hand or by Caelum's automatic injection): do nothing twice.
+declare -F __caelum_precmd >/dev/null 2>&1 && return 0
 # Percent-encode every byte outside [A-Za-z0-9/._~-] so control bytes (BEL, ESC),
 # '%', spaces and non-ASCII bytes in a directory name cannot end or inject sequences.
 __caelum_urlencode() {
@@ -22,4 +25,11 @@ __caelum_osc7() {
 }
 __caelum_precmd() { local s=$?; printf '\e]133;D;%s\a' "$s"; __caelum_osc7; printf '\e]133;A\a'; return $s; }
 PROMPT_COMMAND="__caelum_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-PS0='\e]133;C\a'"${PS0}"
+# PS0 (the command-start mark) only exists from bash 4.4. Older bash, such as macOS's
+# /bin/bash 3.2, gets no mark from this script: a DEBUG trap cannot be armed safely
+# there (it breaks PROMPT_COMMAND values ending in ';', '&' or a comment, is restored
+# around `source`, and fires inside `bind -x` handlers). Caelum itself notices Enter at
+# the prompt instead, so Copy Last Command Output and the long-command timer still work.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+  PS0='\e]133;C\a'"${PS0}"
+fi

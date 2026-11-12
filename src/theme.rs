@@ -230,9 +230,109 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
+/// WCAG relative luminance of an opaque color (0 black ..= 1 white).
+pub fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+/// WCAG contrast ratio between two colors, 1 (identical) ..= 21 (black on white).
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+/// `fg` moved toward white or black, as little as needed, until its contrast against
+/// `bg` is at least `min`. A color that already meets `min` is returned unchanged; if
+/// even the better extreme cannot reach `min`, that extreme is returned.
+pub fn ensure_contrast(fg: Color32, bg: Color32, min: f32) -> Color32 {
+    if min <= 1. || contrast_ratio(fg, bg) >= min {
+        return fg;
+    }
+    let (white, black) = (Color32::WHITE, Color32::BLACK);
+    // Lighten when the background is dark, darken when it is light (the direction
+    // with more room), unless that direction cannot reach `min` but the other can.
+    let first = if luminance(bg) < 0.18 { white } else { black };
+    let second = if first == white { black } else { white };
+    let target = if contrast_ratio(first, bg) >= min
+        || contrast_ratio(first, bg) >= contrast_ratio(second, bg)
+    {
+        first
+    } else {
+        second
+    };
+    if contrast_ratio(target, bg) < min {
+        return target;
+    }
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..12 {
+        let mid = (lo + hi) / 2.;
+        if contrast_ratio(mix(fg, target, mid), bg) >= min {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(fg, target, hi)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contrast_math_matches_wcag() {
+        let r = contrast_ratio(Color32::BLACK, Color32::WHITE);
+        assert!((r - 21.).abs() < 0.01, "{r}");
+        assert!((contrast_ratio(Color32::RED, Color32::RED) - 1.).abs() < 1e-6);
+        // Symmetric.
+        let (a, b) = (
+            Color32::from_rgb(10, 80, 200),
+            Color32::from_rgb(240, 240, 20),
+        );
+        assert_eq!(contrast_ratio(a, b), contrast_ratio(b, a));
+    }
+    #[test]
+    fn ensure_contrast_nudges_only_what_is_too_faint() {
+        let bg = Color32::from_rgb(30, 30, 30);
+        // Fine already: untouched, whatever the minimum.
+        let good = Color32::from_rgb(220, 220, 220);
+        assert_eq!(ensure_contrast(good, bg, 4.5), good);
+        // Black on near-black is lifted to the minimum, no further than needed.
+        let dark = Color32::from_rgb(20, 20, 20);
+        let fixed = ensure_contrast(dark, bg, 1.8);
+        let r = contrast_ratio(fixed, bg);
+        assert!((1.8..2.0).contains(&r), "{r}");
+        assert!(luminance(fixed) > luminance(bg));
+        // The same on a light background goes darker instead.
+        let light_bg = Color32::from_rgb(250, 250, 250);
+        let faint = Color32::from_rgb(240, 240, 240);
+        let fixed = ensure_contrast(faint, light_bg, 1.8);
+        assert!(luminance(fixed) < luminance(light_bg));
+        assert!(contrast_ratio(fixed, light_bg) >= 1.8);
+        // A disabled minimum (1.0 or less) never changes anything.
+        assert_eq!(ensure_contrast(dark, bg, 1.0), dark);
+        assert_eq!(ensure_contrast(dark, bg, 0.0), dark);
+        // Mid grey on mid grey cannot reach 21; the best extreme is returned.
+        let mid = Color32::from_gray(128);
+        let best = ensure_contrast(mid, mid, 21.);
+        assert!(best == Color32::BLACK || best == Color32::WHITE);
+    }
+    #[test]
+    fn bundled_themes_keep_their_text_color_at_the_default_minimum() {
+        for t in presets().values() {
+            let (fg, bg) = (t.term("foreground"), t.term("background"));
+            assert_eq!(
+                ensure_contrast(fg, bg, crate::model::DEFAULT_MIN_CONTRAST),
+                fg,
+                "{}",
+                t.name
+            );
+        }
+    }
     #[test]
     fn bundled_themes_complete() {
         let p = presets();

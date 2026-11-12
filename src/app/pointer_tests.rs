@@ -138,6 +138,16 @@ fn selection(h: &mut H<'_>) -> Option<String> {
 }
 
 /// Waits a little past the double-click window so the next press is a new click.
+/// Hovers `pos` (with whatever modifiers are held) long enough for the background
+/// file lookup behind path links to answer, as a real pointer resting on a link does.
+fn hover_settle(h: &mut H<'_>, pos: Pos2) {
+    move_to(h, pos);
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(60));
+        h.step();
+    }
+}
+
 fn pause(h: &mut H<'_>) {
     for _ in 0..40 {
         h.step();
@@ -162,6 +172,68 @@ fn drag_selects_exactly_the_dragged_text() {
     pause(&mut h);
     drag(&mut h, to, from);
     assert_eq!(selection(&mut h).as_deref(), Some("HELLO_SELECTION_WORLD"));
+}
+
+fn message(h: &mut H<'_>) -> String {
+    h.state_mut().as_mut().unwrap().message.clone()
+}
+
+#[test]
+fn finishing_a_drag_copies_and_toasts_once() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo HELLO_SELECTION_WORLD tail");
+    let row = row_of(&mut h, "HELLO_SELECTION_WORLD");
+    let from = at(&mut h, 0, row, 0.2);
+    let to = at(&mut h, 20, row, 0.8);
+    move_to(&mut h, from);
+    button(&mut h, from, egui::PointerButton::Primary, true);
+    for i in 1..=8 {
+        move_to(&mut h, from + (to - from) * (i as f32 / 8.));
+        assert_eq!(message(&mut h), "", "no toast while the drag is going");
+    }
+    button(&mut h, to, egui::PointerButton::Primary, false);
+    assert_eq!(message(&mut h), "Copied to clipboard");
+    // A bare click selects nothing and does not toast again.
+    h.state_mut().as_mut().unwrap().message.clear();
+    pause(&mut h);
+    let elsewhere = at(&mut h, 3, row, 0.5);
+    click(&mut h, elsewhere);
+    assert_eq!(message(&mut h), "");
+}
+
+#[test]
+fn copy_on_select_can_be_turned_off() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo HELLO_SELECTION_WORLD tail");
+    h.state_mut()
+        .as_mut()
+        .unwrap()
+        .state
+        .preferences
+        .copy_on_select = false;
+    let row = row_of(&mut h, "HELLO_SELECTION_WORLD");
+    let from = at(&mut h, 0, row, 0.2);
+    let to = at(&mut h, 20, row, 0.8);
+    drag(&mut h, from, to);
+    assert_eq!(selection(&mut h).as_deref(), Some("HELLO_SELECTION_WORLD"));
+    assert_eq!(message(&mut h), "");
+}
+
+#[test]
+fn shift_drag_selects_and_copies_under_mouse_reporting() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "printf '\\033[?1002h\\033[?1006h'; cat");
+    until(&mut h, "mouse mode", |s| {
+        s.term.lock().unwrap().mode().contains(TermMode::MOUSE_DRAG)
+    });
+    let prompt_row = row_of(&mut h, "$ printf");
+    let a = at(&mut h, 2, prompt_row, 0.2);
+    let b = at(&mut h, 7, prompt_row, 0.8);
+    modifiers(&mut h, Modifiers::SHIFT);
+    drag(&mut h, a, b);
+    modifiers(&mut h, Modifiers::NONE);
+    assert_eq!(selection(&mut h).as_deref(), Some("printf"));
+    assert_eq!(message(&mut h), "Copied to clipboard");
 }
 
 #[test]
@@ -410,4 +482,343 @@ fn focus_changes_are_reported_when_the_program_asks() {
     until(&mut h, "focus out", |s| s.text().contains("^[[O"));
     set_focus(&mut h, true);
     until(&mut h, "focus in", |s| s.text().contains("^[[O^[[I"));
+}
+
+// ---- Shell-state features: close confirmation, long-command notice, last output ----
+
+fn app<'a>(h: &'a mut H<'_>) -> &'a mut App {
+    h.state_mut().as_mut().unwrap()
+}
+
+/// The (id, path) of the editor panes in the active tab.
+fn editors(h: &mut H<'_>) -> Vec<(String, PathBuf)> {
+    let mut leaves = vec![];
+    app(h).tab().layout.leaves(&mut leaves);
+    leaves
+        .iter()
+        .filter_map(|p| match p {
+            Pane::Editor { id, path } => Some((id.clone(), path.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn files_path(h: &mut H<'_>) -> Option<PathBuf> {
+    let mut leaves = vec![];
+    app(h).tab().layout.leaves(&mut leaves);
+    leaves.iter().find_map(|p| match p {
+        Pane::Files { path, .. } => Some(path.clone()),
+        _ => None,
+    })
+}
+
+/// Steps until `cond` holds for the app, or panics after 15 s.
+fn until_app(h: &mut H<'_>, what: &str, cond: impl Fn(&mut App) -> bool) {
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        h.step();
+        if cond(app(h)) {
+            return;
+        }
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn ctrl_click_on_a_file_path_opens_the_editor_at_its_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().canonicalize().unwrap();
+    let body: String = (1..=100).map(|n| format!("row {n}\n")).collect();
+    std::fs::write(dir.join("notes.txt"), &body).unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let mut h = run(
+        d.path(),
+        &format!(
+            "cd {}; echo see notes.txt:50:3; echo see missing.txt:5; echo see sub/",
+            dir.display()
+        ),
+    );
+    let note_row = row_of(&mut h, "see notes.txt:50:3");
+    let missing_row = row_of(&mut h, "see missing.txt:5");
+    let sub_row = row_of(&mut h, "see sub/");
+    // The path is resolved against the shell's directory once it has moved there.
+    until(&mut h, "cd", |s| s.cwd == dir);
+    let panes = |h: &mut H<'_>| editors(h).len();
+    let before = panes(&mut h);
+    // A plain click opens nothing.
+    pause(&mut h);
+    let on_path = at(&mut h, 8, note_row, 0.5);
+    click(&mut h, on_path);
+    assert_eq!(panes(&mut h), before);
+    // Ctrl+click on a file that does not exist opens nothing either.
+    modifiers(&mut h, Modifiers::CTRL);
+    pause(&mut h);
+    let on_missing = at(&mut h, 8, missing_row, 0.5);
+    hover_settle(&mut h, on_missing);
+    click(&mut h, on_missing);
+    assert_eq!(panes(&mut h), before);
+    // Ctrl+click on a directory shows it in the file browser pane.
+    pause(&mut h);
+    let on_dir = at(&mut h, 6, sub_row, 0.5);
+    hover_settle(&mut h, on_dir);
+    click(&mut h, on_dir);
+    h.step();
+    assert_eq!(files_path(&mut h), Some(dir.join("sub")));
+    // Ctrl+click on the real file opens it in an editor pane...
+    pause(&mut h);
+    hover_settle(&mut h, on_path);
+    click(&mut h, on_path);
+    modifiers(&mut h, Modifiers::NONE);
+    until_app(&mut h, "editor pane", |a| !a.documents.is_empty());
+    let opened = editors(&mut h);
+    assert_eq!(opened.len(), before + 1, "{opened:?}");
+    let (id, path) = opened.last().unwrap().clone();
+    assert_eq!(path, dir.join("notes.txt"));
+    // ...with the cursor on line 50, column 3.
+    until_app(&mut h, "cursor placed", |a| !a.goto.contains_key(&id));
+    h.step();
+    let state = egui::TextEdit::load_state(&h.ctx, editor::text_id(&id)).expect("editor state");
+    let at_cursor = state.cursor.char_range().expect("cursor").primary.index;
+    let expected: usize = (1..50)
+        .map(|n| format!("row {n}\n").chars().count())
+        .sum::<usize>()
+        + 2;
+    assert_eq!(at_cursor, expected);
+    assert_eq!(app(&mut h).focused, id);
+    // Ctrl+clicking it again reuses the editor instead of opening another.
+    modifiers(&mut h, Modifiers::CTRL);
+    pause(&mut h);
+    hover_settle(&mut h, on_path);
+    click(&mut h, on_path);
+    modifiers(&mut h, Modifiers::NONE);
+    h.step();
+    assert_eq!(editors(&mut h).len(), before + 1);
+}
+
+fn chord(h: &mut H<'_>, key: Key, mods: Modifiers) {
+    h.input_mut().modifiers = mods;
+    h.input_mut().events.push(egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    });
+    h.step();
+    h.input_mut().modifiers = Modifiers::NONE;
+}
+
+#[test]
+fn closing_an_idle_shell_is_silent_but_a_running_command_asks() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = harness(d.path());
+    until(&mut h, "prompt", |s| s.text().contains('$'));
+    // At a prompt: nothing running, the close goes straight through.
+    assert!(!session(&mut h).is_busy());
+    let before = app(&mut h).terminals.len();
+    app(&mut h).request_close_pane();
+    h.step();
+    assert!(app(&mut h).pending.is_none());
+    assert_eq!(app(&mut h).terminals.len(), before - 1);
+
+    let mut h = run(d.path(), "sleep 30");
+    until(&mut h, "foreground job", |s| s.is_busy());
+    app(&mut h).request_close_pane();
+    h.step();
+    assert!(app(&mut h).pending.is_some(), "asks before killing it");
+    assert_eq!(app(&mut h).busy_in_pending(), 1);
+    assert_eq!(app(&mut h).terminals.len(), 1, "terminal still alive");
+    // Cancelling leaves it running.
+    app(&mut h).pending = None;
+    h.step();
+    assert!(session(&mut h).is_busy());
+}
+
+#[test]
+fn a_finished_job_stops_counting_as_busy() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "sleep 1");
+    until(&mut h, "foreground job", |s| s.is_busy());
+    until(&mut h, "job to finish", |s| !s.is_busy());
+}
+
+fn set_window_focus(h: &mut H<'_>, focused: bool) {
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .focused = Some(focused);
+    h.step();
+}
+
+#[test]
+fn directional_focus_moves_between_split_panes_and_leaves_zoom() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = harness(d.path());
+    until(&mut h, "prompt", |s| s.text().contains('$'));
+    let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+    let (terminal, files) = {
+        let mut leaves = vec![];
+        app(&mut h).tab().layout.leaves(&mut leaves);
+        let find = |want_term: bool| {
+            leaves
+                .iter()
+                .find(|p| matches!(p, Pane::Terminal { .. }) == want_term)
+                .map(|p| p.id().to_string())
+                .expect("default layout has both")
+        };
+        (find(true), find(false))
+    };
+    let rects = {
+        let a = app(&mut h);
+        let area = a.pane_area.expect("laid out");
+        let area = model::PaneRect::new(area.left(), area.top(), area.width(), area.height());
+        a.tab().layout.leaf_rects(area, panes::GAP)
+    };
+    let (dir_to_files, dir_back) = {
+        let x = |id: &str| rects.iter().find(|(i, _)| i == id).unwrap().1.x;
+        if x(&files) > x(&terminal) {
+            (Key::ArrowRight, Key::ArrowLeft)
+        } else {
+            (Key::ArrowLeft, Key::ArrowRight)
+        }
+    };
+    app(&mut h).focused = terminal.clone();
+    chord(&mut h, dir_to_files, ctrl_alt);
+    assert_eq!(app(&mut h).focused, files);
+    // No pane further that way: focus stays put.
+    chord(&mut h, dir_to_files, ctrl_alt);
+    assert_eq!(app(&mut h).focused, files);
+    chord(&mut h, Key::ArrowUp, ctrl_alt);
+    assert_eq!(app(&mut h).focused, files);
+    chord(&mut h, dir_back, ctrl_alt);
+    assert_eq!(app(&mut h).focused, terminal);
+    // From a zoomed pane the layout comes back, with focus on the neighbour.
+    app(&mut h).zoom = Some(terminal.clone());
+    h.step();
+    chord(&mut h, dir_to_files, ctrl_alt);
+    assert_eq!(app(&mut h).focused, files);
+    assert!(app(&mut h).zoom.is_none());
+    // The shell never saw the chords as text.
+    assert!(!session(&mut h).text().contains("^[["));
+}
+
+fn pill_center(h: &mut H<'_>) -> Option<Pos2> {
+    session(h).scroll_pill_rect().map(|r| r.center())
+}
+
+#[test]
+fn scroll_to_bottom_pill_appears_only_when_scrolled_back() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "seq 1 300; echo END_OF_SEQ");
+    row_of(&mut h, "END_OF_SEQ");
+    assert_eq!(pill_center(&mut h), None, "no pill at the bottom");
+    // Scroll back with the wheel.
+    let pos = at(&mut h, 10, 10, 0.5);
+    move_to(&mut h, pos);
+    for _ in 0..4 {
+        h.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(0., 5.),
+            modifiers: Modifiers::NONE,
+        });
+        h.step();
+    }
+    h.step();
+    assert!(lock_offset(&mut h) > 0);
+    let pill = pill_center(&mut h).expect("pill while scrolled back");
+    assert!(!session(&mut h).has_unseen_output());
+    // New output while scrolled back marks the pill.
+    session(&mut h).write(b"seq 1 40\r".to_vec());
+    until(&mut h, "new output noted", |s| s.has_unseen_output());
+    // A click jumps to the live bottom and the pill goes away.
+    let offset = lock_offset(&mut h);
+    assert!(offset > 0);
+    click(&mut h, pill);
+    h.step();
+    assert_eq!(lock_offset(&mut h), 0);
+    assert_eq!(pill_center(&mut h), None);
+    assert!(!session(&mut h).has_unseen_output());
+}
+
+#[test]
+fn programs_can_set_the_clipboard_with_osc_52_when_allowed() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "printf '\\033]52;c;aGVsbG8=\\007'");
+    until_app(&mut h, "copy toast", |a| a.message == "Copied to clipboard");
+    // Turned off in preferences: the same sequence is ignored.
+    app(&mut h).state.preferences.osc52_write = false;
+    pause(&mut h);
+    app(&mut h).message.clear();
+    for _ in 0..10 {
+        h.step();
+    }
+    assert_eq!(message(&mut h), "", "stale copy");
+    session(&mut h).write(b"printf '\\033]52;c;aGVsbG8=\\007'; echo DONE_OSC\r".to_vec());
+    row_of(&mut h, "DONE_OSC");
+    for _ in 0..10 {
+        h.step();
+    }
+    assert_eq!(message(&mut h), "");
+}
+
+#[test]
+fn a_long_command_finishing_out_of_sight_shows_a_notice_and_a_tab_dot() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = harness(d.path());
+    until(&mut h, "prompt", |s| s.text().contains('$'));
+    app(&mut h).state.preferences.long_command_secs = 1;
+    set_window_focus(&mut h, false);
+    session(&mut h)
+        .write(b"printf '\\033]133;C\\007'; sleep 1.2; printf '\\033]133;D;3\\007'\r".to_vec());
+    let end = Instant::now() + Duration::from_secs(15);
+    while !app(&mut h).message.contains("exit 3") {
+        // The harness does not keep the window unfocused between frames.
+        set_window_focus(&mut h, false);
+        let message = app(&mut h).message.clone();
+        let screen = session(&mut h).text();
+        assert!(Instant::now() < end, "no notice: {message:?}\n{screen}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(app(&mut h).message, "Command failed (exit 3) after 1s");
+    assert!(!app(&mut h).finished_unseen.is_empty(), "tab is marked");
+    // Seeing the pane clears the mark.
+    set_window_focus(&mut h, true);
+    assert!(app(&mut h).finished_unseen.is_empty());
+}
+
+#[test]
+fn a_command_finishing_in_the_focused_pane_stays_quiet() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = harness(d.path());
+    until(&mut h, "prompt", |s| s.text().contains('$'));
+    app(&mut h).state.preferences.long_command_secs = 1;
+    set_window_focus(&mut h, true);
+    session(&mut h).write(
+        b"printf '\\033]133;C\\007'; sleep 1.2; printf '\\033]133;D;0\\007'; echo done-quiet\r"
+            .to_vec(),
+    );
+    until(&mut h, "command done", |s| s.text().contains("done-quiet"));
+    h.step();
+    assert!(app(&mut h).finished_unseen.is_empty());
+    assert!(
+        !app(&mut h).message.contains("Command"),
+        "{:?}",
+        app(&mut h).message
+    );
+}
+
+#[test]
+fn copy_last_output_puts_the_command_output_on_the_clipboard_with_a_toast() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(
+        d.path(),
+        "printf '\\033]133;C\\007one\\ntwo\\n\\033]133;D;0\\007'",
+    );
+    until(&mut h, "span recorded", |s| s.last_output().is_some());
+    assert_eq!(session(&mut h).last_output().as_deref(), Some("one\ntwo"));
+    let ctx = h.ctx.clone();
+    app(&mut h).action(Action::CopyLastOutput, &ctx);
+    assert_eq!(app(&mut h).message, "Copied to clipboard");
 }
