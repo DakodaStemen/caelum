@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" width="640" height="160">
+  <title>Caelum Wordmark Lockup</title>
+  <g transform="translate(20, 20) scale(0.234) translate(37.8, 0)">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="caelum_accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <!-- Open Crescent C with 230° aperture, perfectly balanced footprint -->
+  <path d="M 318 152 A 136 136 0 1 0 318 360 A 30 30 0 0 1 294 326 A 84 84 0 1 1 294 186 A 30 30 0 0 1 318 152 Z" fill="url(#caelum_accent)"/>
+  <!-- Standardized white cursor pill nestled in mouth with generous margin -->
+  <rect x="302" y="208" width="40" height="96" rx="14" fill="#ffffff"/>
+</svg>
+  </g>
+  <text x="160" y="92" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="54" font-weight="700" fill="#f8fafc">Caelum</text>
+  </svg>

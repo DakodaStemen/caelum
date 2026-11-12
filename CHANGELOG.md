@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New app icon, centred and rendered natively per size (bolder small-size master for 16–32 px): hicolor PNGs 16–512 plus scalable SVG, Windows `.ico`, macOS `.icns` (Apple grid), runtime window icon, README and About dialog. `scripts/install.sh` installs every size and refreshes icon/desktop caches; deb/AppImage/pacman desktop entries gain `StartupWMClass`, the RPM ships the desktop file and icons, and the Windows exe embeds the icon (built on Windows).
 - bash older than 4.4 (macOS `/bin/bash` 3.2): `caelum.bash` no longer arms a `DEBUG`
   trap or appends to `PROMPT_COMMAND` (that broke prompts ending in `;`/`&`/a comment,
   lost chained traps and misfired in `bind -x` handlers). Caelum now detects the command

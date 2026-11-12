@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Caelum Rust
+Comment=Native Rust workspace terminal
+Exec=caelum-rs
+Icon=caelum-rs
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=io.github.DakodaStemen.CaelumRust

@@ -679,7 +679,7 @@ impl App {
                 ui.add(
                     egui::Image::from_bytes(
                         "bytes://caelum-icon.png",
-                        include_bytes!("../../assets/brand/icon.png"),
+                        include_bytes!("../../assets/app-icons/window-icon-256.png"),
                     )
                     .fit_to_exact_size(Vec2::splat(128.)),
                 );
