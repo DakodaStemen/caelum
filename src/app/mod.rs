@@ -1185,19 +1185,22 @@ impl App {
                             self.save_document(id);
                         }
                     }
-                    Some(1) => {
-                        for id in dirty {
-                            // A prior save may still be queued on the IO thread; cancel it
-                            // so discarding never writes. A save already running finishes
-                            // (see `DocumentIo::discard`).
-                            self.docio.discard(&id);
-                            self.documents.remove(&id);
-                        }
-                        self.finish_close(ctx);
-                    }
+                    // Discarding only drops the edits. The close stays pending, so the next
+                    // frame runs the busy-terminal check before anything is stopped.
+                    Some(1) => self.discard_documents(dirty),
                     _ => {}
                 }
             }
+        }
+    }
+    /// Drops the unsaved documents `ids` without closing anything.
+    fn discard_documents(&mut self, ids: Vec<String>) {
+        for id in ids {
+            // A prior save may still be queued on the IO thread; cancel it so
+            // discarding never writes. A save already running finishes (see
+            // `DocumentIo::discard`).
+            self.docio.discard(&id);
+            self.documents.remove(&id);
         }
     }
     fn dirty_in_pending(&self) -> Vec<String> {
@@ -1519,7 +1522,10 @@ impl App {
         }
         self.apply_font(ctx);
         let theme = self.theme();
+        // Every session, drawn or not, sees the current clipboard-write preference
+        // before it is polled (a hidden tab must not honour a switched-off setting).
         for session in self.terminals.values_mut() {
+            session.set_osc52_write(self.state.preferences.osc52_write);
             session.poll(&theme);
         }
         self.announce_finished(ctx);
@@ -1964,6 +1970,40 @@ mod tests {
         assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
         assert!(has_tab(&app, &b));
         assert!(app.documents[&editor].dirty());
+    }
+    /// "Discard" in the unsaved-edits dialog used to close straight away, killing a
+    /// running command in the same close. It must fall through to the busy check.
+    #[cfg(unix)]
+    #[test]
+    fn discarding_edits_still_asks_before_stopping_a_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _ctx, _b, editor) = app_with_dirty_background_tab(dir.path());
+        let mut leaves = vec![];
+        app.workspace().tabs[0].layout.leaves(&mut leaves);
+        let terminal = leaves
+            .iter()
+            .find(|p| matches!(p, Pane::Terminal { .. }))
+            .map(|p| p.id().to_string())
+            .expect("tab A has a terminal");
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let session =
+            caelum_rs::terminal::Session::spawn(dir.path(), Some(&argv), egui::Context::default())
+                .unwrap();
+        // The shell integration reports a command in progress.
+        session.shell.lock().unwrap().running = true;
+        app.terminals.insert(terminal, session);
+        app.pending = Some(PendingClose::Window);
+        // Step 1 of the close flow: unsaved edits come first, and busy is not asked yet.
+        assert_eq!(app.dirty_in_pending(), vec![editor.clone()]);
+        assert_eq!(app.busy_in_pending(), 1);
+        // The user picks Discard.
+        app.discard_documents(vec![editor]);
+        assert!(app.dirty_in_pending().is_empty());
+        assert!(
+            app.pending.is_some(),
+            "Discard must not complete the close: the running command was never confirmed"
+        );
+        assert_eq!(app.busy_in_pending(), 1, "next step asks about the command");
     }
     #[test]
     fn switching_tabs_during_save_changes_does_not_redirect_the_close() {

@@ -47,6 +47,7 @@ impl App {
                 chosen,
                 ctx.clone(),
                 self.state.preferences.shell_integration,
+                self.state.preferences.osc52_write,
             ) {
                 Ok(s) => {
                     self.terminals.insert(id.to_string(), s);

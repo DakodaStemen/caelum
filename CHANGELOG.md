@@ -2,7 +2,18 @@
 
 ## Unreleased
 
-- Ctrl+click a local file path in terminal output (`path`, `path:line`, `path:line:col`,
+- Review fixes for the friendlier-terminal work: the injected bash starts with the
+  same options as a plain `bash -l` (`inherit_errexit` and the history defaults are no
+  longer left from POSIX mode); OSC 52 writes are refused on the reader thread when the
+  setting is off or the payload is over 1 MiB, only the newest pending write is kept,
+  the preference reaches every tab (also hidden ones) before it is polled, and OSC
+  strings longer than about 1.4 MB are cut off before they reach the terminal parser;
+  file-path links are looked up only while Ctrl is held, on a background thread with a
+  short cache, so a stalled network mount cannot freeze the window; **Discard** in the
+  unsaved-edits dialog now goes on to the running-command confirmation instead of
+  closing at once; "Copy Last Command Output" no longer includes the next prompt
+  when the output had no trailing newline.
+- Ctrl+click (hover with Ctrl to see the underline) a local file path in terminal output (`path`, `path:line`, `path:line:col`,
   as printed by compilers, `rg` and Python tracebacks) to open it in Caelum's editor
   pane scrolled to that line; relative paths resolve against the shell's directory and
   only existing files are links. Folders open in the file browser pane when one exists.

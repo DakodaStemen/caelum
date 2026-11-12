@@ -109,6 +109,96 @@ impl OscScanner {
     }
 }
 
+/// Longest OSC string (bytes after `ESC ]`) handed to the terminal parser. The vte 0.15
+/// parser Alacritty uses grows its OSC buffer without bound, so a program (or a stray
+/// `cat` of a hostile file) could make it allocate arbitrarily much; this caps that.
+/// It is above the base64 form of the largest honoured OSC 52 write (1 MiB), so a write
+/// cut off here still decodes to more than the clipboard cap and is refused as too big.
+pub const MAX_OSC_BYTES: usize = 1024 * 1024 * 4 / 3 + 8 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardState {
+    Ground,
+    Esc,
+    Osc(usize),
+    OscEsc,
+    /// Over the cap: payload bytes are dropped until the string ends.
+    Skip,
+}
+
+/// Byte filter in front of the terminal parser that bounds OSC strings to
+/// [`MAX_OSC_BYTES`]. Longer strings are cancelled (`CAN`) at the cap, which makes the
+/// parser dispatch the truncated string, and the rest is dropped up to the terminator.
+#[derive(Debug)]
+pub struct OscGuard {
+    state: GuardState,
+}
+
+impl Default for OscGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OscGuard {
+    pub fn new() -> Self {
+        Self {
+            state: GuardState::Ground,
+        }
+    }
+
+    /// `bytes` unchanged unless an OSC string in it passes the cap.
+    pub fn filter<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        use GuardState::*;
+        let mut out: Option<Vec<u8>> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            let mut keep = true;
+            let mut cancel = false;
+            self.state = match (self.state, b) {
+                (Ground, 0x1b) => Esc,
+                (Ground, _) => Ground,
+                (Esc, b']') => Osc(0),
+                (Esc, 0x1b) => Esc,
+                (Esc, _) => Ground,
+                (Osc(_), 0x07 | 0x18 | 0x1a) => Ground,
+                (Osc(_), 0x1b) => OscEsc,
+                (Osc(n), _) if n >= MAX_OSC_BYTES => {
+                    cancel = true;
+                    keep = false;
+                    Skip
+                }
+                (Osc(n), _) => Osc(n + 1),
+                (OscEsc, b']') => Osc(0),
+                (OscEsc, _) => Ground,
+                (Skip, 0x07) => {
+                    keep = false;
+                    Ground
+                }
+                (Skip, 0x18 | 0x1a) => Ground,
+                (Skip, 0x1b) => Esc,
+                (Skip, _) => {
+                    keep = false;
+                    Skip
+                }
+            };
+            if (!keep || cancel) && out.is_none() {
+                out = Some(bytes[..i].to_vec());
+            }
+            if let Some(out) = out.as_mut() {
+                if cancel {
+                    out.push(0x18);
+                } else if keep {
+                    out.push(b);
+                }
+            }
+        }
+        match out {
+            Some(v) => v.into(),
+            None => bytes.into(),
+        }
+    }
+}
+
 fn parse(payload: &[u8], host: &str) -> Option<OscEvent> {
     let text = std::str::from_utf8(payload).ok()?;
     let (code, rest) = text.split_once(';').unwrap_or((text, ""));
@@ -256,5 +346,35 @@ mod tests {
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].1, OscEvent::PromptStart);
         assert!(scan(b"\x1b]133;A\x18\x07").is_empty());
+    }
+
+    #[test]
+    fn guard_passes_normal_and_bounds_oversized_osc_strings() {
+        let mut g = OscGuard::new();
+        let normal = b"a\x1b]52;c;aGk=\x07b\x1b]0;t\x1b\\c";
+        assert_eq!(&*g.filter(normal), &normal[..]);
+        // 5 MiB OSC, fed in odd-sized chunks, followed by a good sequence.
+        let mut stream = b"\x1b]52;c;".to_vec();
+        stream.extend(std::iter::repeat_n(b'A', 5 * 1024 * 1024));
+        stream.extend(b"\x07\x1b]133;A\x07tail");
+        let mut out = Vec::new();
+        for chunk in stream.chunks(7001) {
+            out.extend_from_slice(&g.filter(chunk));
+        }
+        assert!(out.len() < MAX_OSC_BYTES + 64, "kept {} bytes", out.len());
+        // The oversized string is cancelled, and what follows survives intact.
+        assert!(out.windows(1).any(|w| w == [0x18]));
+        assert!(
+            out.ends_with(b"\x1b]133;A\x07tail"),
+            "{:?}",
+            &out[out.len() - 20..]
+        );
+        // ST-terminated overflow recovers too.
+        let mut stream = b"\x1b]52;c;".to_vec();
+        stream.extend(std::iter::repeat_n(b'A', MAX_OSC_BYTES + 100));
+        stream.extend(b"\x1b\\ok");
+        let out = g.filter(&stream).into_owned();
+        assert!(out.ends_with(b"\x1b\\ok"));
+        assert!(out.len() < MAX_OSC_BYTES + 64);
     }
 }

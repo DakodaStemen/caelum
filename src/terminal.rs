@@ -1,7 +1,7 @@
 //! PTY ownership, terminal emulation and input translation. The UI never blocks on PTY I/O.
 use crate::{
     model::Preferences,
-    osc::{OscEvent, OscScanner},
+    osc::{OscEvent, OscGuard, OscScanner},
     theme::Theme,
 };
 use alacritty_terminal::{
@@ -40,23 +40,42 @@ use std::{
 pub struct Events {
     tx: SyncSender<Event>,
     title: Arc<Mutex<Option<String>>>,
+    /// Whether programs may set the clipboard (OSC 52); read on the PTY thread, so a
+    /// refused write is dropped before it is queued.
+    osc52: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<ClipWrite>>>,
 }
+/// The newest OSC 52 write waiting for the UI: the text, or the size of one refused
+/// for being too large.
+type ClipWrite = Result<String, usize>;
 /// UI-side end of [`Events`].
 struct EventQueue {
     rx: Receiver<Event>,
     title: Arc<Mutex<Option<String>>>,
+    osc52: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<ClipWrite>>>,
 }
 const EVENT_QUEUE: usize = 1024;
 impl Events {
     fn new() -> (Self, EventQueue) {
         let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE);
         let title = Arc::new(Mutex::new(None));
+        // Off until the owner says otherwise: nothing is written before the preference is known.
+        let osc52 = Arc::new(AtomicBool::new(false));
+        let clipboard = Arc::new(Mutex::new(None));
         (
             Self {
                 tx,
                 title: title.clone(),
+                osc52: osc52.clone(),
+                clipboard: clipboard.clone(),
             },
-            EventQueue { rx, title },
+            EventQueue {
+                rx,
+                title,
+                osc52,
+                clipboard,
+            },
         )
     }
 }
@@ -68,10 +87,16 @@ impl EventListener for Events {
             Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) => {
                 let _ = self.tx.try_send(event);
             }
-            // OSC 52 writes only; the UI decides whether to honour them. Reads
-            // (`ClipboardLoad`) are never forwarded, so a program cannot see the clipboard.
-            Event::ClipboardStore(ClipboardType::Clipboard, _) => {
-                let _ = self.tx.try_send(event);
+            // OSC 52 writes only. Reads (`ClipboardLoad`) are never forwarded, so a
+            // program cannot see the clipboard. A refused or oversized write never
+            // reaches the queue, and only the newest accepted one is kept, so a flood
+            // of them holds at most one payload.
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                match osc52_accepts(self.osc52.load(Ordering::Relaxed), &text) {
+                    Ok(true) => *lock(&self.clipboard) = Some(Ok(text)),
+                    Ok(false) => {}
+                    Err(n) => *lock(&self.clipboard) = Some(Err(n)),
+                }
             }
             // Everything else (wakeups, bells, reads, the PRIMARY selection, ...) is ignored.
             _ => {}
@@ -155,8 +180,10 @@ pub struct ShellState {
     started: Option<Instant>,
     /// Absolute line where the running command's output began.
     output_start: Option<i64>,
-    /// Absolute line span `start..end` of the last finished command's output.
-    output: Option<(i64, i64)>,
+    /// Absolute line span `start..end` of the last finished command's output, and, when
+    /// its last line had no trailing newline, the last column that output filled (the
+    /// next prompt is drawn after it on that same line and must not be copied).
+    output: Option<(i64, i64, Option<usize>)>,
     /// A command that just finished, until [`Session::take_finished`] collects it.
     finished: Option<Finished>,
 }
@@ -210,12 +237,13 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
                 // The cursor sits at the start of the line after the output, unless the
                 // output did not end in a newline; then its last line is the cursor's.
                 let cursor = cursor_abs(term);
-                let end = if term.grid().cursor.point.column.0 == 0 {
-                    cursor
+                let column = term.grid().cursor.point.column.0;
+                let (end, last_col) = if column == 0 {
+                    (cursor, None)
                 } else {
-                    cursor + 1
+                    (cursor + 1, Some(column - 1))
                 };
-                shell.output = (end > start).then_some((start, end));
+                shell.output = (end > start).then_some((start, end, last_col));
             }
             if let Some(started) = shell.started.take()
                 && was_running
@@ -236,8 +264,14 @@ fn shell_injection(shell: &str) -> Option<crate::shell_integration::Injection> {
     crate::shell_integration::install(&root).ok()?;
     crate::shell_integration::plan(shell, &root, &|k| std::env::var(k).ok())
 }
-/// Text of the absolute line span `start..end` (end exclusive), if it is still on the grid.
-fn output_text(term: &Term<Events>, start: i64, end: i64) -> Option<String> {
+/// Text of the absolute line span `start..end` (end exclusive), if it is still on the
+/// grid. With `last_col`, the last line is cut after that column.
+fn output_text(
+    term: &Term<Events>,
+    start: i64,
+    end: i64,
+    last_col: Option<usize>,
+) -> Option<String> {
     let history = term.grid().history_size() as i64;
     let (first, last) = (start - history, end - 1 - history);
     if end <= start || first < -history || last >= term.screen_lines() as i64 {
@@ -245,7 +279,10 @@ fn output_text(term: &Term<Events>, start: i64, end: i64) -> Option<String> {
     }
     let text = term.bounds_to_string(
         Point::new(Line(first as i32), Column(0)),
-        Point::new(Line(last as i32), term.last_column()),
+        Point::new(
+            Line(last as i32),
+            last_col.map_or(term.last_column(), |c| Column(c).min(term.last_column())),
+        ),
     );
     Some(text.trim_end_matches('\n').to_string())
 }
@@ -285,14 +322,14 @@ pub struct Session {
     focus_reported: Option<bool>,
     /// Text was copied to the clipboard since the app last asked (for the toast).
     copied: bool,
-    /// Programs may set the clipboard with OSC 52 (kept in step with the preference).
-    pub osc52_write: bool,
     /// Output arrived while the view was scrolled back (for the scroll-to-bottom pill).
     unseen_output: bool,
     /// Last history size and display offset seen, to tell new output from scrolling.
     last_history: usize,
     /// Directories may be opened from a Ctrl+click (a file browser pane exists).
     pub dir_links: bool,
+    /// Background lookup of path text hovered with Ctrl held.
+    probe: PathProbe,
     /// Launched as `ssh`/`codex`/`claude` rather than a shell.
     runs_program: bool,
     wake: egui::Context,
@@ -303,16 +340,18 @@ pub struct Session {
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
-        Self::spawn_with(cwd, argv, ctx, true)
+        Self::spawn_with(cwd, argv, ctx, true, true)
     }
     /// Starts a session. With `integrate`, the user's shell (when `argv` is `None`) is
     /// launched so it emits OSC 7 / OSC 133 without any dotfile edits; see
-    /// [`crate::shell_integration`].
+    /// [`crate::shell_integration`]. `osc52` is the clipboard-write preference in force
+    /// from the first byte of output; keep it current with [`Session::set_osc52_write`].
     pub fn spawn_with(
         cwd: &Path,
         argv: Option<&[String]>,
         ctx: egui::Context,
         integrate: bool,
+        osc52: bool,
     ) -> Result<Self> {
         let cwd = if cwd.is_dir() {
             cwd.to_path_buf()
@@ -387,6 +426,7 @@ impl Session {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let (listener, events) = Events::new();
+        events.osc52.store(osc52, Ordering::Relaxed);
         let term = Arc::new(Mutex::new(Term::new(term_config(), &size, listener)));
         let stop = Arc::new(AtomicBool::new(false));
         let read_stop = stop.clone();
@@ -429,10 +469,10 @@ impl Session {
             metrics: None,
             focus_reported: None,
             copied: false,
-            osc52_write: true,
             unseen_output: false,
             last_history: 0,
             dir_links: false,
+            probe: PathProbe::new(ctx.clone()),
             runs_program,
             wake: ctx,
             #[cfg(test)]
@@ -497,8 +537,8 @@ impl Session {
     /// integration reported one and it is still in the scrollback.
     pub fn last_output(&self) -> Option<String> {
         let term = lock(&self.term);
-        let (start, end) = lock(&self.shell).output?;
-        output_text(&term, start, end).filter(|t| !t.is_empty())
+        let (start, end, last_col) = lock(&self.shell).output?;
+        output_text(&term, start, end, last_col).filter(|t| !t.is_empty())
     }
     /// The command that finished since the last call, if any.
     pub fn take_finished(&mut self) -> Option<Finished> {
@@ -521,6 +561,11 @@ impl Session {
             return fg > 0 && fg as u32 != pid;
         }
         false
+    }
+    /// Whether programs in this pane may set the clipboard (OSC 52). Takes effect for
+    /// output the reader has not yet parsed; call it for every session before polling.
+    pub fn set_osc52_write(&self, on: bool) {
+        self.events.osc52.store(on, Ordering::Relaxed);
     }
     /// Whether text was copied since the last call.
     pub fn take_copied(&mut self) -> bool {
@@ -561,23 +606,26 @@ impl Session {
                     })
                     .into_bytes(),
                 ),
-                // OSC 52 is write-only: the clipboard can be set but never read back.
-                Event::ClipboardStore(_, text) => match osc52_accepts(self.osc52_write, &text) {
-                    Ok(true) => {
-                        let ctx = self.wake.clone();
-                        self.copy_to_clipboard(&ctx, text);
-                    }
-                    Ok(false) => {}
-                    Err(n) => {
-                        self.error = Some(format!(
-                            "Ignored a {} KiB clipboard write (limit {} KiB)",
-                            n / 1024,
-                            OSC52_MAX_BYTES / 1024
-                        ));
-                    }
-                },
                 _ => {}
             }
+        }
+        // OSC 52 is write-only: the clipboard can be set but never read back. The
+        // preference is re-checked here, so a write queued just before the user turned
+        // it off is dropped too.
+        let pending = lock(&self.events.clipboard).take();
+        match pending {
+            Some(Ok(text)) if self.events.osc52.load(Ordering::Relaxed) => {
+                let ctx = self.wake.clone();
+                self.copy_to_clipboard(&ctx, text);
+            }
+            Some(Err(n)) if self.events.osc52.load(Ordering::Relaxed) => {
+                self.error = Some(format!(
+                    "Ignored a {} KiB clipboard write (limit {} KiB)",
+                    n / 1024,
+                    OSC52_MAX_BYTES / 1024
+                ));
+            }
+            _ => {}
         }
         if !self.exited
             && let Some(child) = &mut self.child
@@ -760,6 +808,7 @@ fn read_loop(
 ) {
     let mut parser: ansi::Processor = ansi::Processor::new();
     let mut scanner = OscScanner::default();
+    let mut guard = OscGuard::new();
     let mut bytes = [0; 16384];
     while !stop.load(Ordering::Relaxed) {
         match reader.read(&mut bytes) {
@@ -771,11 +820,11 @@ fn read_loop(
                     let mut shell = lock(&shell);
                     let mut done = 0;
                     for (end, event) in events {
-                        parser.advance(&mut *t, &bytes[done..end]);
+                        parser.advance(&mut *t, &guard.filter(&bytes[done..end]));
                         done = end;
                         apply_osc(&t, &mut shell, event);
                     }
-                    parser.advance(&mut *t, &bytes[done..n]);
+                    parser.advance(&mut *t, &guard.filter(&bytes[done..n]));
                     reconcile_marks(&t, &mut shell);
                 }
                 ctx.request_repaint();
@@ -1394,7 +1443,7 @@ fn layout(
     ui.painter_at(rect)
         .rect_filled(rect, 0., theme.term("background"));
     s.resize((area.width() / cw) as usize, (area.height() / ch) as usize);
-    s.osc52_write = prefs.osc52_write;
+    s.set_osc52_write(prefs.osc52_write);
     s.poll(theme);
     s.track_unseen_output();
     let m = Metrics {
@@ -1740,7 +1789,14 @@ struct Link {
     file: Option<FileRef>,
 }
 
-fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2, files: &FileLookup) -> Option<Link> {
+/// `paths` is `Some` only when the user asked for file links (Ctrl held); without it
+/// no path text is ever looked up, so plain hovering never costs a filesystem call.
+fn link_under(
+    term: &Term<Events>,
+    m: &Metrics,
+    pos: Pos2,
+    paths: Option<&PathScan>,
+) -> Option<Link> {
     if let Some(uri) = link_at(term, m, pos) {
         return Some(Link {
             uri,
@@ -1756,12 +1812,138 @@ fn link_under(term: &Term<Events>, m: &Metrics, pos: Pos2, files: &FileLookup) -
             file: None,
         });
     }
-    let (file, start, end) = path_at(term, point, files)?;
+    let (file, start, end) = path_at(term, point, paths?)?;
     Some(Link {
         uri: file.path.display().to_string(),
         span: Some((start, end)),
         file: Some(file),
     })
+}
+
+/// What a background lookup of path text is keyed by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProbeKey {
+    cwd: PathBuf,
+    home: PathBuf,
+    text: String,
+    dirs: bool,
+}
+/// `(path, is_dir)` of an existing file, or `None`.
+type Probed = Option<(PathBuf, bool)>;
+type Resolver = Arc<dyn Fn(&ProbeKey) -> Probed + Send + Sync>;
+/// Result of asking the probe about a path.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Ready(Probed),
+    /// Not known yet; the lookup runs on a worker thread and repaints when done.
+    Pending,
+}
+const PROBE_TTL: Duration = Duration::from_secs(3);
+const PROBE_MAX_INFLIGHT: usize = 4;
+const PROBE_MAX_CACHED: usize = 256;
+#[derive(Default)]
+struct ProbeState {
+    done: std::collections::HashMap<ProbeKey, (Instant, Probed)>,
+    inflight: std::collections::HashSet<ProbeKey>,
+}
+/// Answers "does this path text name an existing file?" without ever touching the
+/// filesystem on the calling (UI) thread: lookups run on short-lived worker threads
+/// (at most [`PROBE_MAX_INFLIGHT`], so a stalled NFS/FUSE mount can hold only a few
+/// and the window never waits for it), and results are cached for a few seconds, per
+/// (directory, text), so hovering the same token costs one lookup.
+#[derive(Clone)]
+struct PathProbe {
+    resolver: Resolver,
+    state: Arc<Mutex<ProbeState>>,
+    wake: egui::Context,
+}
+impl PathProbe {
+    fn new(wake: egui::Context) -> Self {
+        Self::with_resolver(
+            wake,
+            Arc::new(|k: &ProbeKey| {
+                let files = FileLookup {
+                    cwd: &k.cwd,
+                    home: k.home.clone(),
+                    dirs: k.dirs,
+                };
+                resolve_file_ref(&k.text, None, None, &files).map(|f| (f.path, f.is_dir))
+            }),
+        )
+    }
+    fn with_resolver(wake: egui::Context, resolver: Resolver) -> Self {
+        Self {
+            resolver,
+            state: Arc::default(),
+            wake,
+        }
+    }
+    /// Never blocks on the resolver. An expired cached answer is returned while a
+    /// refresh runs, so a link does not flicker off every few seconds.
+    fn lookup(&self, key: &ProbeKey) -> Probe {
+        let mut st = lock(&self.state);
+        let cached = st.done.get(key).cloned();
+        if let Some((at, r)) = &cached
+            && at.elapsed() < PROBE_TTL
+        {
+            return Probe::Ready(r.clone());
+        }
+        let stale = cached.map(|(_, r)| Probe::Ready(r));
+        if st.inflight.contains(key) || st.inflight.len() >= PROBE_MAX_INFLIGHT {
+            return stale.unwrap_or(Probe::Pending);
+        }
+        st.inflight.insert(key.clone());
+        drop(st);
+        let (resolver, state, wake, k) = (
+            self.resolver.clone(),
+            self.state.clone(),
+            self.wake.clone(),
+            key.clone(),
+        );
+        let spawned = thread::Builder::new()
+            .name("link-probe".into())
+            .spawn(move || {
+                let result = resolver(&k);
+                let mut st = lock(&state);
+                st.inflight.remove(&k);
+                if st.done.len() >= PROBE_MAX_CACHED {
+                    st.done.clear();
+                }
+                st.done.insert(k, (Instant::now(), result));
+                drop(st);
+                wake.request_repaint();
+            });
+        if spawned.is_err() {
+            lock(&self.state).inflight.remove(key);
+        }
+        stale.unwrap_or(Probe::Pending)
+    }
+}
+/// Everything needed to turn path text under the pointer into a [`FileRef`].
+struct PathScan<'a> {
+    probe: &'a PathProbe,
+    cwd: &'a Path,
+    home: PathBuf,
+    dirs: bool,
+}
+impl PathScan<'_> {
+    fn resolve(&self, text: &str, line: Option<usize>, col: Option<usize>) -> Option<FileRef> {
+        let key = ProbeKey {
+            cwd: self.cwd.to_path_buf(),
+            home: self.home.clone(),
+            text: text.to_string(),
+            dirs: self.dirs,
+        };
+        let Probe::Ready(Some((path, is_dir))) = self.probe.lookup(&key) else {
+            return None;
+        };
+        Some(FileRef {
+            path,
+            line: line.map(|n| n.max(1)),
+            col: col.map(|n| n.max(1)),
+            is_dir,
+        })
+    }
 }
 
 /// What paths in terminal text are resolved against.
@@ -1819,11 +2001,7 @@ fn url_at(term: &Term<Events>, point: Point) -> Option<(String, Point, Point)> {
 }
 
 /// The existing local file written in the text at `point`, with its first and last cells.
-fn path_at(
-    term: &Term<Events>,
-    point: Point,
-    files: &FileLookup,
-) -> Option<(FileRef, Point, Point)> {
+fn path_at(term: &Term<Events>, point: Point, paths: &PathScan) -> Option<(FileRef, Point, Point)> {
     let cells = text_cells(term, point);
     let at = cells.iter().rposition(|(_, p)| *p <= point)?;
     let chars: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
@@ -1831,7 +2009,7 @@ fn path_at(
     let found = find_path_tokens(&chars)
         .into_iter()
         .find(|t| (t.from..t.to).contains(&at))?;
-    let file = resolve_file_ref(&found.text, found.line, found.col, files)?;
+    let file = paths.resolve(&found.text, found.line, found.col)?;
     Some((file, cells[found.from].1, cells[found.to - 1].1))
 }
 
@@ -2059,15 +2237,18 @@ fn handle_links(
     p: PointerMode,
 ) -> (Option<(Point, Point)>, Option<FileRef>) {
     let mut span = None;
-    let files = FileLookup {
+    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+    // File links are only looked for while Ctrl is held (the key that opens them).
+    let paths = ctrl.then(|| PathScan {
+        probe: &s.probe,
         cwd: &s.cwd,
         home: crate::model::home(),
         dirs: s.dir_links,
-    };
+    });
     if let Some(pos) = response.hover_pos()
         && s.mouse.gesture.is_none()
     {
-        let link = link_under(&lock(&s.term), m, pos, &files);
+        let link = link_under(&lock(&s.term), m, pos, paths.as_ref());
         if let Some(link) = link {
             let tip = if link.file.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2092,11 +2273,10 @@ fn handle_links(
         }
     }
     let mut open = None;
-    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     if response.clicked()
         && ctrl
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some(link) = link_under(&lock(&s.term), m, pos, &files)
+        && let Some(link) = link_under(&lock(&s.term), m, pos, paths.as_ref())
     {
         if link.file.is_some() {
             open = link.file;
@@ -2805,14 +2985,10 @@ fn context_menu(
         return;
     }
     if response.secondary_clicked() {
-        let files = FileLookup {
-            cwd: &s.cwd,
-            home: crate::model::home(),
-            dirs: false,
-        };
+        // The menu only offers URLs, so path text is not looked up at all.
         s.mouse.menu_link = response
             .interact_pointer_pos()
-            .and_then(|pos| link_under(&lock(&s.term), m, pos, &files))
+            .and_then(|pos| link_under(&lock(&s.term), m, pos, None))
             .filter(|link| link.file.is_none())
             .map(|link| link.uri);
     }
@@ -2923,8 +3099,8 @@ mod tests {
         go(&mut term, &mut shell, "\x1b]133;A\x07$ echo hi\r\n");
         go(&mut term, &mut shell, "\x1b]133;C\x07hi\r\nthere\r\n");
         go(&mut term, &mut shell, "\x1b]133;D;0\x07\x1b]133;A\x07$ ");
-        let (s, e) = shell.output.expect("span recorded");
-        assert_eq!(output_text(&term, s, e).as_deref(), Some("hi\nthere"));
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi\nthere"));
         // The next command replaces it; output without a final newline keeps its last line.
         go(&mut term, &mut shell, "ls\r\n\x1b]133;C\x07a b\r\npartial");
         go(
@@ -2932,9 +3108,67 @@ mod tests {
             &mut shell,
             "\x1b]133;D;1\x07\x1b]133;A\x07\r\n$ ",
         );
-        let (s, e) = shell.output.unwrap();
-        assert_eq!(output_text(&term, s, e).as_deref(), Some("a b\npartial"));
+        let (s, e, c) = shell.output.unwrap();
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("a b\npartial"));
         assert_eq!(shell.last_exit, Some(1));
+    }
+    #[test]
+    fn last_output_without_a_trailing_newline_excludes_the_next_prompt() {
+        let (mut term, mut shell) = shell_term(5);
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        let mut go = |term: &mut Term<Events>, shell: &mut ShellState, s: &str| {
+            feed(term, shell, &mut parser, &mut scanner, s.as_bytes());
+        };
+        go(&mut term, &mut shell, "\x1b]133;A\x07$ printf foo\r\n");
+        go(&mut term, &mut shell, "\x1b]133;C\x07foo");
+        // The prompt is drawn right after the output, on the same line.
+        go(&mut term, &mut shell, "\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let (s, e, c) = shell.output.expect("span recorded");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("foo"));
+    }
+    /// The same, end to end: a real bash running `printf foo` with Caelum's own
+    /// integration script, read back through the session API.
+    #[cfg(unix)]
+    #[test]
+    fn real_shell_printf_without_newline_copies_only_its_output() {
+        let Some(bash) = ["/bin/bash", "/usr/bin/bash"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("shell/caelum.bash");
+        let rc = dir.path().join("rc");
+        std::fs::write(&rc, format!("PS1='PROMPT> '\n. '{}'\n", script.display())).unwrap();
+        let argv: Vec<String> = [
+            "/usr/bin/env".to_string(),
+            "CAELUM_RS=1".into(),
+            "HISTFILE=/dev/null".into(),
+            bash.to_string(),
+            "--noprofile".into(),
+            "--rcfile".into(),
+            rc.display().to_string(),
+            "-i".into(),
+        ]
+        .to_vec();
+        let mut s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let wait = |s: &mut Session, what: &str, f: &dyn Fn(&Session) -> bool| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !f(s) {
+                s.poll(&theme);
+                assert!(Instant::now() < end, "timed out: {what}: {:?}", s.text());
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait(&mut s, "prompt", &|s| s.text().contains("PROMPT>"));
+        s.write(b"printf foo\r".to_vec());
+        wait(&mut s, "output", &|s| s.last_output().is_some());
+        wait(&mut s, "next prompt", &|s| {
+            s.text().matches("PROMPT>").count() >= 2
+        });
+        assert_eq!(s.last_output().as_deref(), Some("foo"));
     }
     #[test]
     fn last_output_spans_scrollback_and_is_dropped_when_marks_are() {
@@ -2952,9 +3186,9 @@ mod tests {
             &mut scanner,
             text.as_bytes(),
         );
-        let (s, e) = shell.output.unwrap();
+        let (s, e, c) = shell.output.unwrap();
         assert_eq!(e - s, 30);
-        let out = output_text(&term, s, e).unwrap();
+        let out = output_text(&term, s, e, c).unwrap();
         assert!(
             out.starts_with("line 0\n") && out.ends_with("line 29"),
             "{out}"
@@ -3674,6 +3908,103 @@ mod ux_tests {
         assert_eq!(got, "src/a.rs:3:9");
     }
 
+    fn key(text: &str) -> ProbeKey {
+        ProbeKey {
+            cwd: "/w".into(),
+            home: "/h".into(),
+            text: text.into(),
+            dirs: false,
+        }
+    }
+
+    /// A resolver stuck for a second (a dead NFS mount) must cost the caller nothing,
+    /// run once per path however often it is asked, and be answered from the cache after.
+    #[test]
+    fn slow_path_lookup_never_blocks_the_caller_and_is_cached() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let probe = PathProbe::with_resolver(
+            egui::Context::default(),
+            Arc::new(move |k: &ProbeKey| {
+                c.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(600));
+                Some((PathBuf::from(&k.text), false))
+            }),
+        );
+        let started = Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(probe.lookup(&key("a.rs")), Probe::Pending);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "1000 frames took {:?} against a 600 ms resolver",
+            started.elapsed()
+        );
+        let end = Instant::now() + Duration::from_secs(5);
+        let got = loop {
+            if let Probe::Ready(r) = probe.lookup(&key("a.rs")) {
+                break r;
+            }
+            assert!(Instant::now() < end, "lookup never finished");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(got, Some((PathBuf::from("a.rs"), false)));
+        assert_eq!(probe.lookup(&key("a.rs")), Probe::Ready(got));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one filesystem call per path"
+        );
+    }
+
+    /// Many different hovered tokens cannot pile up threads behind a stalled mount.
+    #[test]
+    fn stalled_lookups_are_capped() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let probe = PathProbe::with_resolver(
+            egui::Context::default(),
+            Arc::new(move |_: &ProbeKey| {
+                c.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(500));
+                None
+            }),
+        );
+        for i in 0..50 {
+            assert_eq!(probe.lookup(&key(&format!("f{i}"))), Probe::Pending);
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert!(calls.load(Ordering::SeqCst) <= PROBE_MAX_INFLIGHT);
+    }
+
+    /// The pane's link scan finds a real file only through the probe, with Ctrl-style
+    /// opt-in: without a `PathScan`, no path is looked at.
+    #[test]
+    fn path_links_need_the_scan_and_resolve_through_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "x").unwrap();
+        let probe = PathProbe::new(egui::Context::default());
+        let scan = PathScan {
+            probe: &probe,
+            cwd: dir.path(),
+            home: dir.path().to_path_buf(),
+            dirs: false,
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        let file = loop {
+            if let Some(f) = scan.resolve("main.rs", Some(4), None) {
+                break f;
+            }
+            assert!(Instant::now() < end, "never resolved");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            (file.path, file.line, file.is_dir),
+            (dir.path().join("main.rs"), Some(4), false)
+        );
+        assert!(scan.resolve("absent.rs", None, None).is_none());
+    }
+
     #[test]
     fn file_refs_resolve_against_the_working_directory_and_must_exist() {
         let dir = tempfile::tempdir().unwrap();
@@ -3731,9 +4062,15 @@ mod ux_tests {
     }
 
     #[test]
-    fn only_clipboard_writes_are_forwarded() {
+    fn only_enabled_clipboard_writes_are_kept_and_only_the_newest() {
         let (events, queue) = Events::new();
-        events.send_event(Event::ClipboardStore(ClipboardType::Clipboard, "hi".into()));
+        let store = |t: &str| Event::ClipboardStore(ClipboardType::Clipboard, t.into());
+        // Disabled (the initial state): nothing is kept, however big.
+        events.send_event(store("nope"));
+        events.send_event(store(&"x".repeat(OSC52_MAX_BYTES + 1)));
+        assert!(lock(&queue.clipboard).is_none());
+        queue.osc52.store(true, Ordering::Relaxed);
+        events.send_event(store("first"));
         events.send_event(Event::ClipboardStore(
             ClipboardType::Selection,
             "primary".into(),
@@ -3742,9 +4079,82 @@ mod ux_tests {
             ClipboardType::Clipboard,
             Arc::new(|text| text.to_string()),
         ));
-        let got: Vec<Event> = queue.rx.try_iter().collect();
-        assert_eq!(got.len(), 1, "reads and PRIMARY writes must be dropped");
-        assert!(matches!(&got[0], Event::ClipboardStore(ClipboardType::Clipboard, t) if t == "hi"));
+        events.send_event(store("second"));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("second".into())));
+        // Nothing went through the bounded event channel at all.
+        assert!(queue.rx.try_iter().next().is_none());
+        // Oversized: only the size is kept, not the payload.
+        let big = "y".repeat(OSC52_MAX_BYTES + 1);
+        events.send_event(store(&big));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Err(big.len())));
+    }
+
+    #[test]
+    fn a_flood_of_clipboard_writes_holds_one_payload() {
+        let (events, queue) = Events::new();
+        queue.osc52.store(true, Ordering::Relaxed);
+        for i in 0..5000 {
+            events.send_event(Event::ClipboardStore(
+                ClipboardType::Clipboard,
+                format!("write {i}"),
+            ));
+        }
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("write 4999".into())));
+        assert!(queue.rx.try_iter().next().is_none());
+    }
+
+    /// A 6 MiB OSC 52 through the same guard + parser the reader thread uses is refused
+    /// as too big, and a small one right after it still lands.
+    #[test]
+    fn oversized_osc52_is_bounded_before_decoding_and_refused() {
+        let (events, queue) = Events::new();
+        queue.osc52.store(true, Ordering::Relaxed);
+        let mut term = Term::new(term_config(), &Size { cols: 20, rows: 5 }, events);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut guard = OscGuard::new();
+        let mut stream = b"\x1b]52;c;".to_vec();
+        stream.extend(std::iter::repeat_n(b'A', 6 * 1024 * 1024));
+        stream.extend(b"\x07");
+        for chunk in stream.chunks(16384) {
+            parser.advance(&mut term, &guard.filter(chunk));
+        }
+        match lock(&queue.clipboard).take() {
+            Some(Err(n)) => assert!(n > OSC52_MAX_BYTES && n < 6 * 1024 * 1024, "{n}"),
+            other => panic!("expected a refused oversize write, got {other:?}"),
+        }
+        parser.advance(&mut term, &guard.filter(b"\x1b]52;c;aGVsbG8=\x07"));
+        assert_eq!(lock(&queue.clipboard).take(), Some(Ok("hello".into())));
+    }
+
+    /// The preference is read when output is parsed, not when a pane is drawn: a tab
+    /// that is never drawn must stop honouring a setting that was switched off.
+    #[cfg(unix)]
+    #[test]
+    fn background_session_honours_osc52_switched_off_before_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "sleep 1; printf '\\033]52;c;aGVsbG8=\\007'; sleep 2",
+        ]
+        .map(String::from)
+        .into();
+        let mut s = Session::spawn_with(
+            dir.path(),
+            Some(&argv),
+            egui::Context::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        s.set_osc52_write(false); // the user turned it off; this tab was never drawn
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < end {
+            s.poll(&theme);
+            assert!(!s.take_copied(), "clipboard written despite the setting");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(unix)]
@@ -3758,8 +4168,8 @@ mod ux_tests {
         .map(String::from)
         .into();
         let ctx = egui::Context::default();
-        let mut s = Session::spawn(dir.path(), Some(&argv), ctx.clone()).unwrap();
-        s.osc52_write = enabled;
+        let mut s =
+            Session::spawn_with(dir.path(), Some(&argv), ctx.clone(), false, enabled).unwrap();
         let theme = crate::theme::presets().remove("starlight").unwrap();
         let end = std::time::Instant::now() + Duration::from_secs(if enabled { 8 } else { 1 });
         let mut copied = false;

@@ -14,7 +14,7 @@ embedded in the binary and written to `shell-integration/` in the profile direct
 
 | Shell | How it is loaded |
 | --- | --- |
-| bash | Started as `bash --posix` with `ENV` set to a shim (bash only reads `ENV` in POSIX mode). The shim restores `ENV`, leaves POSIX mode, sources `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login`, `~/.profile` (what `bash -l` does), then loads `caelum.bash`. `~/.bash_logout` is not run. |
+| bash | Started as `bash --posix` with `ENV` set to a shim (bash only reads `ENV` in POSIX mode). The shim restores `ENV`, leaves POSIX mode (and switches back off the options POSIX mode turns on, such as `inherit_errexit`, so `set -e` behaves as in a plain shell), sources `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login`, `~/.profile` (exactly what the plain `bash -l` Caelum starts without integration does: `~/.bashrc` is read only if your profile sources it), then loads `caelum.bash`. `~/.bash_logout` is not run. |
 | zsh | `ZDOTDIR` points at a wrapper whose `.zshenv` restores your `ZDOTDIR` (or unsets it), runs your `.zshenv`, and loads `caelum.zsh` just before the first prompt, after your `.zshrc`. If your `.zshrc` replaces `precmd_functions` wholesale the hook is lost; source `caelum.zsh` yourself then. |
 | fish | The data directory is prepended to `XDG_DATA_DIRS` so fish sources its `vendor_conf.d/caelum.fish`, which removes that entry again. fish 4 also emits its own OSC 7/133 marks; Caelum tolerates the duplicates. |
 

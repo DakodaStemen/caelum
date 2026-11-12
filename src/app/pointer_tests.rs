@@ -138,6 +138,16 @@ fn selection(h: &mut H<'_>) -> Option<String> {
 }
 
 /// Waits a little past the double-click window so the next press is a new click.
+/// Hovers `pos` (with whatever modifiers are held) long enough for the background
+/// file lookup behind path links to answer, as a real pointer resting on a link does.
+fn hover_settle(h: &mut H<'_>, pos: Pos2) {
+    move_to(h, pos);
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(60));
+        h.step();
+    }
+}
+
 fn pause(h: &mut H<'_>) {
     for _ in 0..40 {
         h.step();
@@ -545,16 +555,19 @@ fn ctrl_click_on_a_file_path_opens_the_editor_at_its_line() {
     modifiers(&mut h, Modifiers::CTRL);
     pause(&mut h);
     let on_missing = at(&mut h, 8, missing_row, 0.5);
+    hover_settle(&mut h, on_missing);
     click(&mut h, on_missing);
     assert_eq!(panes(&mut h), before);
     // Ctrl+click on a directory shows it in the file browser pane.
     pause(&mut h);
     let on_dir = at(&mut h, 6, sub_row, 0.5);
+    hover_settle(&mut h, on_dir);
     click(&mut h, on_dir);
     h.step();
     assert_eq!(files_path(&mut h), Some(dir.join("sub")));
     // Ctrl+click on the real file opens it in an editor pane...
     pause(&mut h);
+    hover_settle(&mut h, on_path);
     click(&mut h, on_path);
     modifiers(&mut h, Modifiers::NONE);
     until_app(&mut h, "editor pane", |a| !a.documents.is_empty());
@@ -576,6 +589,7 @@ fn ctrl_click_on_a_file_path_opens_the_editor_at_its_line() {
     // Ctrl+clicking it again reuses the editor instead of opening another.
     modifiers(&mut h, Modifiers::CTRL);
     pause(&mut h);
+    hover_settle(&mut h, on_path);
     click(&mut h, on_path);
     modifiers(&mut h, Modifiers::NONE);
     h.step();
