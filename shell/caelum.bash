@@ -25,4 +25,23 @@ __caelum_osc7() {
 }
 __caelum_precmd() { local s=$?; printf '\e]133;D;%s\a' "$s"; __caelum_osc7; printf '\e]133;A\a'; return $s; }
 PROMPT_COMMAND="__caelum_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-PS0='\e]133;C\a'"${PS0}"
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+  PS0='\e]133;C\a'"${PS0}"
+else
+  # PS0 only exists from bash 4.4; macOS ships 3.2. Emit the command-start mark from a
+  # DEBUG trap instead, armed by the last PROMPT_COMMAND entry so it fires once, just
+  # before the first command of the line the user submitted.
+  __caelum_armed=
+  __caelum_arm() { __caelum_armed=1; }
+  __caelum_preexec() { [ -n "$__caelum_armed" ] || return 0; __caelum_armed=; printf '\e]133;C\a'; }
+  # Keep a DEBUG trap the user already set (trap -p prints: trap -- 'cmd' DEBUG).
+  __caelum_prev=$(trap -p DEBUG)
+  if [ -n "$__caelum_prev" ]; then
+    __caelum_prev=${__caelum_prev#"trap -- '"}; __caelum_prev=${__caelum_prev%"' DEBUG"}
+    trap "__caelum_preexec; $__caelum_prev" DEBUG
+  else
+    trap '__caelum_preexec' DEBUG
+  fi
+  unset __caelum_prev
+  PROMPT_COMMAND="$PROMPT_COMMAND;__caelum_arm"
+fi

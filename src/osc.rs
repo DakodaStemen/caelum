@@ -67,7 +67,7 @@ impl OscScanner {
                 }
                 State::Esc => match b {
                     b']' => self.begin(),
-                    0x1b => {}
+                    _ if esc_stays(b) => {}
                     _ => self.state = State::Ground,
                 },
                 State::Osc => match b {
@@ -85,6 +85,7 @@ impl OscScanner {
                 State::OscEsc => match b {
                     b'\\' => self.finish(i + 1, &mut events),
                     b']' => self.begin(),
+                    _ if esc_stays(b) => {}
                     _ => self.state = State::Ground,
                 },
             }
@@ -116,12 +117,23 @@ impl OscScanner {
 /// cut off here still decodes to more than the clipboard cap and is refused as too big.
 pub const MAX_OSC_BYTES: usize = 1024 * 1024 * 4 / 3 + 8 * 1024;
 
+/// Bytes that leave vte 0.15's Escape state unchanged: it executes the C0 controls
+/// (except CAN/SUB, which return to Ground), ignores DEL and anything >= 0x80 (it has
+/// no 8-bit C1 handling there), and ESC restarts the escape. So `ESC NUL ]` and
+/// `ESC DEL ]` still begin an OSC string, exactly like `ESC ]`.
+fn esc_stays(b: u8) -> bool {
+    matches!(b, 0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff)
+}
+
+/// Mirror of the vte 0.15 states that can lead into an OSC string. Every other vte
+/// state (CSI, DCS, SOS/PM/APC, escape intermediates, UTF-8 text) behaves like
+/// `Ground` here: it can only reach an OSC through `ESC` and then `]` from Escape, and
+/// vte does not buffer DCS/SOS/PM/APC payload, so those need no bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuardState {
     Ground,
     Esc,
     Osc(usize),
-    OscEsc,
     /// Over the cap: payload bytes are dropped until the string ends.
     Skip,
 }
@@ -158,18 +170,17 @@ impl OscGuard {
                 (Ground, 0x1b) => Esc,
                 (Ground, _) => Ground,
                 (Esc, b']') => Osc(0),
-                (Esc, 0x1b) => Esc,
+                (Esc, b) if esc_stays(b) => Esc,
                 (Esc, _) => Ground,
                 (Osc(_), 0x07 | 0x18 | 0x1a) => Ground,
-                (Osc(_), 0x1b) => OscEsc,
+                // vte ends the string at ESC and is then in Escape, not only for `\\`.
+                (Osc(_), 0x1b) => Esc,
                 (Osc(n), _) if n >= MAX_OSC_BYTES => {
                     cancel = true;
                     keep = false;
                     Skip
                 }
                 (Osc(n), _) => Osc(n + 1),
-                (OscEsc, b']') => Osc(0),
-                (OscEsc, _) => Ground,
                 (Skip, 0x07) => {
                     keep = false;
                     Ground
@@ -376,5 +387,162 @@ mod tests {
         let out = g.filter(&stream).into_owned();
         assert!(out.ends_with(b"\x1b\\ok"));
         assert!(out.len() < MAX_OSC_BYTES + 64);
+    }
+
+    /// Longest OSC string (bytes between the params' `;`s excluded) vte dispatched.
+    #[derive(Default)]
+    struct Longest(usize);
+    impl alacritty_terminal::vte::Perform for Longest {
+        fn osc_dispatch(&mut self, params: &[&[u8]], _bell: bool) {
+            self.0 = self.0.max(params.iter().map(|p| p.len()).sum());
+        }
+    }
+    /// What vte dispatches for `chunks` fed through a fresh guard; returns the longest
+    /// dispatched OSC and the bytes the guard forwarded.
+    fn through_guard(chunks: &[&[u8]]) -> (usize, Vec<u8>) {
+        let (mut g, mut parser, mut seen) = (
+            OscGuard::new(),
+            alacritty_terminal::vte::Parser::new(),
+            Longest::default(),
+        );
+        let mut fwd = Vec::new();
+        for c in chunks {
+            let f = g.filter(c);
+            parser.advance(&mut seen, &f);
+            fwd.extend_from_slice(&f);
+        }
+        (seen.0, fwd)
+    }
+    fn long_osc(prefix: &[u8], len: usize, end: &[u8]) -> Vec<u8> {
+        let mut v = prefix.to_vec();
+        v.extend(b"52;c;");
+        v.extend(std::iter::repeat_n(b'A', len));
+        v.extend(end);
+        v
+    }
+    /// Every way vte 0.15 can enter an OSC string from Escape, including controls it
+    /// executes or ignores there (the guard used to fall back to Ground on them).
+    #[test]
+    fn guard_bounds_every_vte_route_into_an_osc_string() {
+        let prefixes: [&[u8]; 9] = [
+            b"\x1b]",
+            b"\x1b\x00]",
+            b"\x1b\x7f]",
+            b"\x1b\x01]",
+            b"\x1b\x1c]",
+            b"\x1b\x1b]",
+            b"\x1b\x80]",
+            b"\x1b\x9d]",
+            b"\x1b\x00\x7f\x1f\x1b\x19]",
+        ];
+        for prefix in prefixes {
+            let stream = long_osc(prefix, 3 * 1024 * 1024, b"\x07tail");
+            // Whole, and split at every position around the introducer.
+            for split in 0..=prefix.len() + 6 {
+                let (max, fwd) = through_guard(&[&stream[..split], &stream[split..]]);
+                assert!(max <= MAX_OSC_BYTES, "{prefix:?} split {split}: {max}");
+                assert!(fwd.len() < MAX_OSC_BYTES + 64 + prefix.len());
+                assert!(fwd.ends_with(b"tail"), "{prefix:?} split {split}");
+            }
+            let chunks: Vec<&[u8]> = stream.chunks(7001).collect();
+            assert!(through_guard(&chunks).0 <= MAX_OSC_BYTES, "{prefix:?}");
+        }
+    }
+    #[test]
+    fn guard_bounds_an_osc_started_right_after_another_ends_with_esc() {
+        for mid in [&b"\x1b"[..], b"\x1b\x00", b"\x1b\x7f", b"\x1b\x1b"] {
+            let mut stream = b"\x1b]0;title".to_vec();
+            stream.extend(mid);
+            stream.extend(long_osc(b"]", 3 * 1024 * 1024, b"\x1b\\ok").iter());
+            let (max, fwd) = through_guard(&[&stream]);
+            assert!(max <= MAX_OSC_BYTES, "{mid:?}: {max}");
+            assert!(fwd.ends_with(b"\x1b\\ok"), "{mid:?}");
+        }
+    }
+    #[test]
+    fn guard_counts_interleaved_controls_and_resets_on_can_sub() {
+        // Ignored C0 bytes inside the string still count toward the cap (conservative).
+        let mut stream = b"\x1b]52;c;".to_vec();
+        for _ in 0..(MAX_OSC_BYTES / 2 + 10) {
+            stream.extend(b"A\x00");
+        }
+        stream.extend(b"\x07");
+        assert!(through_guard(&[&stream]).0 <= MAX_OSC_BYTES);
+        // CAN ends the string; what follows is plain text and passes untouched.
+        let mut stream = long_osc(b"\x1b]", 1000, b"\x18");
+        stream.extend(std::iter::repeat_n(b'B', 2 * MAX_OSC_BYTES));
+        let (_, fwd) = through_guard(&[&stream]);
+        assert_eq!(fwd, stream);
+    }
+    /// Not an OSC in vte (escape intermediate / CSI / DCS), so nothing to bound and
+    /// nothing may be altered.
+    #[test]
+    fn guard_leaves_non_osc_long_payloads_byte_identical() {
+        for prefix in [
+            &b"\x1b ]"[..],
+            b"\x1b[",
+            b"\x1bP",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x1b_",
+        ] {
+            let stream = long_osc(prefix, MAX_OSC_BYTES + 5000, b"\x1b\\z");
+            let (max, fwd) = through_guard(&[&stream]);
+            assert_eq!(max, 0, "{prefix:?}");
+            assert_eq!(fwd, stream, "{prefix:?}");
+        }
+        // A long but legitimate OSC under the cap is forwarded unchanged.
+        let ok = long_osc(b"\x1b]", MAX_OSC_BYTES - 100, b"\x07text");
+        assert_eq!(through_guard(&[&ok]).1, ok);
+    }
+    /// Seeded random streams of the bytes that steer vte's parser: no dispatched OSC
+    /// may exceed the cap, and the output must not depend on how reads were split.
+    #[test]
+    fn guard_fuzz_matches_vte_state_machine() {
+        const ALPHA: &[u8] = b"\x1b\x1b]]\\\x07\x18\x1a\x00\x01\x1c\x1f\x7f\x80\x9d\x9c \
+            P X ^ _ [ ; 5 2 A";
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..40 {
+            let mut stream = Vec::new();
+            for _ in 0..(next() % 40 + 5) {
+                match next() % 10 {
+                    0 => {
+                        // An introducer with random bytes between ESC and `]`, then a
+                        // run that straddles the cap.
+                        stream.push(0x1b);
+                        for _ in 0..next() % 3 {
+                            stream.push(ALPHA[(next() % ALPHA.len() as u64) as usize]);
+                        }
+                        stream.push(b']');
+                        let n = MAX_OSC_BYTES as u64 - 50 + next() % 200;
+                        stream.extend(std::iter::repeat_n(b'A', n as usize));
+                    }
+                    1 => stream.extend(std::iter::repeat_n(b'B', (next() % 3000) as usize)),
+                    _ => stream.push(ALPHA[(next() % ALPHA.len() as u64) as usize]),
+                }
+            }
+            let whole = through_guard(&[&stream]);
+            assert!(whole.0 <= MAX_OSC_BYTES, "round {round}: {}", whole.0);
+            let mut cuts: Vec<usize> = (0..4)
+                .map(|_| (next() % (stream.len() as u64 + 1)) as usize)
+                .collect();
+            cuts.sort_unstable();
+            let parts: Vec<&[u8]> = std::iter::once(0)
+                .chain(cuts.iter().copied())
+                .zip(cuts.iter().copied().chain(std::iter::once(stream.len())))
+                .map(|(a, b)| &stream[a..b])
+                .collect();
+            assert_eq!(
+                through_guard(&parts),
+                whole,
+                "round {round} split dependent"
+            );
+        }
     }
 }

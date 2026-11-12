@@ -236,9 +236,14 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
             {
                 // The cursor sits at the start of the line after the output, unless the
                 // output did not end in a newline; then its last line is the cursor's.
+                // Output that exactly fills a row leaves the cursor on that row's last
+                // column with a wrap pending (`input_needs_wrap`): the last character is
+                // then *at* the cursor column, not before it.
                 let cursor = cursor_abs(term);
                 let column = term.grid().cursor.point.column.0;
-                let (end, last_col) = if column == 0 {
+                let (end, last_col) = if term.grid().cursor.input_needs_wrap {
+                    (cursor + 1, Some(column))
+                } else if column == 0 {
                     (cursor, None)
                 } else {
                     (cursor + 1, Some(column - 1))
@@ -3112,6 +3117,31 @@ mod tests {
         assert_eq!(output_text(&term, s, e, c).as_deref(), Some("a b\npartial"));
         assert_eq!(shell.last_exit, Some(1));
     }
+    /// Output that fills the row exactly (cursor parked with a wrap pending) must keep
+    /// its last character; the 20-column grid makes 20 and 40 the exact-width cases.
+    #[test]
+    fn last_output_keeps_the_last_char_when_it_fills_the_line() {
+        for n in [1usize, 3, 19, 20, 21, 39, 40, 41, 59, 60] {
+            let (mut term, mut shell) = shell_term(5);
+            let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+            let out: String = (0..n).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            let text =
+                format!("\x1b]133;A\x07$ x\r\n\x1b]133;C\x07{out}\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+            feed(
+                &mut term,
+                &mut shell,
+                &mut parser,
+                &mut scanner,
+                text.as_bytes(),
+            );
+            let (s, e, c) = shell.output.expect("span recorded");
+            assert_eq!(
+                output_text(&term, s, e, c).as_deref(),
+                Some(out.as_str()),
+                "{n} chars"
+            );
+        }
+    }
     #[test]
     fn last_output_without_a_trailing_newline_excludes_the_next_prompt() {
         let (mut term, mut shell) = shell_term(5);
@@ -3131,8 +3161,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_shell_printf_without_newline_copies_only_its_output() {
-        let Some(bash) = ["/bin/bash", "/usr/bin/bash"]
+        // CAELUM_TEST_BASH lets CI/dev pick a specific bash (e.g. a 3.2 build).
+        let over = std::env::var("CAELUM_TEST_BASH").ok();
+        let Some(bash) = over
+            .as_deref()
             .into_iter()
+            .chain(["/bin/bash", "/usr/bin/bash"])
             .find(|p| Path::new(p).is_file())
         else {
             return;
