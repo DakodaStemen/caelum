@@ -212,6 +212,11 @@ impl ShellState {
     /// 133;C arriving later overrides it. `cursor` is the absolute cursor line and
     /// `alt_screen` whether the alternate screen is active, both at submission, so a
     /// command line the terminal wrapped puts the output after its last row.
+    /// Known limits of the inferred start (no 133;C): it is taken when Enter is written,
+    /// so a command line that wraps, or was submitted with the cursor off its last row,
+    /// can leave the tail of that line in the copied output; and PS2 continuation lines
+    /// of a multi-line command can be copied too. An empty Enter is detected at 133;D
+    /// (empty inferred span) and leaves the previous output alone.
     fn submit(&mut self, cursor: i64, alt_screen: bool) {
         if !self.at_prompt || self.running || alt_screen {
             return;
@@ -276,6 +281,10 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
         }
         OscEvent::CommandEnd(code) => {
             let was_running = shell.running;
+            let inferred = shell.inferred;
+            // An inferred start with no output is most likely an empty Enter: keep the
+            // previous output. Its finished record stays (a silent slow command must
+            // still reach the long-command notice; an instant one is under the threshold).
             shell.running = false;
             shell.inferred = false;
             shell.at_prompt = false;
@@ -297,7 +306,9 @@ fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
                 } else {
                     (cursor + 1, Some(column - 1))
                 };
-                shell.output = (end > start).then_some((start, end, last_col));
+                if !(inferred && end <= start) {
+                    shell.output = (end > start).then_some((start, end, last_col));
+                }
             }
             if let Some(started) = shell.started.take()
                 && was_running
@@ -3318,6 +3329,69 @@ mod tests {
     }
     fn press_enter(term: &Term<Events>, shell: &mut ShellState) {
         shell.submit(cursor_abs(term), term.mode().contains(TermMode::ALT_SCREEN));
+    }
+    #[test]
+    fn empty_enter_keeps_last_output() {
+        let (mut term, mut shell) = submit_term(8, "\x1b]133;A\x07$ echo hi");
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let kept = shell.output;
+        assert!(kept.is_some());
+        shell.finished = None;
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, kept, "empty Enter wiped last output");
+    }
+    #[test]
+    fn empty_enter_keeps_output_without_133_c_and_next_command_updates_it() {
+        let (mut term, mut shell) = submit_term(10, "\x1b]133;A\x07$ echo hi");
+        let (mut parser, mut scanner) = (ansi::Processor::new(), OscScanner::default());
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nhi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let kept = shell.output;
+        let (s, e, c) = kept.expect("span");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("hi"));
+        shell.finished = None;
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        assert_eq!(shell.output, kept);
+        // A real command afterwards still replaces the output.
+        press_enter(&term, &mut shell);
+        feed(
+            &mut term,
+            &mut shell,
+            &mut parser,
+            &mut scanner,
+            b"\r\nyo\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let (s, e, c) = shell.output.expect("span");
+        assert_eq!(output_text(&term, s, e, c).as_deref(), Some("yo"));
+        assert!(shell.finished.is_some());
     }
     #[test]
     fn enter_at_a_prompt_marks_the_command_start_without_133_c() {

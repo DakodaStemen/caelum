@@ -61,6 +61,18 @@ lines (a `PS2` continuation) or edited with the cursor away from the end of the 
 starts its output a line or two early, and a command started by a prompt hook rather
 than Enter is not seen.
 
+### Limitations
+
+Because the start is inferred when Enter is written, not reported by the shell:
+
+- A command line that wraps across rows, or was submitted with the cursor not on its
+  last row, can leave the tail of the command line at the start of the copied output.
+- For a multi-line command with `PS2` continuation lines, Copy Last Command Output can
+  include the continuation lines.
+- An empty Enter is ignored (the previous output stays copyable).
+
+Install Homebrew bash 4.4 or newer for exact marks.
+
 ## Manual setup
 
 Only needed if automatic setup is off or unsupported for your shell (guarded so other
