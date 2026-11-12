@@ -164,6 +164,68 @@ fn drag_selects_exactly_the_dragged_text() {
     assert_eq!(selection(&mut h).as_deref(), Some("HELLO_SELECTION_WORLD"));
 }
 
+fn message(h: &mut H<'_>) -> String {
+    h.state_mut().as_mut().unwrap().message.clone()
+}
+
+#[test]
+fn finishing_a_drag_copies_and_toasts_once() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo HELLO_SELECTION_WORLD tail");
+    let row = row_of(&mut h, "HELLO_SELECTION_WORLD");
+    let from = at(&mut h, 0, row, 0.2);
+    let to = at(&mut h, 20, row, 0.8);
+    move_to(&mut h, from);
+    button(&mut h, from, egui::PointerButton::Primary, true);
+    for i in 1..=8 {
+        move_to(&mut h, from + (to - from) * (i as f32 / 8.));
+        assert_eq!(message(&mut h), "", "no toast while the drag is going");
+    }
+    button(&mut h, to, egui::PointerButton::Primary, false);
+    assert_eq!(message(&mut h), "Copied to clipboard");
+    // A bare click selects nothing and does not toast again.
+    h.state_mut().as_mut().unwrap().message.clear();
+    pause(&mut h);
+    let elsewhere = at(&mut h, 3, row, 0.5);
+    click(&mut h, elsewhere);
+    assert_eq!(message(&mut h), "");
+}
+
+#[test]
+fn copy_on_select_can_be_turned_off() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "echo HELLO_SELECTION_WORLD tail");
+    h.state_mut()
+        .as_mut()
+        .unwrap()
+        .state
+        .preferences
+        .copy_on_select = false;
+    let row = row_of(&mut h, "HELLO_SELECTION_WORLD");
+    let from = at(&mut h, 0, row, 0.2);
+    let to = at(&mut h, 20, row, 0.8);
+    drag(&mut h, from, to);
+    assert_eq!(selection(&mut h).as_deref(), Some("HELLO_SELECTION_WORLD"));
+    assert_eq!(message(&mut h), "");
+}
+
+#[test]
+fn shift_drag_selects_and_copies_under_mouse_reporting() {
+    let d = tempfile::tempdir().unwrap();
+    let mut h = run(d.path(), "printf '\\033[?1002h\\033[?1006h'; cat");
+    until(&mut h, "mouse mode", |s| {
+        s.term.lock().unwrap().mode().contains(TermMode::MOUSE_DRAG)
+    });
+    let prompt_row = row_of(&mut h, "$ printf");
+    let a = at(&mut h, 2, prompt_row, 0.2);
+    let b = at(&mut h, 7, prompt_row, 0.8);
+    modifiers(&mut h, Modifiers::SHIFT);
+    drag(&mut h, a, b);
+    modifiers(&mut h, Modifiers::NONE);
+    assert_eq!(selection(&mut h).as_deref(), Some("printf"));
+    assert_eq!(message(&mut h), "Copied to clipboard");
+}
+
 #[test]
 fn double_click_selects_a_word_and_triple_click_the_line() {
     let d = tempfile::tempdir().unwrap();

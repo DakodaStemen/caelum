@@ -606,7 +606,11 @@ pub struct Preferences {
     pub sidebar: bool,
     /// Ask before a multi-line paste reaches a program without bracketed paste.
     pub confirm_multiline_paste: bool,
-    /// Copy selected text to the clipboard as soon as it is selected.
+    /// Copy selected text to the clipboard as soon as it is selected (on by default).
+    /// Stored under a new key: profiles saved before the default flipped wrote an
+    /// explicit `copyOnSelect: false` that only recorded the old default, so reading
+    /// that key would keep existing users on "off". Turning it off again is saved.
+    #[serde(rename = "copyOnSelectV2")]
     pub copy_on_select: bool,
     pub custom_themes: Vec<crate::theme::Theme>,
 }
@@ -622,7 +626,7 @@ impl Default for Preferences {
             cursor_blink: false,
             sidebar: false,
             confirm_multiline_paste: true,
-            copy_on_select: false,
+            copy_on_select: true,
             custom_themes: vec![],
         }
     }
@@ -1502,6 +1506,23 @@ mod migration_tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"followSystem\": false"), "{text}");
         assert!(!State::read(&path).unwrap().preferences.follow_system);
+    }
+
+    #[test]
+    fn copy_on_select_defaults_on_and_old_profiles_get_it() {
+        assert!(Preferences::default().copy_on_select);
+        // Saved by a build where "off" was the default: the stale key is ignored.
+        let old: Preferences =
+            serde_json::from_value(serde_json::json!({"copyOnSelect": false})).unwrap();
+        assert!(old.copy_on_select);
+        // A user who turns it off keeps it off.
+        let off = Preferences {
+            copy_on_select: false,
+            ..Preferences::default()
+        };
+        let back: Preferences =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.copy_on_select);
     }
 
     #[test]

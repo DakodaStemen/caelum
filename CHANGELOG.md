@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Copy on Select is now on by default: finishing a selection copies it to the
+  clipboard and shows a "Copied to clipboard" toast (also for Ctrl+Shift+C, Ctrl+Insert
+  and the menu Copy). Existing profiles pick up the new default (the preference is
+  stored under a new key); turning it off in Preferences is kept. While a program has
+  mouse reporting on, hold Shift to select.
 - Terminal mouse: drag selection is anchored where the button went down and follows
   cell halves; triple-click selects a line, double/triple-click then drag extends by
   words/lines, Shift+click extends, Ctrl+drag selects a block, and dragging past the

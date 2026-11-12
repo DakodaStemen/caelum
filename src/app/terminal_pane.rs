@@ -77,7 +77,7 @@ impl App {
         if let Some(text) = &shown.selected {
             self.primary.set(text);
             if self.state.preferences.copy_on_select {
-                ctx.copy_text(text.clone());
+                session.copy_to_clipboard(ctx, text.clone());
             }
         }
         if shown.paste_primary
@@ -94,6 +94,9 @@ impl App {
                 preview,
                 dont_ask: false,
             });
+        }
+        if session.take_copied() {
+            self.message = "Copied to clipboard".into();
         }
         *cwd = session.cwd.clone();
         if let Some(error) = session.error.take() {

@@ -104,8 +104,9 @@ command palette.
 | Wheel | Scroll the scrollback; in `less`, `man` and other full-screen programs, scroll their text |
 | Drop files | Type their shell-quoted paths |
 
-Selecting text copies it to the PRIMARY selection; turn on **Copy on Select** in
-Preferences to copy it to the clipboard too. When a program such as `vim`, `tmux`
+Selecting text copies it to the PRIMARY selection and, with **Copy on Select**
+(on by default; switch it off in Preferences), to the clipboard too, with a brief
+"Copied to clipboard" toast. When a program such as `vim`, `tmux`
 or `htop` turns on mouse reporting, clicks, drags and the wheel go to that
 program; hold Shift to select text instead.
 

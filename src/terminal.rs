@@ -194,6 +194,8 @@ pub struct Session {
     metrics: Option<Metrics>,
     /// Focus state last seen, for focus in/out reports (mode 1004).
     focus_reported: Option<bool>,
+    /// Text was copied to the clipboard since the app last asked (for the toast).
+    copied: bool,
     wake: egui::Context,
     /// Test hook: when set, the cleanup thread waits for a message before doing any
     /// work, so a test can prove `drop` returns while cleanup has not yet run.
@@ -303,6 +305,7 @@ impl Session {
             mouse: Mouse::default(),
             metrics: None,
             focus_reported: None,
+            copied: false,
             wake: ctx,
             #[cfg(test)]
             cleanup_gate: None,
@@ -354,6 +357,17 @@ impl Session {
             self.paste(text);
             false
         }
+    }
+    /// Copies `text` to the clipboard and notes it for the "Copied" toast.
+    pub fn copy_to_clipboard(&mut self, ctx: &egui::Context, text: String) {
+        if !text.is_empty() {
+            ctx.copy_text(text);
+            self.copied = true;
+        }
+    }
+    /// Whether text was copied since the last call.
+    pub fn take_copied(&mut self) -> bool {
+        std::mem::take(&mut self.copied)
     }
     /// The held multi-line paste, if any, for the app to confirm.
     pub fn take_pending_paste(&mut self) -> Option<String> {
@@ -1747,7 +1761,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
             egui::Event::Copy => {
                 if ui.input(|i| i.modifiers.shift) {
                     if let Some(text) = s.selection() {
-                        ui.ctx().copy_text(text);
+                        s.copy_to_clipboard(ui.ctx(), text);
                     }
                 } else {
                     s.write(vec![3]);
@@ -1768,7 +1782,7 @@ fn handle_events(ui: &egui::Ui, s: &mut Session, prefs: &Preferences) {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                 } else if let Some(text) = s.selection() {
-                    ui.ctx().copy_text(text);
+                    s.copy_to_clipboard(ui.ctx(), text);
                 }
             }
             egui::Event::Key {
@@ -2296,7 +2310,7 @@ fn context_menu(
             .clicked()
         {
             if let Some(text) = selection {
-                ui.ctx().copy_text(text);
+                s.copy_to_clipboard(ui.ctx(), text);
             }
             ui.close();
         }
