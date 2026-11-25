@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# Binary: never normalised or diffed
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.gz binary
+*.zip binary
+
+# Lockfiles and generated sources: collapsed in PR diffs
+Cargo.lock linguist-generated
