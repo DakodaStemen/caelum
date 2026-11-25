@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/mark-dark.svg">
-    <img src="assets/brand/mark.svg" width="96" alt="Caelum icon">
-  </picture>
+  <img src="assets/app-icons/linux/hicolor/scalable/apps/caelum-rs.svg" width="96" alt="Caelum icon">
 </p>
 
 ```text
@@ -58,7 +55,7 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 
 | Area | What works today |
 | --- | --- |
-| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, selection, copy, bracketed paste, scrollback search, OSC 8 hyperlinks |
+| Terminal | ANSI, 256-color and true-color, alternate screen, scrollback, mouse selection (drag, word, line, block), copy/paste with PRIMARY selection, bracketed paste, scrollback search, OSC 8 and plain-text links, Ctrl+click on file paths (`file:line:col`) to open them in the editor, a "Jump to bottom" pill while scrolled back, write-only OSC 52 clipboard, a minimum text contrast, mouse reporting for TUIs, file drag-and-drop |
 | Layout | Workspaces, tabs, splits in four directions that rebalance and never shrink a pane below a minimum size, pane zoom |
 | Editor | UTF-8 editing with syntax highlighting, external-change checks, atomic saves, recovery snapshots |
 | Themes | Follows the desktop's light/dark style and accent (Adwaita palette) by default; thirteen bundled themes, custom color editor with live preview, JSON import/export |
@@ -79,15 +76,57 @@ Module boundaries are described in [docs/architecture.md](docs/architecture.md).
 | Ctrl+Shift+R | Balance panes (equal sizes) |
 | Ctrl+Shift+Enter | Zoom / restore pane |
 | Ctrl+Shift+W | Close pane |
-| Ctrl+Shift+C / V | Copy selection / paste |
+| Ctrl+Alt+Arrow | Focus the neighbouring pane in that direction (leaves zoom; Alt+Arrow stays with the shell's word movement) |
+| Ctrl+Shift+C / V | Copy selection / paste (also Ctrl+Insert / Shift+Insert) |
+| Ctrl+Shift+A | Select all terminal text |
 | Ctrl+Shift+F | Search terminal output and scrollback |
 | Ctrl+O / Ctrl+S | Open / save file |
 
 Double-click a tab to rename it, drag a divider to resize (double-click it to
-balance), and right-click a terminal for copy/paste. The split button in the
+balance), and right-click a terminal for copy, paste, select all, links and
+clearing the scrollback. The split button in the
 headerbar and in each pane header opens a popover with all four directions and
 Balance. Everything else is in the main menu (the three-line button) and the
 command palette.
+
+### Mouse in the terminal
+
+| Mouse | Action |
+| --- | --- |
+| Drag | Select text; dragging past the top or bottom edge scrolls |
+| Double-click / triple-click | Select a word (URLs and `file:line` stay whole) / the whole line; keep dragging to extend by words or lines |
+| Shift+click | Extend the selection |
+| Ctrl+drag | Select a rectangular block |
+| Middle-click | Paste the last selection (Linux PRIMARY selection) |
+| Ctrl+click | Open an http(s) link (OSC 8 or plain text), or a local file path in the editor pane (`path:line[:col]` from compilers, `rg` and tracebacks scrolls to that line; a folder opens in the file browser pane when one is open) |
+| Jump to bottom | A small pill at the bottom right appears only while scrolled back; click it to return to the live output. Its outline takes the accent colour when new output arrived meanwhile |
+| Wheel | Scroll the scrollback; in `less`, `man` and other full-screen programs, scroll their text |
+| Drop files | Type their shell-quoted paths |
+
+Selecting text copies it to the PRIMARY selection and, with **Copy on Select**
+(on by default; switch it off in Preferences), to the clipboard too, with a brief
+"Copied to clipboard" toast. When a program such as `vim`, `tmux`
+or `htop` turns on mouse reporting, clicks, drags and the wheel go to that
+program; hold Shift to select text instead.
+
+Programs can put text on the clipboard with the OSC 52 escape sequence (write
+only: they can never read the clipboard back, and anything over 1 MiB is
+refused). It shows the same "Copied to clipboard" toast; turn it off with
+**Programs Can Copy** in Preferences or `[terminal] osc52_write = false`. Text a
+program colors almost the same as its background is lightened or darkened just
+enough to read (minimum contrast ratio 1.5; `[terminal] min_contrast` in
+`config.toml`, 1 turns it off).
+### Shell integration (automatic)
+
+Caelum starts bash, zsh and fish with its prompt/cwd integration already loaded; no
+dotfile edits (it sources your own startup files first and never touches them). That
+powers: new panes opening in the shell's directory, **Ctrl+Shift+Up/Down** to jump
+between prompts, a toast (and a dot on the tab) when a command that ran 10 s or longer
+finishes while you are in another pane, tab or window, **Copy Last Command Output**
+(right-click menu, command palette, `ctrl+shift+o`), and a confirmation only when you
+close a pane, tab or window with a command still running (idle shells close silently).
+Opt out with `shell_integration = false` in `config.toml`; tune the notice with
+`long_command_seconds` (0 turns it off). Details: [docs/shell-integration.md](docs/shell-integration.md).
 
 On GNOME Wayland, which has no server-side window decorations, the headerbar is the
 title bar: it carries the window buttons from your `button-layout`, drag it to move
@@ -193,5 +232,5 @@ does not establish accessibility of terminal content.
 ## License
 
 [MIT](LICENSE). Third-party crates retain their own licenses; see
-[third-party notices](THIRD_PARTY_NOTICES.md). The icon is a clean SVG redraw of the supplied Caelum mark
-without lettering; a heavier rendering is used at small app-icon sizes.
+[third-party notices](THIRD_PARTY_NOTICES.md). The app icon is an SVG tile (masters in `assets/brand`, generated sizes in `assets/app-icons`, rebuilt with `scripts/gen-icons.py`);
+a bolder, pill-less master is used at 32 px and below.

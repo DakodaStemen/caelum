@@ -16,8 +16,8 @@ Core components include:
   CC-BY-SA-3.0 or LGPL-3.0, by the GNOME Project —
   https://gitlab.gnome.org/GNOME/adwaita-icon-theme
 
-The Caelum mark is a hand-written SVG redraw (three nested crescent arcs) of the supplied icon, without lettering. Source SVGs
-are in `assets/brand`; `mark-app.svg` adds weight for small-size readability, and
-`icon.png` is its application rendering. No fonts are bundled; default fonts come from
+The Caelum app icon is a hand-written SVG (three nested crescent arcs and a cursor pill, no lettering). Master SVGs
+are in `assets/brand` (`icon.svg`, bolder `icon-small.svg` for 32 px and below, `mark.svg`, `lockup.svg`); every PNG/ICO/ICNS
+in `assets/app-icons` is generated from them by `scripts/gen-icons.py`. No fonts are bundled; default fonts come from
 eframe and system fontconfig. Rust does not remove licensing obligations
 for bundled assets, dependencies or third-party code.

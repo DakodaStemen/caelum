@@ -86,8 +86,10 @@ fn main() -> Result<()> {
     // Desktop colors, font and window buttons are read while the window opens.
     let look = std::thread::spawn(caelum_rs::appearance::detect);
     let csd = caelum_rs::appearance::client_side_decorations();
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand/icon.png"))
-        .context("Loading app icon")?;
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../assets/app-icons/window-icon-256.png"
+    ))
+    .context("Loading app icon")?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Caelum Rust")

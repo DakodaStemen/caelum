@@ -7,8 +7,17 @@ if [[ ! -x "$source_binary" ]]; then
   exit 1
 fi
 install -Dm755 "$source_binary" "$HOME/.local/bin/caelum-rs"
-install -Dm644 "$project_dir/assets/brand/mark-app.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/caelum-rs.svg"
-mkdir -p "$HOME/.local/share/applications"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+icon_theme="$data_home/icons/hicolor"
+icon_src="$project_dir/assets/app-icons/linux/hicolor"
+installed_icons=0
+for icon in "$icon_src"/*/apps/caelum-rs.*; do
+  rel="${icon#"$icon_src"/}"
+  install -Dm644 "$icon" "$icon_theme/$rel"
+  installed_icons=$((installed_icons + 1))
+done
+if [[ $installed_icons -eq 0 ]]; then echo "No icons found in $icon_src" >&2; exit 1; fi
+mkdir -p "$data_home/applications"
 # Desktop Entry values use their own quoting rules, not shell interpolation.
 binary_path="$HOME/.local/bin/caelum-rs"
 escaped_binary="${binary_path//\\/\\\\}"
@@ -16,7 +25,7 @@ escaped_binary="${escaped_binary//\"/\\\"}"
 escaped_binary="${escaped_binary//\`/\\\`}"
 escaped_binary="${escaped_binary//\$/\\\$}"
 escaped_binary="${escaped_binary//%/%%}"
-cat > "$HOME/.local/share/applications/io.github.DakodaStemen.CaelumRust.desktop" <<DESKTOP
+cat > "$data_home/applications/io.github.DakodaStemen.CaelumRust.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Caelum Rust
@@ -27,5 +36,10 @@ Terminal=false
 Categories=System;TerminalEmulator;
 StartupWMClass=io.github.DakodaStemen.CaelumRust
 DESKTOP
-if command -v update-desktop-database >/dev/null; then update-desktop-database "$HOME/.local/share/applications"; fi
-printf 'Installed %s\n' "$binary_path"
+# Cache refreshes are best effort: a missing or failing tool must not fail the install.
+if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -f -t "$icon_theme" || true; fi
+if command -v update-desktop-database >/dev/null; then update-desktop-database "$data_home/applications" || true; fi
+for kbuild in kbuildsycoca6 kbuildsycoca5; do
+  if command -v "$kbuild" >/dev/null; then "$kbuild" >/dev/null 2>&1 || true; break; fi
+done
+printf 'Installed %s and %s icon files\n' "$binary_path" "$installed_icons"

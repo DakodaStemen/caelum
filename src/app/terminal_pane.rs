@@ -21,6 +21,12 @@ impl App {
         cwd: &mut PathBuf,
         command: &Option<Vec<String>>,
     ) -> bool {
+        // Directories in output are links only if there is a file browser to show them.
+        let has_files = {
+            let mut leaves = vec![];
+            self.tab().layout.leaves(&mut leaves);
+            leaves.iter().any(|p| matches!(p, Pane::Files { .. }))
+        };
         if !self.terminals.contains_key(id) {
             // Defense in depth: State::validate already drops unsupported commands.
             if !model::allowed_terminal_command(command.as_deref()) {
@@ -36,7 +42,13 @@ impl App {
             } else {
                 command.as_deref()
             };
-            match Session::spawn(cwd, chosen, ctx.clone()) {
+            match Session::spawn_with(
+                cwd,
+                chosen,
+                ctx.clone(),
+                self.state.preferences.shell_integration,
+                self.state.preferences.osc52_write,
+            ) {
                 Ok(s) => {
                     self.terminals.insert(id.to_string(), s);
                 }
@@ -52,6 +64,7 @@ impl App {
             ctx.request_repaint();
             return false;
         };
+        session.dir_links = has_files;
         let allow_input = selected
             && !self.palette
             && !self.settings
@@ -64,7 +77,7 @@ impl App {
         } else {
             ""
         };
-        let focused = terminal::show(
+        let shown = terminal::show(
             ui,
             session,
             theme,
@@ -72,6 +85,19 @@ impl App {
             allow_input,
             search,
         );
+        // Selecting copies to the PRIMARY selection (and the clipboard with copy on
+        // select); a middle click pastes PRIMARY, through the multi-line check.
+        if let Some(text) = &shown.selected {
+            self.primary.set(text);
+            if self.state.preferences.copy_on_select {
+                session.copy_to_clipboard(ctx, text.clone());
+            }
+        }
+        if shown.paste_primary
+            && let Some(text) = self.primary.get()
+        {
+            session.paste_or_hold(&text, self.state.preferences.confirm_multiline_paste);
+        }
         if let Some(text) = session.take_pending_paste() {
             let (lines, preview) = terminal::paste_preview(&text);
             self.pending_paste = Some(PendingPaste {
@@ -82,11 +108,18 @@ impl App {
                 dont_ask: false,
             });
         }
+        if session.take_copied() {
+            self.message = "Copied to clipboard".into();
+        }
+        if let Some(target) = shown.open_file {
+            // Opened after the frame's layout, which writes the layout back.
+            self.pending_ref = Some(target);
+        }
         *cwd = session.cwd.clone();
         if let Some(error) = session.error.take() {
             self.message = error;
         }
-        focused
+        shown.clicked
     }
     /// Modal asking whether a held multi-line paste should reach the terminal.
     /// Enter pastes, Escape cancels; "Don't ask again" is saved on Paste.

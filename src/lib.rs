@@ -4,6 +4,8 @@ pub mod files;
 pub mod model;
 pub mod osc;
 pub mod platform;
+pub mod primary;
+pub mod shell_integration;
 pub mod syntax;
 pub mod terminal;
 pub mod theme;

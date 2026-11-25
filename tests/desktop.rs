@@ -191,6 +191,79 @@ impl Keyboard {
         thread::sleep(Duration::from_millis(120));
         Ok(())
     }
+    /// Like `shortcut`, but lets the toolkit see the modifiers before the key, as a human would.
+    fn slow_shortcut(&self, sym: u32) -> Result<()> {
+        let ctrl = self.key(0xffe3)?.0;
+        let shift = self.key(0xffe1)?.0;
+        let key = self.key(sym)?.0;
+        for (code, down) in [(ctrl, true), (shift, true)] {
+            self.event(code, down)?;
+            thread::sleep(Duration::from_millis(120));
+        }
+        self.event(key, true)?;
+        self.event(key, false)?;
+        thread::sleep(Duration::from_millis(120));
+        self.event(shift, false)?;
+        self.event(ctrl, false)?;
+        thread::sleep(Duration::from_millis(300));
+        Ok(())
+    }
+    fn button(&self, button: u8, press: bool) -> Result<()> {
+        self.connection
+            .xtest_fake_input(
+                if press {
+                    xproto::BUTTON_PRESS_EVENT
+                } else {
+                    xproto::BUTTON_RELEASE_EVENT
+                },
+                button,
+                0,
+                self.root,
+                0,
+                0,
+                0,
+            )?
+            .check()?;
+        self.connection.flush()?;
+        thread::sleep(Duration::from_millis(40));
+        Ok(())
+    }
+    fn move_to(&self, x: i16, y: i16) -> Result<()> {
+        self.connection
+            .warp_pointer(x11rb::NONE, self.window, 0, 0, 0, 0, x, y)?
+            .check()?;
+        self.connection.flush()?;
+        thread::sleep(Duration::from_millis(40));
+        Ok(())
+    }
+    fn drag(&self, from: (i16, i16), to: (i16, i16)) -> Result<()> {
+        self.move_to(from.0, from.1)?;
+        self.button(1, true)?;
+        for i in 1..=10 {
+            self.move_to(
+                from.0 + (to.0 - from.0) * i / 10,
+                from.1 + (to.1 - from.1) * i / 10,
+            )?;
+        }
+        self.button(1, false)?;
+        thread::sleep(Duration::from_millis(250));
+        Ok(())
+    }
+    fn middle_click(&self, x: i16, y: i16) -> Result<()> {
+        self.move_to(x, y)?;
+        self.button(2, true)?;
+        self.button(2, false)?;
+        thread::sleep(Duration::from_millis(250));
+        Ok(())
+    }
+}
+fn selection(name: &str) -> String {
+    Command::new("xclip")
+        .args(["-o", "-selection", name])
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 fn find_window(pid: u32) -> Result<Option<Window>> {
     let (conn, screen) = x11rb::connect(None)?;
@@ -212,9 +285,17 @@ fn find_window(pid: u32) -> Result<Option<Window>> {
     }
     Ok(None)
 }
+/// The tests share one X display, pointer and keyboard focus, so they take turns
+/// (cargo runs tests in parallel by default).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static DISPLAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    DISPLAY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 #[ignore = "requires an X11 desktop or Xvfb; cargo test --test desktop -- --ignored"]
 fn native_keyboard_splits_files_and_restart() -> Result<()> {
+    let _display = one_at_a_time();
     let dir = tempfile::tempdir()?;
     let profile = dir.path().join("profile");
     fs::create_dir(&profile)?;
@@ -367,5 +448,92 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     wait(|| find_window(restarted.0.id()).ok().flatten().is_some())?;
     restarted.0.kill()?;
     restarted.0.wait()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an X11 desktop or Xvfb and xclip; cargo test --test desktop -- --ignored"]
+fn native_mouse_selection_primary_and_paste() -> Result<()> {
+    let _display = one_at_a_time();
+    const WORD: &str = "CAELUM_DRAG_OK";
+    // Without xclip every selection would read as empty and the test would fail late.
+    Command::new("xclip")
+        .arg("-version")
+        .stderr(Stdio::null())
+        .output()
+        .context("xclip is required to read the X selections")?;
+    let dir = tempfile::tempdir()?;
+    let profile = dir.path().join("profile");
+    fs::create_dir(&profile)?;
+    let shell = dir.path().join("shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nexport HISTFILE=/dev/null PS1='$ '\nexec /bin/bash --noprofile --norc -i\n",
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700))?;
+    let mut state = caelum_rs::model::State::default();
+    state.workspaces[0].tabs[0].layout = caelum_rs::model::Pane::terminal(dir.path().to_path_buf());
+    state.save(&profile.join("workspace.json"))?;
+    let app = AppChild(
+        Command::new(env!("CARGO_BIN_EXE_caelum-rs"))
+            .args(["--data-dir", profile.to_str().unwrap()])
+            .env_remove("WAYLAND_DISPLAY")
+            .env("SHELL", &shell)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    let mut window = None;
+    wait(|| {
+        window = find_window(app.0.id()).ok().flatten();
+        window.is_some()
+    })?;
+    let kb = Keyboard::new(window.unwrap())?;
+    kb.focus()?;
+    thread::sleep(Duration::from_millis(700));
+    kb.click(450, 250)?;
+    kb.type_text(&format!("echo {WORD}"))?;
+    kb.press(0xff0d)?;
+    thread::sleep(Duration::from_millis(500));
+    // Click-drag across candidate rows until PRIMARY holds the output line.
+    let geo = kb.connection.get_geometry(kb.window)?.reply()?;
+    let mut row = None;
+    for y in (56..120i16).step_by(4) {
+        kb.drag((8, y), (geo.width as i16 - 20, y))?;
+        let got = selection("primary");
+        if got.trim() == WORD {
+            row = Some(y);
+            eprintln!("drag row y={y} -> PRIMARY == {got:?}");
+            break;
+        }
+    }
+    let hy = row.context("drag never put the output line into PRIMARY")?;
+    let hx = 30;
+    // Double-click selects the word only; Ctrl+Shift+C copies it to CLIPBOARD.
+    kb.click(hx, hy)?;
+    kb.click(hx, hy)?;
+    wait(|| selection("primary") == WORD).context("double-click word -> PRIMARY")?;
+    eprintln!("double-click word -> PRIMARY == {:?}", selection("primary"));
+    thread::sleep(Duration::from_millis(500));
+    kb.slow_shortcut('c' as u32)?;
+    wait(|| selection("clipboard") == WORD).context("CLIPBOARD after Ctrl+Shift+C")?;
+    eprintln!("CLIPBOARD == {:?}", selection("clipboard"));
+    // Click-drag across the row selects text containing the word.
+    let dragged = selection("primary");
+    assert!(dragged.contains(WORD), "PRIMARY was {dragged:?}");
+    // Re-select exactly the word, then middle-click pastes PRIMARY into the command line.
+    kb.click(hx, hy)?;
+    kb.click(hx, hy)?;
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(selection("primary"), WORD);
+    let out = dir.path().join("pasted");
+    kb.type_text("printf %s ")?;
+    kb.middle_click(hx, hy)?;
+    kb.type_text(&format!(" > {}", out.display()))?;
+    kb.press(0xff0d)?;
+    wait(|| fs::read_to_string(&out).ok().as_deref() == Some(WORD))
+        .context("middle-click must paste PRIMARY into the shell")?;
+    eprintln!("middle-click pasted {:?}", fs::read_to_string(&out)?);
     Ok(())
 }
